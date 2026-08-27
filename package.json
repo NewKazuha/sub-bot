@@ -1,0 +1,14 @@
+{
+  "name": "anime-sub-telegram-bot",
+  "version": "1.0.0",
+  "description": "Automated Telegram Bot for extracting and posting anime subtitles and fonts",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cheerio": "^1.0.0"
+  }
+}

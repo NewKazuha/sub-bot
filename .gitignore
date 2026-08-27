@@ -1,0 +1,5 @@
+node_modules/
+temp_work/
+temp_extracted/
+data/posted.json
+.env
