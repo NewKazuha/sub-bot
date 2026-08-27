@@ -1,7 +1,9 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
+import * as cheerio from 'cheerio';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { CONFIG } from './config.mjs';
 import { scrapePostPage } from './site-scrapers.mjs';
 import { processAndExtract } from './extractor.mjs';
@@ -28,7 +30,6 @@ export function savePostedIds(set) {
   }
 }
 
-// Generate normalized key to prevent duplicate posts across multiple sources
 export function normalizeReleaseKey(rawTitle) {
   return rawTitle
     .toLowerCase()
@@ -37,14 +38,33 @@ export function normalizeReleaseKey(rawTitle) {
     .replace(/^_+|_+$/g, '');
 }
 
-// Clean caption matching the old channel format exactly:
-// e.g. "[Crunchyroll] Maou 2099 - 06" or "[ESPADAS-3ASQ] Bleach Sennen Kessen-hen - 33 [+Fonts]"
 export function formatCleanCaption(fileName, isZip = false) {
   let base = path.basename(fileName, path.extname(fileName));
   if (isZip && !base.includes('[+Fonts]') && !base.includes('[+fonts]')) {
     return `${base} [+Fonts]`;
   }
   return base;
+}
+
+async function resolveSubdlDownloadUrl(infoUrl) {
+  try {
+    const res = await fetch(infoUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const doc = cheerio.load(html);
+    let dlUrl = null;
+    doc('a[href]').each((_, el) => {
+      const href = doc(el).attr('href') || '';
+      if (href.includes('dl.subdl.com/subtitle/')) {
+        dlUrl = href;
+        return false; // break
+      }
+    });
+    return dlUrl;
+  } catch (e) {
+    console.warn('SUBDL resolve error:', e.message);
+    return null;
+  }
 }
 
 export async function checkTelegramChannels() {
@@ -63,25 +83,25 @@ export async function checkTelegramChannels() {
     await client.start({ botAuthToken: '' });
     const dialogs = await client.getDialogs({ limit: 100 });
 
-    // Target source channels:
-    // 1. Fansub publisher (instant fansub releases)
-    // 2. SUBDL channels (for official subs: Crunchyroll, Netflix, Shahid, etc.)
+    // Filter ONLY the two exact source channels:
+    // 1. Arabic Anime Publisher (Fansub releases)
+    // 2. KokoBoko [Subdl] (Official subtitles)
     const targetSourceChats = dialogs.filter(d => {
       const idStr = String(d.id);
       const title = (d.title || '').toLowerCase();
-      return (
-        idStr.includes('1031770723') ||
-        idStr.includes('1224725097') ||
-        idStr.includes('2166566367') ||
-        idStr.includes('2217287273') ||
-        title.includes('arabic anime publisher') ||
-        title.includes('kokoboko') ||
-        title.includes('rengoku')
-      );
+      const isChatGroup = title.includes('chat') || title.includes('group');
+      if (isChatGroup) return false;
+
+      const isFansubPublisher = idStr.includes('1031770723') || title === 'arabic anime publisher';
+      const isOfficialKokoboko = idStr.includes('1224725097') || title === 'kokoboko [subdl]';
+
+      return isFansubPublisher || isOfficialKokoboko;
     });
 
+    console.log(`   Found ${targetSourceChats.length} targeted source channel(s):`);
+    targetSourceChats.forEach(c => console.log(`   - ${c.title} (ID: ${c.id})`));
+
     for (const chat of targetSourceChats) {
-      const isSubdlSource = (chat.title || '').toLowerCase().includes('subdl') || (chat.title || '').toLowerCase().includes('rengoku');
       console.log(`\n🔍 Checking: "${chat.title}" (ID: ${chat.id})`);
       const msgs = await client.getMessages(chat.id, { limit: 10 });
 
@@ -90,8 +110,19 @@ export async function checkTelegramChannels() {
         if (posted.has(msgKey)) continue;
 
         const text = msg.message || '';
-        
-        // Case A: Direct file attached (.ass, .srt, .zip, .rar, .7z)
+        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        const titleLine = lines[0]?.replace(/^[📍📌🎬\s]+/, '') || 'Anime Release';
+        const normKey = normalizeReleaseKey(titleLine);
+
+        // Deduplication
+        if (posted.has(normKey)) {
+          console.log(`   ⏭️ Already posted previously: ${titleLine}`);
+          posted.add(msgKey);
+          savePostedIds(posted);
+          continue;
+        }
+
+        // Case A: Direct file attached
         if (msg.media && msg.media.document) {
           const doc = msg.media.document;
           const originalName = doc.attributes?.find(a => a.fileName)?.fileName || `sub_${msg.id}.ass`;
@@ -99,17 +130,7 @@ export async function checkTelegramChannels() {
 
           if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
             const isZip = ['.zip', '.rar', '.7z'].includes(ext);
-            const normKey = normalizeReleaseKey(originalName);
-
-            // Deduplication check
-            if (posted.has(normKey)) {
-              console.log(`   ⏭️ Already posted previously: ${originalName}`);
-              posted.add(msgKey);
-              savePostedIds(posted);
-              continue;
-            }
-
-            console.log(`   ⚡ Downloading subtitle file: "${originalName}"`);
+            console.log(`   ⚡ Downloading attached file: "${originalName}"`);
             fs.mkdirSync(OUT_DIR, { recursive: true });
             const localFilePath = path.join(OUT_DIR, originalName);
 
@@ -117,11 +138,10 @@ export async function checkTelegramChannels() {
             fs.writeFileSync(localFilePath, buffer);
 
             const cleanCaption = formatCleanCaption(originalName, isZip);
-            console.log(`   📤 Publishing to channel with caption: "${cleanCaption}"`);
-            
+            console.log(`   📤 Publishing to channel: "${cleanCaption}"`);
             await sendDocument(localFilePath, cleanCaption);
             console.log(`   ✅ Successfully posted!`);
-            
+
             newFound++;
             posted.add(msgKey);
             posted.add(normKey);
@@ -130,14 +150,58 @@ export async function checkTelegramChannels() {
           }
         }
 
-        // Case B: Post links in Fansub Channel (e.g. Arabic Anime Publisher)
-        const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-        if (urlMatches.length === 0) {
-          posted.add(msgKey);
-          savePostedIds(posted);
-          continue;
+        // Case B: SUBDL Info Link in KokoBoko [Subdl]
+        const subdlMatch = text.match(/https?:\/\/(?:www\.)?subdl\.com\/s\/info\/[a-zA-Z0-9]+/i);
+        if (subdlMatch) {
+          const subdlInfoUrl = subdlMatch[0];
+          console.log(`   🌐 Resolving official SUBDL download link: ${subdlInfoUrl}`);
+          const dlUrl = await resolveSubdlDownloadUrl(subdlInfoUrl);
+
+          if (dlUrl) {
+            console.log(`   📥 Downloading official subtitle from SUBDL: ${dlUrl}`);
+            fs.mkdirSync(OUT_DIR, { recursive: true });
+            const tempZip = path.join(OUT_DIR, `subdl_${msg.id}.zip`);
+            const subdlRes = await fetch(dlUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const zipBuffer = await subdlRes.arrayBuffer();
+            fs.writeFileSync(tempZip, Buffer.from(zipBuffer));
+
+            // Extract ZIP contents
+            const extractTemp = path.join(OUT_DIR, `subdl_extracted_${msg.id}`);
+            fs.mkdirSync(extractTemp, { recursive: true });
+            try {
+              execSync(`unzip -o "${tempZip}" -d "${extractTemp}"`);
+            } catch {
+              try {
+                execSync(`tar -xf "${tempZip}" -C "${extractTemp}"`);
+              } catch {}
+            }
+
+            const subFiles = fs.readdirSync(extractTemp).filter(f => /\.(ass|srt)$/i.test(f));
+            if (subFiles.length > 0) {
+              for (const sFile of subFiles) {
+                const ext = path.extname(sFile);
+                const safeName = `${titleLine.replace(/[\\/:*?"<>|]+/g, '_')}${ext}`;
+                const finalSubPath = path.join(OUT_DIR, safeName);
+                fs.copyFileSync(path.join(extractTemp, sFile), finalSubPath);
+
+                const cleanCaption = titleLine;
+                console.log(`   📤 Publishing official subtitle: "${cleanCaption}"`);
+                await sendDocument(finalSubPath, cleanCaption);
+                console.log(`   ✅ Successfully posted!`);
+                newFound++;
+              }
+              posted.add(msgKey);
+              posted.add(normKey);
+              savePostedIds(posted);
+              fs.rmSync(extractTemp, { recursive: true, force: true });
+              fs.rmSync(tempZip, { force: true });
+              continue;
+            }
+          }
         }
 
+        // Case C: Post links in Fansub Channel (Arabic Anime Publisher)
+        const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
         const postPageUrl = urlMatches.find(u => 
           !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com')
         );
@@ -158,27 +222,16 @@ export async function checkTelegramChannels() {
         }
 
         if (bestUrl) {
-          const rawTitle = pageData?.title || text.split('\n')[0].trim();
-          const normKey = normalizeReleaseKey(rawTitle);
-
-          if (posted.has(normKey)) {
-            console.log(`   ⏭️ Already posted previously: ${rawTitle}`);
-            posted.add(msgKey);
-            savePostedIds(posted);
-            continue;
-          }
-
+          const rawTitle = pageData?.title || titleLine;
           console.log(`   🎯 Extracting: ${bestUrl}`);
           const extracted = await processAndExtract(bestUrl, rawTitle);
 
-          // 1. Send all extracted subtitle files (.ass)
           for (const subFile of extracted.subFiles) {
             const cleanCaption = formatCleanCaption(path.basename(subFile), false);
             console.log(`   📄 Sending: ${cleanCaption}`);
             await sendDocument(subFile, cleanCaption);
           }
 
-          // 2. Send font zip if present
           if (extracted.fontZip) {
             const cleanCaption = formatCleanCaption(path.basename(extracted.fontZip), true);
             console.log(`   🔤 Sending fonts: ${cleanCaption}`);
