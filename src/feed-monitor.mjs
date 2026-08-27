@@ -5,6 +5,7 @@ import { CONFIG } from './config.mjs';
 import { scrapePostPage } from './site-scrapers.mjs';
 import { processAndExtract } from './extractor.mjs';
 import { sendDocument, sendPhoto, sendMessage } from './telegram.mjs';
+import { checkTelegramChannels } from './telegram-client.mjs';
 
 const POSTED_FILE = path.resolve('data', 'posted.json');
 
@@ -29,8 +30,15 @@ function savePostedIds(set) {
 export async function checkNewReleases() {
   console.log(`\n🔍 [${new Date().toISOString()}] Checking all sources for new anime releases...`);
   const posted = loadPostedIds();
-  let newFound = 0;
 
+  // 1. Check Source Telegram Channels (Arabic Anime Publisher & SUBDL / Rengoku)
+  try {
+    await checkTelegramChannels();
+  } catch (err) {
+    console.error('Channel monitor error:', err.message);
+  }
+
+  // 2. Check Fansub Team Websites (RSS Feeds)
   for (const site of CONFIG.SITES) {
     try {
       console.log(`📡 Checking feed for: ${site.name} (${site.feed})`);
@@ -48,17 +56,12 @@ export async function checkNewReleases() {
         if (title && link) items.push({ title, link });
       });
 
-      console.log(`   Found ${items.length} items in feed.`);
-
       for (const item of items.slice(0, 3)) {
         if (posted.has(item.link)) continue;
 
-        console.log(`\n✨ NEW RELEASE DETECTED: "${item.title}"`);
-        console.log(`   URL: ${item.link}`);
-
+        console.log(`\n✨ NEW RSS RELEASE: "${item.title}"`);
         const pageData = await scrapePostPage(item.link, site);
         if (!pageData || !pageData.bestDownloadUrl) {
-          console.warn(`   ⚠️ No download link found on page: ${item.link}`);
           posted.add(item.link);
           continue;
         }
@@ -83,28 +86,22 @@ export async function checkNewReleases() {
 
           for (const subFile of extracted.subFiles) {
             const subName = path.basename(subFile);
-            console.log(`   📄 Sending subtitle file: ${subName}`);
             await sendDocument(subFile, `📎 <b>ملف الترجمة:</b> <code>${subName}</code>`);
           }
 
           if (extracted.fontZip) {
             const zipName = path.basename(extracted.fontZip);
-            console.log(`   🔤 Sending fonts package: ${zipName}`);
             await sendDocument(extracted.fontZip, `🔤 <b>حزمة الخطوط المرفقة بالعمل:</b> <code>${zipName}</code>`);
           }
-
-          console.log(`   ✅ Successfully posted to Telegram!`);
-          newFound++;
         }
 
         posted.add(item.link);
         savePostedIds(posted);
       }
     } catch (err) {
-      console.error(`Feed check error for ${site.name}:`, err.message);
+      console.warn(`Feed check warning for ${site.name}:`, err.message);
     }
   }
 
   savePostedIds(posted);
-  console.log(`🏁 Check cycle complete. Processed ${newFound} new release(s).\n`);
 }

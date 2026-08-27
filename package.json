@@ -8,7 +8,9 @@
     "start": "node src/index.mjs"
   },
   "dependencies": {
+    "cheerio": "^1.0.0",
     "express": "^4.21.0",
-    "cheerio": "^1.0.0"
+    "input": "^1.0.1",
+    "telegram": "^2.26.22"
   }
 }

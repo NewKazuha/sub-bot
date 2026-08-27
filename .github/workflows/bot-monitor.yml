@@ -1,4 +1,4 @@
-﻿name: Anime Sub Auto-Poster Monitor
+name: Anime Sub Auto-Poster Monitor
 
 on:
   schedule:
@@ -26,14 +26,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies & Tools
+      - name: Install Dependencies & Multimedia Tools
         run: |
           npm install
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools ffmpeg
+          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools ffmpeg zip
           pip install --no-cache-dir mega.py gdown
 
       - name: Run Feed Monitor & Extract Subtitles
+        env:
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
         run: |
           node -e "import('./src/feed-monitor.mjs').then(m => m.checkNewReleases());"
 
@@ -41,5 +45,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/posted.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update posted releases list" && git push origin main)
+          git add data/posted.json || true
+          git commit -m "Update posted releases list [skip ci]" || true
+          git push origin main || true
