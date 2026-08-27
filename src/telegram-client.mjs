@@ -57,7 +57,7 @@ async function resolveSubdlDownloadUrl(infoUrl) {
       const href = doc(el).attr('href') || '';
       if (href.includes('dl.subdl.com/subtitle/')) {
         dlUrl = href;
-        return false; // break
+        return false;
       }
     });
     return dlUrl;
@@ -83,9 +83,6 @@ export async function checkTelegramChannels() {
     await client.start({ botAuthToken: '' });
     const dialogs = await client.getDialogs({ limit: 100 });
 
-    // Filter ONLY the two exact source channels:
-    // 1. Arabic Anime Publisher (Fansub releases)
-    // 2. KokoBoko [Subdl] (Official subtitles)
     const targetSourceChats = dialogs.filter(d => {
       const idStr = String(d.id);
       const title = (d.title || '').toLowerCase();
@@ -165,7 +162,6 @@ export async function checkTelegramChannels() {
             const zipBuffer = await subdlRes.arrayBuffer();
             fs.writeFileSync(tempZip, Buffer.from(zipBuffer));
 
-            // Extract ZIP contents
             const extractTemp = path.join(OUT_DIR, `subdl_extracted_${msg.id}`);
             fs.mkdirSync(extractTemp, { recursive: true });
             try {
@@ -211,7 +207,8 @@ export async function checkTelegramChannels() {
 
         if (postPageUrl) {
           console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
-          pageData = await scrapePostPage(postPageUrl);
+          const matchingSite = CONFIG.SITES.find(s => postPageUrl.includes(new URL(s.base).hostname));
+          pageData = await scrapePostPage(postPageUrl, matchingSite);
           bestUrl = pageData?.bestDownloadUrl;
         }
 
@@ -224,29 +221,34 @@ export async function checkTelegramChannels() {
         if (bestUrl) {
           const rawTitle = pageData?.title || titleLine;
           console.log(`   🎯 Extracting: ${bestUrl}`);
-          const extracted = await processAndExtract(bestUrl, rawTitle);
+          try {
+            const extracted = await processAndExtract(bestUrl, rawTitle);
 
-          for (const subFile of extracted.subFiles) {
-            const cleanCaption = formatCleanCaption(path.basename(subFile), false);
-            console.log(`   📄 Sending: ${cleanCaption}`);
-            await sendDocument(subFile, cleanCaption);
-          }
+            for (const subFile of extracted.subFiles) {
+              const cleanCaption = formatCleanCaption(path.basename(subFile), false);
+              console.log(`   📄 Sending: ${cleanCaption}`);
+              await sendDocument(subFile, cleanCaption);
+            }
 
-          if (extracted.fontZip) {
-            const cleanCaption = formatCleanCaption(path.basename(extracted.fontZip), true);
-            console.log(`   🔤 Sending fonts: ${cleanCaption}`);
-            await sendDocument(extracted.fontZip, cleanCaption);
-          }
+            if (extracted.fontZip) {
+              const cleanCaption = formatCleanCaption(path.basename(extracted.fontZip), true);
+              console.log(`   🔤 Sending fonts: ${cleanCaption}`);
+              await sendDocument(extracted.fontZip, cleanCaption);
+            }
 
-          if (extracted.subFiles.length > 0 || extracted.fontZip) {
-            console.log(`   ✅ Successfully posted!`);
-            newFound++;
-            posted.add(normKey);
+            if (extracted.subFiles.length > 0 || extracted.fontZip) {
+              console.log(`   ✅ Successfully posted!`);
+              newFound++;
+              posted.add(msgKey);
+              posted.add(normKey);
+              savePostedIds(posted);
+            }
+          } catch (e) {
+            console.error(`   ❌ Extraction failed for ${bestUrl}:`, e.message);
           }
+        } else {
+          console.warn(`   ⚠️ No valid download link could be extracted from: ${postPageUrl || text}`);
         }
-
-        posted.add(msgKey);
-        savePostedIds(posted);
       }
     }
   } catch (err) {
