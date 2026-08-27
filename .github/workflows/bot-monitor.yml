@@ -1,0 +1,44 @@
+﻿name: Anime Sub Auto-Poster Monitor
+
+on:
+  schedule:
+    # Runs every 15 minutes automatically 24/7
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Tools (MKVToolNix, Aria2, Megatools, FFmpeg, Gdown)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools ffmpeg
+          pip install --no-cache-dir mega.py gdown
+
+      - name: Run Feed Monitor & Extract Subtitles
+        run: |
+          node -e "import('./src/feed-monitor.mjs').then(m => m.checkNewReleases());"
+
+      - name: Commit & Push Processed State
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/posted.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update posted releases list" && git push origin main)
