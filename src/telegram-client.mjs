@@ -5,12 +5,12 @@ import path from 'node:path';
 import { CONFIG } from './config.mjs';
 import { scrapePostPage } from './site-scrapers.mjs';
 import { processAndExtract } from './extractor.mjs';
-import { sendDocument, sendPhoto, sendMessage } from './telegram.mjs';
+import { sendDocument } from './telegram.mjs';
 
 const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
 
-function loadPostedIds() {
+export function loadPostedIds() {
   try {
     if (fs.existsSync(POSTED_FILE)) {
       return new Set(JSON.parse(fs.readFileSync(POSTED_FILE, 'utf8')));
@@ -19,7 +19,7 @@ function loadPostedIds() {
   return new Set();
 }
 
-function savePostedIds(set) {
+export function savePostedIds(set) {
   try {
     fs.mkdirSync(path.dirname(POSTED_FILE), { recursive: true });
     fs.writeFileSync(POSTED_FILE, JSON.stringify([...set], null, 2));
@@ -28,89 +28,109 @@ function savePostedIds(set) {
   }
 }
 
+// Generate normalized key to prevent duplicate posts across multiple sources
+export function normalizeReleaseKey(rawTitle) {
+  return rawTitle
+    .toLowerCase()
+    .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar/gi, '')
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+// Clean caption matching the old channel format exactly:
+// e.g. "[Crunchyroll] Maou 2099 - 06" or "[ESPADAS-3ASQ] Bleach Sennen Kessen-hen - 33 [+Fonts]"
+export function formatCleanCaption(fileName, isZip = false) {
+  let base = path.basename(fileName, path.extname(fileName));
+  if (isZip && !base.includes('[+Fonts]') && !base.includes('[+fonts]')) {
+    return `${base} [+Fonts]`;
+  }
+  return base;
+}
+
 export async function checkTelegramChannels() {
   const sessionStr = CONFIG.TELEGRAM.SESSION;
-  if (!sessionStr) {
-    console.warn('⚠️ No TELEGRAM_SESSION found in configuration. Skipping channel polling.');
-    return;
-  }
+  if (!sessionStr) return;
 
   const posted = loadPostedIds();
   let newFound = 0;
 
-  console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram to check source channels...`);
+  console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
   const client = new TelegramClient(new StringSession(sessionStr), CONFIG.TELEGRAM.API_ID, CONFIG.TELEGRAM.API_HASH, {
     connectionRetries: 5
   });
 
   try {
     await client.start({ botAuthToken: '' });
-    console.log('   ✅ Connected successfully as user!');
-
     const dialogs = await client.getDialogs({ limit: 100 });
-    
-    // Find target source channels
+
+    // Target source channels:
+    // 1. Fansub publisher (instant fansub releases)
+    // 2. SUBDL channels (for official subs: Crunchyroll, Netflix, Shahid, etc.)
     const targetSourceChats = dialogs.filter(d => {
       const idStr = String(d.id);
       const title = (d.title || '').toLowerCase();
       return (
         idStr.includes('1031770723') ||
         idStr.includes('1224725097') ||
-        idStr.includes('2217287273') ||
         idStr.includes('2166566367') ||
+        idStr.includes('2217287273') ||
         title.includes('arabic anime publisher') ||
         title.includes('kokoboko') ||
         title.includes('rengoku')
       );
     });
 
-    console.log(`   Found ${targetSourceChats.length} source channel(s) in dialogs.`);
-
     for (const chat of targetSourceChats) {
-      console.log(`\n🔍 Checking recent messages from: "${chat.title}" (ID: ${chat.id})`);
-      const msgs = await client.getMessages(chat.id, { limit: 5 });
+      const isSubdlSource = (chat.title || '').toLowerCase().includes('subdl') || (chat.title || '').toLowerCase().includes('rengoku');
+      console.log(`\n🔍 Checking: "${chat.title}" (ID: ${chat.id})`);
+      const msgs = await client.getMessages(chat.id, { limit: 10 });
 
       for (const msg of msgs) {
         const msgKey = `tg_${chat.id}_${msg.id}`;
         if (posted.has(msgKey)) continue;
 
         const text = msg.message || '';
-        console.log(`\n✨ NEW MESSAGE DETECTED from [${chat.title}]:`);
-        console.log(`   Message snippet: ${text.slice(0, 150).replace(/\n/g, ' ')}`);
-
-        // 1. Check if the message has an attached subtitle / archive file directly (.ass, .srt, .zip, .rar)
+        
+        // Case A: Direct file attached (.ass, .srt, .zip, .rar, .7z)
         if (msg.media && msg.media.document) {
           const doc = msg.media.document;
-          const fileName = doc.attributes?.find(a => a.fileName)?.fileName || `sub_${msg.id}.ass`;
-          const ext = path.extname(fileName).toLowerCase();
+          const originalName = doc.attributes?.find(a => a.fileName)?.fileName || `sub_${msg.id}.ass`;
+          const ext = path.extname(originalName).toLowerCase();
 
           if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
-            console.log(`   ⚡ Direct subtitle/font document attached in message: "${fileName}"`);
-            fs.mkdirSync(OUT_DIR, { recursive: true });
-            const localFilePath = path.join(OUT_DIR, fileName);
+            const isZip = ['.zip', '.rar', '.7z'].includes(ext);
+            const normKey = normalizeReleaseKey(originalName);
 
-            console.log(`   📥 Downloading attachment from Telegram...`);
+            // Deduplication check
+            if (posted.has(normKey)) {
+              console.log(`   ⏭️ Already posted previously: ${originalName}`);
+              posted.add(msgKey);
+              savePostedIds(posted);
+              continue;
+            }
+
+            console.log(`   ⚡ Downloading subtitle file: "${originalName}"`);
+            fs.mkdirSync(OUT_DIR, { recursive: true });
+            const localFilePath = path.join(OUT_DIR, originalName);
+
             const buffer = await client.downloadMedia(msg);
             fs.writeFileSync(localFilePath, buffer);
 
-            const titleMatch = text.split('\n')[0] || fileName;
-            const caption = [
-              `🎬 <b>${titleMatch}</b>`,
-              `👥 <b>المصدر:</b> ${chat.title}`,
-              `\n💎 <i>تم النشر تلقائياً عبر @ArAnimeSubBot</i>`
-            ].join('\n');
-
-            console.log(`   📤 Publishing directly to Telegram Channel...`);
-            await sendDocument(localFilePath, caption);
+            const cleanCaption = formatCleanCaption(originalName, isZip);
+            console.log(`   📤 Publishing to channel with caption: "${cleanCaption}"`);
+            
+            await sendDocument(localFilePath, cleanCaption);
             console.log(`   ✅ Successfully posted!`);
+            
             newFound++;
             posted.add(msgKey);
+            posted.add(normKey);
             savePostedIds(posted);
             continue;
           }
         }
 
-        // 2. Extract URLs from message text
+        // Case B: Post links in Fansub Channel (e.g. Arabic Anime Publisher)
         const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
         if (urlMatches.length === 0) {
           posted.add(msgKey);
@@ -118,10 +138,6 @@ export async function checkTelegramChannels() {
           continue;
         }
 
-        console.log(`   Discovered ${urlMatches.length} link(s) in message.`);
-        const titleLine = text.split('\n')[0].trim() || 'Anime Release';
-
-        // Check if there is a blog / post page URL (e.g. Celestial, Asahi, Blogspot, Rhythm, Revive, etc.)
         const postPageUrl = urlMatches.find(u => 
           !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com')
         );
@@ -130,12 +146,11 @@ export async function checkTelegramChannels() {
         let pageData = null;
 
         if (postPageUrl) {
-          console.log(`   🌐 Scraping post page: ${postPageUrl}`);
+          console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
           pageData = await scrapePostPage(postPageUrl);
           bestUrl = pageData?.bestDownloadUrl;
         }
 
-        // If not found from scraping, check if there's a direct Mega/Drive/Mediafire link in the message text itself
         if (!bestUrl) {
           bestUrl = urlMatches.find(u => 
             u.includes('mega.nz') || u.includes('drive.google.com') || u.includes('mediafire.com') || u.includes('nyaa.si') || /\.(ass|srt|zip)$/i.test(u)
@@ -143,39 +158,37 @@ export async function checkTelegramChannels() {
         }
 
         if (bestUrl) {
-          console.log(`   🎯 Selected Best Download Link: ${bestUrl}`);
-          const extracted = await processAndExtract(bestUrl, pageData?.title || titleLine);
+          const rawTitle = pageData?.title || text.split('\n')[0].trim();
+          const normKey = normalizeReleaseKey(rawTitle);
 
-          if (extracted.subFiles.length > 0) {
-            console.log(`   📤 Publishing to Telegram Channel...`);
-            
-            const caption = [
-              `🎬 <b>${pageData?.title || titleLine}</b>`,
-              `👥 <b>المصدر:</b> ${chat.title}`,
-              postPageUrl ? `🔗 <a href="${postPageUrl}">رابط التدوينة الأصلية</a>` : '',
-              `\n💎 <i>تم استخراج الترجمة تلقائياً عبر @ArAnimeSubBot</i>`
-            ].filter(Boolean).join('\n');
+          if (posted.has(normKey)) {
+            console.log(`   ⏭️ Already posted previously: ${rawTitle}`);
+            posted.add(msgKey);
+            savePostedIds(posted);
+            continue;
+          }
 
-            if (pageData?.posterUrl) {
-              await sendPhoto(pageData.posterUrl, caption).catch(() => {});
-            } else {
-              await sendMessage(caption).catch(() => {});
-            }
+          console.log(`   🎯 Extracting: ${bestUrl}`);
+          const extracted = await processAndExtract(bestUrl, rawTitle);
 
-            for (const subFile of extracted.subFiles) {
-              const subName = path.basename(subFile);
-              console.log(`   📄 Sending subtitle file: ${subName}`);
-              await sendDocument(subFile, `📎 <b>ملف الترجمة:</b> <code>${subName}</code>`);
-            }
+          // 1. Send all extracted subtitle files (.ass)
+          for (const subFile of extracted.subFiles) {
+            const cleanCaption = formatCleanCaption(path.basename(subFile), false);
+            console.log(`   📄 Sending: ${cleanCaption}`);
+            await sendDocument(subFile, cleanCaption);
+          }
 
-            if (extracted.fontZip) {
-              const zipName = path.basename(extracted.fontZip);
-              console.log(`   🔤 Sending fonts package: ${zipName}`);
-              await sendDocument(extracted.fontZip, `🔤 <b>حزمة الخطوط المرفقة بالعمل:</b> <code>${zipName}</code>`);
-            }
+          // 2. Send font zip if present
+          if (extracted.fontZip) {
+            const cleanCaption = formatCleanCaption(path.basename(extracted.fontZip), true);
+            console.log(`   🔤 Sending fonts: ${cleanCaption}`);
+            await sendDocument(extracted.fontZip, cleanCaption);
+          }
 
-            console.log(`   ✅ Successfully posted to Telegram!`);
+          if (extracted.subFiles.length > 0 || extracted.fontZip) {
+            console.log(`   ✅ Successfully posted!`);
             newFound++;
+            posted.add(normKey);
           }
         }
 

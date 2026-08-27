@@ -1,37 +1,16 @@
 import * as cheerio from 'cheerio';
-import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG } from './config.mjs';
 import { scrapePostPage } from './site-scrapers.mjs';
 import { processAndExtract } from './extractor.mjs';
-import { sendDocument, sendPhoto, sendMessage } from './telegram.mjs';
-import { checkTelegramChannels } from './telegram-client.mjs';
-
-const POSTED_FILE = path.resolve('data', 'posted.json');
-
-function loadPostedIds() {
-  try {
-    if (fs.existsSync(POSTED_FILE)) {
-      return new Set(JSON.parse(fs.readFileSync(POSTED_FILE, 'utf8')));
-    }
-  } catch {}
-  return new Set();
-}
-
-function savePostedIds(set) {
-  try {
-    fs.mkdirSync(path.dirname(POSTED_FILE), { recursive: true });
-    fs.writeFileSync(POSTED_FILE, JSON.stringify([...set], null, 2));
-  } catch (e) {
-    console.error('Failed to save posted IDs:', e.message);
-  }
-}
+import { sendDocument } from './telegram.mjs';
+import { checkTelegramChannels, loadPostedIds, savePostedIds, normalizeReleaseKey, formatCleanCaption } from './telegram-client.mjs';
 
 export async function checkNewReleases() {
   console.log(`\n🔍 [${new Date().toISOString()}] Checking all sources for new anime releases...`);
   const posted = loadPostedIds();
 
-  // 1. Check Source Telegram Channels (Arabic Anime Publisher & SUBDL / Rengoku)
+  // 1. Check Source Telegram Channels (Arabic Anime Publisher & SUBDL)
   try {
     await checkTelegramChannels();
   } catch (err) {
@@ -59,6 +38,16 @@ export async function checkNewReleases() {
       for (const item of items.slice(0, 3)) {
         if (posted.has(item.link)) continue;
 
+        const rawTitle = item.title;
+        const normKey = normalizeReleaseKey(rawTitle);
+
+        if (posted.has(normKey)) {
+          console.log(`   ⏭️ Already posted previously: ${rawTitle}`);
+          posted.add(item.link);
+          savePostedIds(posted);
+          continue;
+        }
+
         console.log(`\n✨ NEW RSS RELEASE: "${item.title}"`);
         const pageData = await scrapePostPage(item.link, site);
         if (!pageData || !pageData.bestDownloadUrl) {
@@ -68,31 +57,22 @@ export async function checkNewReleases() {
 
         const extracted = await processAndExtract(pageData.bestDownloadUrl, pageData.title || item.title);
 
-        if (extracted.subFiles.length > 0) {
-          console.log(`   📤 Publishing to Telegram Channel...`);
-          
-          const caption = [
-            `🎬 <b>${pageData.title || item.title}</b>`,
-            `👥 <b>فريق الترجمة:</b> ${site.name}`,
-            `🔗 <a href="${item.link}">رابط تدوينة العمل الأصلية</a>`,
-            `\n💎 <i>تم استخراج الترجمة تلقائياً عبر @ArAnimeSubBot</i>`
-          ].join('\n');
+        // 1. Send all extracted subtitle files (.ass)
+        for (const subFile of extracted.subFiles) {
+          const cleanCaption = formatCleanCaption(path.basename(subFile), false);
+          console.log(`   📄 Sending: ${cleanCaption}`);
+          await sendDocument(subFile, cleanCaption);
+        }
 
-          if (pageData.posterUrl) {
-            await sendPhoto(pageData.posterUrl, caption).catch(() => {});
-          } else {
-            await sendMessage(caption).catch(() => {});
-          }
+        // 2. Send font zip if present
+        if (extracted.fontZip) {
+          const cleanCaption = formatCleanCaption(path.basename(extracted.fontZip), true);
+          console.log(`   🔤 Sending fonts: ${cleanCaption}`);
+          await sendDocument(extracted.fontZip, cleanCaption);
+        }
 
-          for (const subFile of extracted.subFiles) {
-            const subName = path.basename(subFile);
-            await sendDocument(subFile, `📎 <b>ملف الترجمة:</b> <code>${subName}</code>`);
-          }
-
-          if (extracted.fontZip) {
-            const zipName = path.basename(extracted.fontZip);
-            await sendDocument(extracted.fontZip, `🔤 <b>حزمة الخطوط المرفقة بالعمل:</b> <code>${zipName}</code>`);
-          }
+        if (extracted.subFiles.length > 0 || extracted.fontZip) {
+          posted.add(normKey);
         }
 
         posted.add(item.link);
