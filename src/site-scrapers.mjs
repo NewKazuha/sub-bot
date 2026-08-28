@@ -22,7 +22,7 @@ class SessionJar {
 const siteSessions = new Map();
 
 async function ensureSiteSession(siteConfig) {
-  if (!siteConfig.user || !siteConfig.pass) return null;
+  if (!siteConfig || !siteConfig.user || !siteConfig.pass) return null;
   let jar = siteSessions.get(siteConfig.id);
   if (!jar) {
     jar = new SessionJar();
@@ -36,6 +36,7 @@ async function ensureSiteSession(siteConfig) {
       log: siteConfig.user,
       pwd: siteConfig.pass,
       rememberme: 'forever',
+      'wp-submit': 'Log In',
       testcookie: '1',
       redirect_to: `${siteConfig.base}/`
     });
@@ -58,6 +59,21 @@ async function ensureSiteSession(siteConfig) {
   return jar;
 }
 
+const IGNORED_DOMAINS = [
+  'maz-software.com',
+  'twitter.com',
+  'x.com',
+  'facebook.com',
+  'instagram.com',
+  'discord.gg',
+  'discord.com',
+  't.me',
+  'telegram.me',
+  'wordpress.org',
+  'blogger.com',
+  'google.com/url'
+];
+
 export async function scrapePostPage(pageUrl, siteConfig = null) {
   let cookieHeader = '';
   if (siteConfig && siteConfig.user) {
@@ -78,39 +94,47 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
 
   const $ = cheerio.load(html);
 
-  const title = $('h1.entry-title').text().trim() || $('title').text().replace(/[-–|].*$/, '').trim() || 'Anime Release';
-  let posterUrl = $('img.wp-post-image').attr('src') || $('img.entry-image').attr('src') || $('article img').first().attr('src') || null;
-  if (posterUrl && posterUrl.startsWith('//')) posterUrl = 'https:' + posterUrl;
+  const title = $('h1.entry-title').text().trim() || 
+                $('h1.post-title').text().trim() || 
+                $('title').text().replace(/[-–|].*$/, '').trim() || 
+                'Anime Release';
 
   const allLinks = [];
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href');
     const text = $(el).text().trim();
     if (href && /^https?:\/\//i.test(href)) {
-      allLinks.push({ href, text });
+      const isIgnored = IGNORED_DOMAINS.some(d => href.includes(d));
+      if (!isIgnored) {
+        allLinks.push({ href, text });
+      }
     }
   });
 
   const directSub = allLinks.find(l => 
-    /\.(ass|srt|zip)$/i.test(l.href) || 
-    /ترجمة|ملف الترجمة|softsub|sub/i.test(l.text)
+    /\.(ass|srt|zip|rar|7z)$/i.test(l.href) || 
+    /^(ملف الترجمة|الترجمة|softsub|fonts|الخطوط)$/i.test(l.text)
   );
 
-  const videoLinks = {
-    directSub: directSub ? directSub.href : null,
-    mega: allLinks.find(l => l.href.includes('mega.nz'))?.href || null,
-    drive: allLinks.find(l => l.href.includes('drive.google.com'))?.href || null,
-    mediafire: allLinks.find(l => l.href.includes('mediafire.com'))?.href || null,
-    torrent: allLinks.find(l => l.href.includes('.torrent') || l.href.includes('nyaa.si') || l.href.includes('/rr-torrent/'))?.href || null
-  };
+  const top4top = allLinks.find(l => l.href.includes('top4top.io'))?.href || null;
+  const mediafire = allLinks.find(l => l.href.includes('mediafire.com'))?.href || null;
+  const mega = allLinks.find(l => l.href.includes('mega.nz'))?.href || null;
+  const drive = allLinks.find(l => l.href.includes('drive.google.com'))?.href || null;
+  const torrent = allLinks.find(l => l.href.includes('.torrent') || l.href.includes('nyaa.si'))?.href || null;
 
-  const bestDownloadUrl = videoLinks.directSub || videoLinks.mega || videoLinks.drive || videoLinks.mediafire || videoLinks.torrent;
+  const bestDownloadUrl = directSub ? directSub.href : (top4top || mediafire || mega || drive || torrent || null);
 
   return {
     title,
-    posterUrl,
     pageUrl,
     bestDownloadUrl,
-    videoLinks
+    videoLinks: {
+      directSub: directSub ? directSub.href : null,
+      top4top,
+      mediafire,
+      mega,
+      drive,
+      torrent
+    }
   };
 }

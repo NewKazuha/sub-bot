@@ -4,3 +4,6 @@ temp_extracted/
 .env
 SESSION_STRING.txt
 generate-session.mjs
+scratch/
+temp_*
+*.zip
