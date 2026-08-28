@@ -71,7 +71,7 @@ export function getCoreAnimeEpisodeKey(title) {
   return title
     .toLowerCase()
     .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
-    .replace(/^\[[^\]]+\]\s*/, '') // strip leading platform/team bracket
+    .replace(/^\[[^\]]+\]\s*/, '')
     .replace(/Ⅱ/g, '2')
     .replace(/Ⅲ/g, '3')
     .replace(/Ⅳ/g, '4')
@@ -243,7 +243,7 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
 }
 
 // ====================================================================
-// SUBDL & Top4Top URL resolvers
+// SUBDL, Top4Top, and Mediafire resolvers
 // ====================================================================
 async function resolveSubdlDownloadUrl(infoUrl) {
   try {
@@ -296,8 +296,24 @@ async function resolveTop4topDownloadUrl(top4topUrl) {
   }
 }
 
+async function resolveMediafireDownloadUrl(mfUrl) {
+  try {
+    const res = await fetch(mfUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const doc = cheerio.load(html);
+    const dlBtn = doc('#downloadButton').attr('href') || doc('a[aria-label="Download file"]').attr('href');
+    if (dlBtn && dlBtn.startsWith('http')) return dlBtn;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ====================================================================
-// Erai-Raws & Torrent Extraction helpers
+// Universal Extraction and Multimedia Tools
 // ====================================================================
 
 function parseEraiMessage(msg) {
@@ -342,10 +358,88 @@ function hasRequiredTools() {
   }
 }
 
-/**
- * Download torrent via aria2c → extract subtitle & fonts track via mkvextract.
- * Returns { filePath, isArchive, ext } or null.
- */
+function extractSubtitleAndFontsFromAnyFile(filePath, workDir, preferArabic = false) {
+  if (!fs.existsSync(filePath)) return null;
+
+  // 1. Direct valid archive or subtitle file
+  const magic = validateFileMagic(filePath);
+  if (magic) {
+    return { filePath, isArchive: magic.isArchive, ext: magic.ext };
+  }
+
+  // 2. MKV / Video file with softsubs & fonts
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.mkv' || ext === '.mp4' || ext === '.m4v') {
+    try {
+      const trackInfo = execSync(`mkvmerge --identify --identification-format json "${filePath}"`, {
+        encoding: 'utf8',
+        timeout: 30000
+      });
+      const info = JSON.parse(trackInfo);
+      const subTracks = (info.tracks || []).filter(t => t.type === 'subtitles');
+      if (subTracks.length === 0) return null;
+
+      let selectedTrack = subTracks.find(t =>
+        t.properties?.language === 'ara' ||
+        t.properties?.language_ietf === 'ar' ||
+        t.properties?.language_ietf === 'ar-SA' ||
+        (t.properties?.track_name || '').toLowerCase().includes('arabic') ||
+        (t.properties?.track_name || '').toLowerCase().includes('عربي')
+      );
+
+      if (!selectedTrack && !preferArabic) {
+        selectedTrack = subTracks[0];
+      }
+
+      if (!selectedTrack) return null;
+
+      const trackId = selectedTrack.id;
+      const codec = (selectedTrack.codec || '').toLowerCase();
+      const subExt = codec.includes('subrip') || codec.includes('srt') ? '.srt' : '.ass';
+      const extractedSubPath = path.join(workDir, `extracted_sub${subExt}`);
+
+      execSync(`mkvextract tracks "${filePath}" ${trackId}:"${extractedSubPath}"`, {
+        stdio: 'pipe',
+        timeout: 60000
+      });
+
+      if (!fs.existsSync(extractedSubPath) || fs.statSync(extractedSubPath).size < 50) return null;
+
+      // Extract fonts if present
+      const attachments = (info.attachments || []).filter(a => {
+        const fn = (a.file_name || '').toLowerCase();
+        return fn.endsWith('.ttf') || fn.endsWith('.otf') || fn.endsWith('.woff') || fn.endsWith('.woff2');
+      });
+
+      if (attachments.length > 0) {
+        console.log(`   📦 Found ${attachments.length} font attachment(s). Extracting and archiving...`);
+        const fontsDir = path.join(workDir, 'fonts');
+        fs.mkdirSync(fontsDir, { recursive: true });
+
+        const extractArgs = attachments.map(a => `${a.id}:"${path.join(fontsDir, a.file_name)}"`).join(' ');
+        try {
+          execSync(`mkvextract attachments "${filePath}" ${extractArgs}`, { stdio: 'pipe', timeout: 60000 });
+          const zipPath = path.join(workDir, 'release_fonts.zip');
+          execSync(`zip -j "${zipPath}" "${extractedSubPath}" "${fontsDir}"/*`, { stdio: 'pipe', timeout: 60000 });
+
+          if (fs.existsSync(zipPath) && fs.statSync(zipPath).size > 100) {
+            return { filePath: zipPath, isArchive: true, ext: '.zip' };
+          }
+        } catch (e) {
+          console.warn('   ⚠️ Font extraction/zipping error:', e.message);
+        }
+      }
+
+      return { filePath: extractedSubPath, isArchive: false, ext: subExt };
+    } catch (e) {
+      console.warn('   ⚠️ MKV extraction error:', e.message);
+      return null;
+    }
+  }
+
+  return null;
+}
+
 async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, preferArabic = true) {
   const torrentPath = path.join(workDir, 'release.torrent');
   await downloadFileToDisk(torrentUrl, torrentPath);
@@ -376,110 +470,17 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, prefer
   }
   findMkvs(downloadDir);
 
-  if (mkvFiles.length === 0) {
-    console.warn(`   ⚠️ No .mkv files found after aria2c download.`);
-    return null;
-  }
+  if (mkvFiles.length === 0) return null;
 
   const mkvPath = mkvFiles[0];
   console.log(`   🎬 MKV found: ${path.basename(mkvPath)} (${(fs.statSync(mkvPath).size / 1024 / 1024).toFixed(1)} MB)`);
 
-  let trackInfo;
-  try {
-    trackInfo = execSync(`mkvmerge --identify --identification-format json "${mkvPath}"`, {
-      encoding: 'utf8',
-      timeout: 30000
-    });
-  } catch (e) {
-    console.error(`   ❌ mkvmerge identify failed:`, e.message?.slice(0, 200));
-    return null;
-  }
-
-  const info = JSON.parse(trackInfo);
-  const subTracks = (info.tracks || []).filter(t => t.type === 'subtitles');
-
-  if (subTracks.length === 0) {
-    console.warn(`   ⚠️ No subtitle tracks found in MKV.`);
-    return null;
-  }
-
-  // Pick the Arabic subtitle track or first subtitle track
-  let selectedTrack = subTracks.find(t =>
-    t.properties?.language === 'ara' ||
-    t.properties?.language_ietf === 'ar' ||
-    t.properties?.language_ietf === 'ar-SA' ||
-    (t.properties?.track_name || '').toLowerCase().includes('arabic') ||
-    (t.properties?.track_name || '').toLowerCase().includes('عربي')
-  );
-
-  if (!selectedTrack && !preferArabic) {
-    selectedTrack = subTracks[0];
-  }
-
-  if (!selectedTrack) {
-    console.warn(`   ⚠️ No matching subtitle track found in MKV.`);
-    return null;
-  }
-
-  const trackId = selectedTrack.id;
-  const codec = (selectedTrack.codec || '').toLowerCase();
-  const subExt = codec.includes('subrip') || codec.includes('srt') ? '.srt' : '.ass';
-  const extractedSubPath = path.join(workDir, `subtitle${subExt}`);
-
-  console.log(`   🔍 Selected subtitle track #${trackId} (${selectedTrack.properties?.track_name || selectedTrack.properties?.language || 'Sub'})`);
-
-  try {
-    execSync(`mkvextract tracks "${mkvPath}" ${trackId}:"${extractedSubPath}"`, {
-      stdio: 'pipe',
-      timeout: 60000
-    });
-  } catch (e) {
-    console.error(`   ❌ mkvextract tracks failed:`, e.message?.slice(0, 200));
-    return null;
-  }
-
-  if (!fs.existsSync(extractedSubPath) || fs.statSync(extractedSubPath).size < 50) {
-    console.warn(`   ⚠️ Extracted subtitle is empty.`);
-    return null;
-  }
-
-  // Check for attachments (fonts)
-  const attachments = info.attachments || [];
-  const fontAttachments = attachments.filter(a => {
-    const fn = (a.file_name || '').toLowerCase();
-    return fn.endsWith('.ttf') || fn.endsWith('.otf') || fn.endsWith('.woff') || fn.endsWith('.woff2');
-  });
-
-  let finalResult = null;
-
-  if (fontAttachments.length > 0) {
-    console.log(`   📦 Found ${fontAttachments.length} font attachment(s). Extracting and archiving...`);
-    const fontsDir = path.join(workDir, 'fonts');
-    fs.mkdirSync(fontsDir, { recursive: true });
-
-    const extractArgs = fontAttachments.map(a => `${a.id}:"${path.join(fontsDir, a.file_name)}"`).join(' ');
-    try {
-      execSync(`mkvextract attachments "${mkvPath}" ${extractArgs}`, { stdio: 'pipe', timeout: 60000 });
-      // Zip the subtitle + fonts
-      const zipPath = path.join(workDir, 'release_fonts.zip');
-      execSync(`zip -j "${zipPath}" "${extractedSubPath}" "${fontsDir}"/*`, { stdio: 'pipe', timeout: 60000 });
-
-      if (fs.existsSync(zipPath) && fs.statSync(zipPath).size > 100) {
-        finalResult = { filePath: zipPath, isArchive: true, ext: '.zip' };
-      }
-    } catch (e) {
-      console.warn(`   ⚠️ Font extraction/zipping failed, falling back to raw .ass:`, e.message);
-    }
-  }
-
-  if (!finalResult) {
-    finalResult = { filePath: extractedSubPath, isArchive: false, ext: subExt };
-  }
+  const result = extractSubtitleAndFontsFromAnyFile(mkvPath, workDir, preferArabic);
 
   try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(torrentPath, { force: true }); } catch {}
 
-  return finalResult;
+  return result;
 }
 
 // ====================================================================
@@ -497,7 +498,7 @@ export async function checkTelegramChannels() {
   const toolsAvailable = hasRequiredTools();
 
   console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
-  if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found in this environment – Torrent extraction will run in GitHub Actions.`);
+  if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found in this environment – Torrent/Cloud extraction will run in GitHub Actions.`);
 
   const client = new TelegramClient(
     new StringSession(sessionStr),
@@ -708,7 +709,7 @@ export async function checkTelegramChannels() {
           }
         }
 
-        // Case B: Post links in Fansub Channel
+        // Case B: Post links in Fansub Channel (Multi-cloud / Torrent / Direct)
         const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
         const postPageUrl = urlMatches.find(u =>
           !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com')
@@ -723,28 +724,79 @@ export async function checkTelegramChannels() {
           const pageData = await scrapePostPage(postPageUrl, matchingSite);
 
           if (pageData) {
-            let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
-            let top4topUrl = pageData.videoLinks?.top4top;
-            let torrentUrl = pageData.videoLinks?.torrent;
+            const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
+            fs.mkdirSync(fansubWorkDir, { recursive: true });
 
-            // 1. Try Direct or Top4Top download first
-            if (top4topUrl) {
-              const resolved = await resolveTop4topDownloadUrl(top4topUrl);
-              if (resolved) directUrl = resolved;
-            }
+            try {
+              let downloadedFilePath = null;
 
-            if (directUrl) {
-              try {
-                const tempFile = path.join(OUT_DIR, `fansub_dl_${msg.id}`);
-                await downloadFileToDisk(directUrl, tempFile, { Referer: postPageUrl });
+              // 1. Direct or Top4Top download
+              let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
+              if (pageData.videoLinks?.top4top) {
+                const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
+                if (resolved) directUrl = resolved;
+              }
 
-                const validated = validateFileMagic(tempFile);
-                if (validated) {
-                  const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
+              if (directUrl) {
+                try {
+                  console.log(`   📥 Direct download: ${directUrl}`);
+                  const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
+                  await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl });
+                  if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                } catch (e) {
+                  console.warn(`   ⚠️ Direct download failed:`, e.message);
+                }
+              }
+
+              // 2. Mediafire Direct File
+              if (!downloadedFilePath && pageData.videoLinks?.mediafire) {
+                console.log(`   📥 Resolving Mediafire: ${pageData.videoLinks.mediafire}`);
+                const mfDirect = await resolveMediafireDownloadUrl(pageData.videoLinks.mediafire);
+                if (mfDirect) {
+                  try {
+                    const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}`);
+                    await downloadFileToDisk(mfDirect, tempDest, { Referer: postPageUrl });
+                    if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                  } catch (e) {
+                    console.warn(`   ⚠️ Mediafire download failed:`, e.message);
+                  }
+                }
+              }
+
+              // 3. Mega (using megadl in GitHub Actions)
+              if (!downloadedFilePath && pageData.videoLinks?.mega && toolsAvailable) {
+                console.log(`   📥 Downloading from Mega: ${pageData.videoLinks.mega}`);
+                try {
+                  execSync(`megadl --path="${fansubWorkDir}" "${pageData.videoLinks.mega}"`, { stdio: 'pipe', timeout: 8 * 60 * 1000 });
+                  const files = fs.readdirSync(fansubWorkDir).filter(f => !f.endsWith('.torrent'));
+                  if (files.length > 0) downloadedFilePath = path.join(fansubWorkDir, files[0]);
+                } catch (e) {
+                  console.warn(`   ⚠️ Mega download failed:`, e.message?.slice(0, 150));
+                }
+              }
+
+              // 4. Google Drive (using gdown)
+              if (!downloadedFilePath && pageData.videoLinks?.drive && toolsAvailable) {
+                console.log(`   📥 Downloading from Google Drive: ${pageData.videoLinks.drive}`);
+                try {
+                  const gdest = path.join(fansubWorkDir, `gdrive_file`);
+                  execSync(`gdown --fuzzy "${pageData.videoLinks.drive}" -O "${gdest}"`, { stdio: 'pipe', timeout: 8 * 60 * 1000 });
+                  if (fs.existsSync(gdest) && fs.statSync(gdest).size > 100) downloadedFilePath = gdest;
+                } catch (e) {
+                  console.warn(`   ⚠️ Google Drive download failed:`, e.message?.slice(0, 150));
+                }
+              }
+
+              // 5. Torrent (using aria2c)
+              if (!downloadedFilePath && pageData.videoLinks?.torrent && toolsAvailable) {
+                console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
+                const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false);
+                if (extractedTorrent && extractedTorrent.filePath) {
+                  const cleanFileName = getSafeTelegramFileName(titleLine, extractedTorrent.ext);
                   const finalPath = path.join(OUT_DIR, cleanFileName);
-                  fs.renameSync(tempFile, finalPath);
+                  fs.renameSync(extractedTorrent.filePath, finalPath);
 
-                  const caption = formatCleanCaption(titleLine, validated.isArchive);
+                  const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive);
                   console.log(`   📤 Publishing to channel: "${caption}"`);
                   const sendResult = await sendDocument(finalPath, caption);
 
@@ -755,23 +807,12 @@ export async function checkTelegramChannels() {
                   }
                   fs.rmSync(finalPath, { force: true });
                   continue;
-                } else {
-                  fs.rmSync(tempFile, { force: true });
                 }
-              } catch (e) {
-                console.warn(`   ⚠️ Direct download failed:`, e.message);
               }
-            }
 
-            // 2. If no direct subtitle file, but a torrent is available (e.g. Rhythm / Nyaa torrent)
-            if (torrentUrl && toolsAvailable) {
-              console.log(`   🎯 Fansub torrent found: ${torrentUrl}. Extracting subtitle...`);
-              const fansubWorkDir = path.join(OUT_DIR, `fansub_torrent_${msg.id}`);
-              fs.mkdirSync(fansubWorkDir, { recursive: true });
-
-              try {
-                const extracted = await downloadAndExtractSubtitleFromTorrent(torrentUrl, fansubWorkDir, false);
-
+              // Process downloaded file (MKV extract or direct archive)
+              if (downloadedFilePath) {
+                const extracted = extractSubtitleAndFontsFromAnyFile(downloadedFilePath, fansubWorkDir, false);
                 if (extracted && extracted.filePath) {
                   const cleanFileName = getSafeTelegramFileName(titleLine, extracted.ext);
                   const finalPath = path.join(OUT_DIR, cleanFileName);
@@ -790,11 +831,11 @@ export async function checkTelegramChannels() {
                   fs.rmSync(finalPath, { force: true });
                   continue;
                 }
-              } catch (e) {
-                console.error(`   ❌ Fansub torrent extraction error:`, e.message);
-              } finally {
-                try { fs.rmSync(fansubWorkDir, { recursive: true, force: true }); } catch {}
               }
+            } catch (e) {
+              console.error(`   ❌ Fansub post processing error:`, e.message);
+            } finally {
+              try { fs.rmSync(fansubWorkDir, { recursive: true, force: true }); } catch {}
             }
           }
         }

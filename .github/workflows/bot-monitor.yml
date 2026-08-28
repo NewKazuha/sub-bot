@@ -27,11 +27,17 @@ jobs:
         with:
           node-version: 22
 
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Install Dependencies & Multimedia Tools
         run: |
           npm install --production
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 zip
+          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip
+          pip install --no-cache-dir gdown
 
       - name: Run Continuous Feed Monitor (14 minutes)
         env:
