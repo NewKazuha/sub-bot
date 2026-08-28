@@ -748,46 +748,7 @@ export async function checkTelegramChannels() {
                 }
               }
 
-              // 2. Mediafire Direct File
-              if (!downloadedFilePath && pageData.videoLinks?.mediafire) {
-                console.log(`   📥 Resolving Mediafire: ${pageData.videoLinks.mediafire}`);
-                const mfDirect = await resolveMediafireDownloadUrl(pageData.videoLinks.mediafire);
-                if (mfDirect) {
-                  try {
-                    const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}`);
-                    await downloadFileToDisk(mfDirect, tempDest, { Referer: postPageUrl });
-                    if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
-                  } catch (e) {
-                    console.warn(`   ⚠️ Mediafire download failed:`, e.message);
-                  }
-                }
-              }
-
-              // 3. Mega (using megadl in GitHub Actions)
-              if (!downloadedFilePath && pageData.videoLinks?.mega && toolsAvailable) {
-                console.log(`   📥 Downloading from Mega: ${pageData.videoLinks.mega}`);
-                try {
-                  execSync(`megadl --path="${fansubWorkDir}" "${pageData.videoLinks.mega}"`, { stdio: 'pipe', timeout: 8 * 60 * 1000 });
-                  const files = fs.readdirSync(fansubWorkDir).filter(f => !f.endsWith('.torrent'));
-                  if (files.length > 0) downloadedFilePath = path.join(fansubWorkDir, files[0]);
-                } catch (e) {
-                  console.warn(`   ⚠️ Mega download failed:`, e.message?.slice(0, 150));
-                }
-              }
-
-              // 4. Google Drive (using gdown)
-              if (!downloadedFilePath && pageData.videoLinks?.drive && toolsAvailable) {
-                console.log(`   📥 Downloading from Google Drive: ${pageData.videoLinks.drive}`);
-                try {
-                  const gdest = path.join(fansubWorkDir, `gdrive_file`);
-                  execSync(`gdown --fuzzy "${pageData.videoLinks.drive}" -O "${gdest}"`, { stdio: 'pipe', timeout: 8 * 60 * 1000 });
-                  if (fs.existsSync(gdest) && fs.statSync(gdest).size > 100) downloadedFilePath = gdest;
-                } catch (e) {
-                  console.warn(`   ⚠️ Google Drive download failed:`, e.message?.slice(0, 150));
-                }
-              }
-
-              // 5. Torrent (using aria2c)
+              // 2. Torrent (Prioritized for speed & reliability in GitHub Actions)
               if (!downloadedFilePath && pageData.videoLinks?.torrent && toolsAvailable) {
                 console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
                 const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false);
@@ -807,6 +768,51 @@ export async function checkTelegramChannels() {
                   }
                   fs.rmSync(finalPath, { force: true });
                   continue;
+                }
+              }
+
+              // 3. Mediafire Direct File
+              if (!downloadedFilePath && pageData.videoLinks?.mediafire) {
+                console.log(`   📥 Resolving Mediafire: ${pageData.videoLinks.mediafire}`);
+                const mfDirect = await resolveMediafireDownloadUrl(pageData.videoLinks.mediafire);
+                if (mfDirect) {
+                  try {
+                    const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}`);
+                    await downloadFileToDisk(mfDirect, tempDest, { Referer: postPageUrl });
+                    if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                  } catch (e) {
+                    console.warn(`   ⚠️ Mediafire download failed:`, e.message);
+                  }
+                }
+              }
+
+              // 4. Mega (using python mega.py)
+              if (!downloadedFilePath && pageData.videoLinks?.mega && toolsAvailable) {
+                console.log(`   📥 Downloading from Mega: ${pageData.videoLinks.mega}`);
+                try {
+                  execSync(`python -c "from mega import Mega; Mega().download_url('${pageData.videoLinks.mega}', '${fansubWorkDir}')"`, { stdio: 'pipe', timeout: 8 * 60 * 1000 });
+                  const files = fs.readdirSync(fansubWorkDir).filter(f => !f.endsWith('.torrent'));
+                  if (files.length > 0) downloadedFilePath = path.join(fansubWorkDir, files[0]);
+                } catch (e) {
+                  console.warn(`   ⚠️ Mega python download failed:`, e.message?.slice(0, 150));
+                  // fallback to megadl
+                  try {
+                    execSync(`megadl --path="${fansubWorkDir}" "${pageData.videoLinks.mega}"`, { stdio: 'pipe', timeout: 5 * 60 * 1000 });
+                    const files = fs.readdirSync(fansubWorkDir).filter(f => !f.endsWith('.torrent'));
+                    if (files.length > 0) downloadedFilePath = path.join(fansubWorkDir, files[0]);
+                  } catch (e2) {}
+                }
+              }
+
+              // 5. Google Drive (using gdown)
+              if (!downloadedFilePath && pageData.videoLinks?.drive && toolsAvailable) {
+                console.log(`   📥 Downloading from Google Drive: ${pageData.videoLinks.drive}`);
+                try {
+                  const gdest = path.join(fansubWorkDir, `gdrive_file`);
+                  execSync(`gdown --fuzzy "${pageData.videoLinks.drive}" -O "${gdest}"`, { stdio: 'pipe', timeout: 8 * 60 * 1000 });
+                  if (fs.existsSync(gdest) && fs.statSync(gdest).size > 100) downloadedFilePath = gdest;
+                } catch (e) {
+                  console.warn(`   ⚠️ Google Drive download failed:`, e.message?.slice(0, 150));
                 }
               }
 
