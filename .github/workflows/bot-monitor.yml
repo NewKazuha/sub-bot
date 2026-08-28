@@ -6,6 +6,10 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
+concurrency:
+  group: anime-sub-monitor
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -22,9 +26,11 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Dependencies
+      - name: Install Dependencies & Multimedia Tools
         run: |
           npm install --production
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2
 
       - name: Run Continuous Feed Monitor
         env:

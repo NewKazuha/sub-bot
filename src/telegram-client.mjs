@@ -3,6 +3,7 @@ import { StringSession } from 'telegram/sessions/index.js';
 import * as cheerio from 'cheerio';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import { CONFIG } from './config.mjs';
@@ -12,6 +13,33 @@ import { sendDocument } from './telegram.mjs';
 const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
 
+// ====================================================================
+// Source channel IDs
+// ====================================================================
+const CHANNEL_KOKOBOKO   = '1224725097';   // KokoBoko [Subdl]
+const CHANNEL_FANSUB     = '1031770723';   // Arabic Anime Publisher
+const CHANNEL_ERAI       = '2084152036';   // Erai-Raws
+
+// ====================================================================
+// Source abbreviation mapping for Erai-Raws
+// ====================================================================
+const SOURCE_ABBREV = {
+  'crunchyroll': 'CR',
+  'hidive':      'HIDIVE',
+  'netflix':     'NF',
+  'disney+':     'DSNP',
+  'amazon':      'AMZN',
+  'amazon prime': 'AMZN',
+  'shahid':      'Shahid',
+  'funimation':  'Funi',
+  'bilibili':    'B-Global',
+  'adi':         'ADI',
+  'abema':       'ABEMA',
+};
+
+// ====================================================================
+// Utility helpers (posted IDs, normalization, naming)
+// ====================================================================
 export function loadPostedIds() {
   try {
     if (fs.existsSync(POSTED_FILE)) {
@@ -95,7 +123,7 @@ export function formatCleanCaption(title, isZip = false) {
 export function getSafeTelegramFileName(name, ext = '.ass') {
   let clean = name.replace(/[\\/:*?"<>|,]+/g, ' ').replace(/\s+/g, ' ').trim();
   const maxBaseLen = 55 - ext.length;
-  
+
   if (clean.length > maxBaseLen) {
     const prefixMatch = clean.match(/^(\[[^\]]+\]\s*)/);
     const prefix = prefixMatch ? prefixMatch[1] : '';
@@ -119,7 +147,7 @@ export function getSafeTelegramFileName(name, ext = '.ass') {
 export function validateFileMagic(filePath) {
   try {
     const stat = fs.statSync(filePath);
-    if (stat.size < 50) return null; // Too small
+    if (stat.size < 50) return null;
 
     const buf = Buffer.alloc(100);
     const fd = fs.openSync(filePath, 'r');
@@ -128,7 +156,6 @@ export function validateFileMagic(filePath) {
 
     const headerStr = buf.toString('utf8');
 
-    // If it's an HTML page (like Mediafire folder HTML or error page), reject it
     if (/^\s*<!DOCTYPE\s+html/i.test(headerStr) || /^\s*<html/i.test(headerStr)) {
       return null;
     }
@@ -163,6 +190,9 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
   return destPath;
 }
 
+// ====================================================================
+// SUBDL & Top4Top URL resolvers
+// ====================================================================
 async function resolveSubdlDownloadUrl(infoUrl) {
   try {
     const res = await fetch(infoUrl, {
@@ -214,6 +244,176 @@ async function resolveTop4topDownloadUrl(top4topUrl) {
   }
 }
 
+// ====================================================================
+// Erai-Raws helpers
+// ====================================================================
+
+/**
+ * Parse an Erai-Raws Telegram message.
+ * Returns { title, source, sourceAbbrev, hasArabic, torrentUrl, nyaaUrl } or null.
+ */
+function parseEraiMessage(msg) {
+  const text = msg.message || '';
+
+  // Extract "Title:" line
+  const titleMatch = text.match(/Title:\s*(.+)/i);
+  if (!titleMatch) return null;
+  const title = titleMatch[1].trim();
+
+  // Extract "Source:" line
+  const sourceMatch = text.match(/Source:\s*(.+)/i);
+  const source = sourceMatch ? sourceMatch[1].trim() : '';
+
+  // Check for Arabic flag 🇸🇦
+  const hasArabic = text.includes('🇸🇦');
+
+  // Get source abbreviation
+  const srcLower = source.toLowerCase();
+  const sourceAbbrev = SOURCE_ABBREV[srcLower] || source;
+
+  // Extract URLs from entities (hyperlinks in "View Link" and "Torrent Link")
+  let nyaaUrl = '';
+  let torrentUrl = '';
+  if (msg.entities) {
+    for (const ent of msg.entities) {
+      if (ent.className === 'MessageEntityTextUrl' && ent.url) {
+        if (ent.url.includes('.torrent')) {
+          torrentUrl = ent.url;
+        } else if (ent.url.includes('nyaa.si/view/')) {
+          nyaaUrl = ent.url;
+        }
+      }
+    }
+  }
+
+  return { title, source, sourceAbbrev, hasArabic, torrentUrl, nyaaUrl };
+}
+
+/**
+ * Check if aria2c and mkvextract are available (GitHub Actions environment).
+ */
+function hasRequiredTools() {
+  try {
+    execSync('aria2c --version', { stdio: 'ignore' });
+    execSync('mkvextract --version', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Download torrent via aria2c → extract Arabic subtitle track via mkvextract.
+ * Returns the path to the extracted .ass file, or null on failure.
+ */
+async function downloadAndExtractArabicSub(torrentUrl, workDir) {
+  // 1. Download the .torrent file
+  const torrentPath = path.join(workDir, 'erai.torrent');
+  await downloadFileToDisk(torrentUrl, torrentPath);
+  console.log(`   📥 Torrent file downloaded (${fs.statSync(torrentPath).size} bytes)`);
+
+  // 2. Download the MKV via aria2c
+  const downloadDir = path.join(workDir, 'mkv_dl');
+  fs.mkdirSync(downloadDir, { recursive: true });
+  try {
+    console.log(`   📥 Downloading MKV via aria2c...`);
+    execSync(
+      `aria2c --seed-time=0 --max-upload-limit=1K --file-allocation=none ` +
+      `--max-concurrent-downloads=5 --split=5 --max-connection-per-server=5 ` +
+      `--continue=true --dir="${downloadDir}" "${torrentPath}"`,
+      { stdio: 'pipe', timeout: 10 * 60 * 1000 } // 10 min timeout
+    );
+  } catch (e) {
+    console.error(`   ❌ aria2c download failed:`, e.message?.slice(0, 200));
+    return null;
+  }
+
+  // 3. Find the MKV file
+  const mkvFiles = [];
+  function findMkvs(dir) {
+    for (const f of fs.readdirSync(dir)) {
+      const fp = path.join(dir, f);
+      if (fs.statSync(fp).isDirectory()) findMkvs(fp);
+      else if (f.toLowerCase().endsWith('.mkv')) mkvFiles.push(fp);
+    }
+  }
+  findMkvs(downloadDir);
+
+  if (mkvFiles.length === 0) {
+    console.warn(`   ⚠️ No .mkv files found after aria2c download.`);
+    return null;
+  }
+
+  const mkvPath = mkvFiles[0];
+  console.log(`   🎬 MKV found: ${path.basename(mkvPath)} (${(fs.statSync(mkvPath).size / 1024 / 1024).toFixed(1)} MB)`);
+
+  // 4. Identify Arabic subtitle track with mkvmerge --identify
+  let trackInfo;
+  try {
+    trackInfo = execSync(`mkvmerge --identify --identification-format json "${mkvPath}"`, {
+      encoding: 'utf8',
+      timeout: 30000
+    });
+  } catch (e) {
+    console.error(`   ❌ mkvmerge identify failed:`, e.message?.slice(0, 200));
+    return null;
+  }
+
+  const info = JSON.parse(trackInfo);
+  const arabicTrack = info.tracks?.find(t =>
+    t.type === 'subtitles' &&
+    (t.properties?.language === 'ara' ||
+     t.properties?.language_ietf === 'ar' ||
+     t.properties?.language_ietf === 'ar-SA' ||
+     (t.properties?.track_name || '').toLowerCase().includes('arabic') ||
+     (t.properties?.track_name || '').toLowerCase().includes('عربي'))
+  );
+
+  if (!arabicTrack) {
+    console.warn(`   ⚠️ No Arabic subtitle track found in MKV.`);
+    // List available tracks for debugging
+    const subTracks = (info.tracks || []).filter(t => t.type === 'subtitles');
+    subTracks.forEach(t => {
+      console.log(`      Track ${t.id}: lang=${t.properties?.language} ietf=${t.properties?.language_ietf} name="${t.properties?.track_name || ''}"`);
+    });
+    return null;
+  }
+
+  const trackId = arabicTrack.id;
+  const codec = (arabicTrack.codec || '').toLowerCase();
+  const subExt = codec.includes('subrip') || codec.includes('srt') ? '.srt' : '.ass';
+  const extractedPath = path.join(workDir, `arabic_sub${subExt}`);
+
+  console.log(`   🔍 Found Arabic track #${trackId} (${arabicTrack.properties?.track_name || arabicTrack.properties?.language}) codec=${arabicTrack.codec}`);
+
+  // 5. Extract the Arabic subtitle track
+  try {
+    execSync(`mkvextract tracks "${mkvPath}" ${trackId}:"${extractedPath}"`, {
+      stdio: 'pipe',
+      timeout: 60000
+    });
+  } catch (e) {
+    console.error(`   ❌ mkvextract failed:`, e.message?.slice(0, 200));
+    return null;
+  }
+
+  if (!fs.existsSync(extractedPath) || fs.statSync(extractedPath).size < 50) {
+    console.warn(`   ⚠️ Extracted subtitle is empty or missing.`);
+    return null;
+  }
+
+  console.log(`   ✅ Arabic subtitle extracted: ${(fs.statSync(extractedPath).size / 1024).toFixed(1)} KB`);
+
+  // 6. Delete the large MKV to free space
+  try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(torrentPath, { force: true }); } catch {}
+
+  return extractedPath;
+}
+
+// ====================================================================
+// Main check function
+// ====================================================================
 export async function checkTelegramChannels() {
   const sessionStr = CONFIG.TELEGRAM.SESSION;
   if (!sessionStr) {
@@ -223,8 +423,11 @@ export async function checkTelegramChannels() {
 
   const posted = loadPostedIds();
   let newFound = 0;
+  const toolsAvailable = hasRequiredTools();
 
   console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
+  if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found – Erai-Raws processing will be skipped.`);
+
   const client = new TelegramClient(
     new StringSession(sessionStr),
     CONFIG.TELEGRAM.API_ID,
@@ -242,10 +445,11 @@ export async function checkTelegramChannels() {
       const isChatGroup = title.includes('chat') || title.includes('group');
       if (isChatGroup) return false;
 
-      const isFansubPublisher = idStr.includes('1031770723') || title.includes('arabic anime publisher');
-      const isOfficialKokoboko = idStr.includes('1224725097') || title.includes('kokoboko [subdl]');
+      const isFansubPublisher = idStr.includes(CHANNEL_FANSUB)  || title.includes('arabic anime publisher');
+      const isOfficialKokoboko = idStr.includes(CHANNEL_KOKOBOKO) || title.includes('kokoboko [subdl]');
+      const isEraiRaws = idStr.includes(CHANNEL_ERAI) || title.includes('erai-raws');
 
-      return isFansubPublisher || isOfficialKokoboko;
+      return isFansubPublisher || isOfficialKokoboko || isEraiRaws;
     });
 
     console.log(`   Found ${targetSourceChats.length} targeted source channel(s):`);
@@ -254,7 +458,11 @@ export async function checkTelegramChannels() {
     fs.mkdirSync(OUT_DIR, { recursive: true });
 
     for (const chat of targetSourceChats) {
-      const isKokoboko = String(chat.id).includes('1224725097') || (chat.title || '').toLowerCase().includes('kokoboko');
+      const idStr = String(chat.id);
+      const titleLower = (chat.title || '').toLowerCase();
+      const isKokoboko = idStr.includes(CHANNEL_KOKOBOKO) || titleLower.includes('kokoboko');
+      const isErai     = idStr.includes(CHANNEL_ERAI)     || titleLower.includes('erai-raws');
+
       console.log(`\n🔍 Checking: "${chat.title}" (ID: ${chat.id})`);
       const msgs = await client.getMessages(chat.id, { limit: 10 });
 
@@ -263,6 +471,84 @@ export async function checkTelegramChannels() {
         if (posted.has(msgKey)) continue;
 
         const text = msg.message || '';
+
+        // ==============================================================
+        // CHANNEL 3: Erai-Raws (Official Subtitles via Torrent)
+        // ==============================================================
+        if (isErai) {
+          const eraiData = parseEraiMessage(msg);
+          if (!eraiData) continue;
+
+          // Only process releases with Arabic subtitles
+          if (!eraiData.hasArabic) {
+            posted.add(msgKey);
+            savePostedIds(posted);
+            continue;
+          }
+
+          const formattedTitle = `[${eraiData.sourceAbbrev}] ${eraiData.title}`;
+          const normKey = normalizeReleaseKey(formattedTitle);
+
+          if (posted.has(normKey)) {
+            posted.add(msgKey);
+            savePostedIds(posted);
+            continue;
+          }
+
+          if (!toolsAvailable) {
+            console.log(`   ⏭️ [Erai-Raws] Skipping "${formattedTitle}" – aria2c/mkvextract not available.`);
+            continue;
+          }
+
+          if (!eraiData.torrentUrl) {
+            console.warn(`   ⚠️ [Erai-Raws] No torrent URL found for "${formattedTitle}". Skipping.`);
+            continue;
+          }
+
+          console.log(`\n✨ [Erai-Raws] "${formattedTitle}"`);
+          console.log(`   📦 Source: ${eraiData.source} → [${eraiData.sourceAbbrev}]`);
+          console.log(`   🔗 Torrent: ${eraiData.torrentUrl}`);
+
+          const eraiWorkDir = path.join(OUT_DIR, `erai_${msg.id}`);
+          fs.mkdirSync(eraiWorkDir, { recursive: true });
+
+          try {
+            const extractedSubPath = await downloadAndExtractArabicSub(eraiData.torrentUrl, eraiWorkDir);
+
+            if (extractedSubPath) {
+              const subExt = path.extname(extractedSubPath);
+              const cleanFileName = getSafeTelegramFileName(formattedTitle, subExt);
+              const finalPath = path.join(OUT_DIR, cleanFileName);
+              fs.renameSync(extractedSubPath, finalPath);
+
+              const caption = formattedTitle;
+              console.log(`   📤 Publishing to channel: "${caption}" (filename: ${cleanFileName})`);
+              const sendResult = await sendDocument(finalPath, caption);
+
+              if (sendResult?.ok) {
+                console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
+                newFound++;
+                posted.add(msgKey);
+                posted.add(normKey);
+                savePostedIds(posted);
+              } else {
+                console.error(`   ❌ Failed to send document:`, sendResult);
+              }
+
+              fs.rmSync(finalPath, { force: true });
+            }
+          } catch (e) {
+            console.error(`   ❌ Erai-Raws processing error:`, e.message);
+          } finally {
+            try { fs.rmSync(eraiWorkDir, { recursive: true, force: true }); } catch {}
+          }
+
+          continue;
+        }
+
+        // ==============================================================
+        // Build title for KokoBoko / Fansub channels
+        // ==============================================================
         const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
         const titleLine = isKokoboko ? formatCleanTitle(lines[0] || 'Anime Release') : extractTeamAndFormatTitle(text);
         const normKey = normalizeReleaseKey(titleLine);
@@ -274,7 +560,7 @@ export async function checkTelegramChannels() {
         }
 
         // ==============================================================
-        // 1. CHANNEL 1: KokoBoko [Subdl] (Official Subtitles)
+        // CHANNEL 1: KokoBoko [Subdl] (Official Subtitles)
         // ==============================================================
         if (isKokoboko) {
           const subdlMatch = text.match(/https?:\/\/(?:www\.)?subdl\.com\/s\/info\/[a-zA-Z0-9]+/i);
@@ -325,7 +611,7 @@ export async function checkTelegramChannels() {
         }
 
         // ==============================================================
-        // 2. CHANNEL 2: Arabic Anime Publisher (Fansub Releases)
+        // CHANNEL 2: Arabic Anime Publisher (Fansub Releases)
         // ==============================================================
         // Case A: Direct file attached to the message
         if (msg.media && msg.media.document) {
@@ -383,7 +669,6 @@ export async function checkTelegramChannels() {
               if (resolvedTop4top) dlUrl = resolvedTop4top;
             }
 
-            // Only attempt direct download if it points to a direct file or top4top
             if (/\.(ass|srt|zip|rar|7z)$/i.test(dlUrl) || dlUrl.includes('top4top.io')) {
               try {
                 const tempFile = path.join(OUT_DIR, `fansub_dl_${msg.id}`);
