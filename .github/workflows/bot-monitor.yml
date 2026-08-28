@@ -2,8 +2,8 @@ name: Anime Sub Auto-Poster Monitor
 
 on:
   schedule:
-    # Runs every 5 minutes automatically 24/7
-    - cron: '*/5 * * * *'
+    # Triggers every 15 minutes to initiate the next continuous monitor window
+    - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
 permissions:
@@ -12,6 +12,7 @@ permissions:
 jobs:
   check-and-post:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,27 +22,22 @@ jobs:
         with:
           node-version: 22
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Dependencies & Multimedia Tools
+      - name: Install Dependencies
         run: |
-          npm install
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools ffmpeg zip
-          pip install --no-cache-dir mega.py gdown
+          npm install --production
 
-      - name: Run Feed Monitor & Extract Subtitles
+      - name: Run Continuous Feed Monitor
         env:
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
+          RUN_DURATION_MINUTES: 14
+          CHECK_INTERVAL_SECONDS: 45
         run: |
-          node -e "import('./src/feed-monitor.mjs').then(m => m.checkNewReleases());"
+          node src/action-runner.mjs
 
       - name: Commit & Push Processed State
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
