@@ -4,12 +4,25 @@ import { CONFIG } from './config.mjs';
 
 const API_BASE = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}`;
 
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 export async function sendMessage(text, { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
   try {
+    const bodyObj = {
+      chat_id: chatId,
+      text: parseMode === 'HTML' ? escapeHtml(text) : text
+    };
+    if (parseMode) bodyObj.parse_mode = parseMode;
+
     const res = await fetch(`${API_BASE}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: parseMode })
+      body: JSON.stringify(bodyObj)
     });
     return await res.json();
   } catch (e) {
@@ -28,8 +41,8 @@ export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TEL
     formData.append('chat_id', String(chatId));
     formData.append('document', blob, fileName);
     if (caption) {
-      formData.append('caption', caption);
-      formData.append('parse_mode', parseMode);
+      formData.append('caption', parseMode === 'HTML' ? escapeHtml(caption) : caption);
+      if (parseMode) formData.append('parse_mode', parseMode);
     }
 
     const res = await fetch(`${API_BASE}/sendDocument`, {
@@ -45,10 +58,17 @@ export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TEL
 
 export async function sendPhoto(photoUrl, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
   try {
+    const bodyObj = {
+      chat_id: chatId,
+      photo: photoUrl,
+      caption: parseMode === 'HTML' ? escapeHtml(caption) : caption
+    };
+    if (parseMode) bodyObj.parse_mode = parseMode;
+
     const res = await fetch(`${API_BASE}/sendPhoto`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption, parse_mode: parseMode })
+      body: JSON.stringify(bodyObj)
     });
     return await res.json();
   } catch (e) {

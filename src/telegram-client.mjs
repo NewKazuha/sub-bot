@@ -49,12 +49,10 @@ export function extractTeamAndFormatTitle(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
 
-  // If title already has [Team] at start
   if (/^\[[^\]]+\]/.test(rawTitle)) {
     return rawTitle;
   }
 
-  // Look for "By ..." or "بواسطة ..." line in message text
   let team = '';
   for (const line of lines) {
     const match = line.match(/^(?:By|من قبل|ترجمة|بواسطة)\s+@?([a-zA-Z0-9_\- ]+)/i);
@@ -118,6 +116,38 @@ export function getSafeTelegramFileName(name, ext = '.ass') {
   return `${clean}${ext}`;
 }
 
+export function validateFileMagic(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size < 50) return null; // Too small
+
+    const buf = Buffer.alloc(100);
+    const fd = fs.openSync(filePath, 'r');
+    fs.readSync(fd, buf, 0, 100, 0);
+    fs.closeSync(fd);
+
+    const headerStr = buf.toString('utf8');
+
+    // If it's an HTML page (like Mediafire folder HTML or error page), reject it
+    if (/^\s*<!DOCTYPE\s+html/i.test(headerStr) || /^\s*<html/i.test(headerStr)) {
+      return null;
+    }
+
+    const hex4 = buf.subarray(0, 4).toString('hex');
+    const hex6 = buf.subarray(0, 6).toString('hex');
+
+    if (hex4 === '504b0304' || hex4 === '504b0506') return { ext: '.zip', isArchive: true };
+    if (hex6 === '377abcaf271c') return { ext: '.7z', isArchive: true };
+    if (hex4 === '52617221') return { ext: '.rar', isArchive: true };
+    if (headerStr.includes('[Script Info]') || headerStr.includes('Dialogue:') || headerStr.includes('Format:')) return { ext: '.ass', isArchive: false };
+    if (/^\s*1\s*\r?\n\d\d:\d\d:\d\d/m.test(headerStr)) return { ext: '.srt', isArchive: false };
+
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 export async function downloadFileToDisk(url, destPath, headers = {}) {
   const res = await fetch(url, {
     headers: {
@@ -152,6 +182,34 @@ async function resolveSubdlDownloadUrl(infoUrl) {
     return dlUrl;
   } catch (e) {
     console.warn('SUBDL resolve error:', e.message);
+    return null;
+  }
+}
+
+async function resolveTop4topDownloadUrl(top4topUrl) {
+  try {
+    const res = await fetch(top4topUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const doc = cheerio.load(html);
+    let directUrl = null;
+    doc('input[value*="top4top.io/"]').each((_, el) => {
+      const val = doc(el).attr('value') || '';
+      if (val.startsWith('http')) {
+        directUrl = val;
+        return false;
+      }
+    });
+    if (!directUrl) {
+      doc('a[href*="top4top.io/f_"]').each((_, el) => {
+        directUrl = doc(el).attr('href');
+        return false;
+      });
+    }
+    return directUrl;
+  } catch (e) {
     return null;
   }
 }
@@ -232,23 +290,18 @@ export async function checkTelegramChannels() {
                 const tempDownload = path.join(OUT_DIR, `temp_subdl_${msg.id}`);
                 await downloadFileToDisk(dlUrl, tempDownload, { Referer: subdlInfoUrl });
 
-                const headerBuffer = Buffer.alloc(100);
-                const fd = fs.openSync(tempDownload, 'r');
-                fs.readSync(fd, headerBuffer, 0, 100, 0);
-                fs.closeSync(fd);
+                const validated = validateFileMagic(tempDownload);
+                if (!validated) {
+                  console.warn(`   ⚠️ Downloaded SUBDL file was invalid or HTML. Skipping.`);
+                  fs.rmSync(tempDownload, { force: true });
+                  continue;
+                }
 
-                const headerStr = headerBuffer.toString('utf8');
-                const isZip = headerBuffer.subarray(0, 4).toString('hex') === '504b0304';
-                const isAss = headerStr.includes('[Script Info]') || headerStr.includes('Dialogue:');
-                const isSrt = /^\s*1\s*\r?\n\d\d:\d\d:\d\d/m.test(headerStr);
-
-                const ext = isZip ? '.zip' : (isSrt ? '.srt' : '.ass');
-                const cleanFileName = getSafeTelegramFileName(titleLine, ext);
+                const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
                 const finalPath = path.join(OUT_DIR, cleanFileName);
-
                 fs.renameSync(tempDownload, finalPath);
 
-                const caption = formatCleanCaption(titleLine, isZip);
+                const caption = formatCleanCaption(titleLine, validated.isArchive);
                 console.log(`   📤 Publishing to channel: "${caption}" (filename: ${cleanFileName})`);
                 const sendResult = await sendDocument(finalPath, caption);
 
@@ -281,23 +334,25 @@ export async function checkTelegramChannels() {
           const ext = path.extname(originalName).toLowerCase();
 
           if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
-            const isZip = ['.zip', '.rar', '.7z'].includes(ext);
             console.log(`\n✨ [Fansub Attachment] "${titleLine}" (${originalName})`);
             const localFilePath = path.join(OUT_DIR, originalName);
 
             const buffer = await client.downloadMedia(msg);
             fs.writeFileSync(localFilePath, buffer);
 
-            const caption = formatCleanCaption(titleLine, isZip);
-            console.log(`   📤 Publishing to channel: "${caption}"`);
-            const sendResult = await sendDocument(localFilePath, caption);
+            const validated = validateFileMagic(localFilePath);
+            if (validated) {
+              const caption = formatCleanCaption(titleLine, validated.isArchive);
+              console.log(`   📤 Publishing to channel: "${caption}"`);
+              const sendResult = await sendDocument(localFilePath, caption);
 
-            if (sendResult?.ok) {
-              console.log(`   ✅ Successfully posted!`);
-              newFound++;
-              posted.add(msgKey);
-              posted.add(normKey);
-              savePostedIds(posted);
+              if (sendResult?.ok) {
+                console.log(`   ✅ Successfully posted!`);
+                newFound++;
+                posted.add(msgKey);
+                posted.add(normKey);
+                savePostedIds(posted);
+              }
             }
 
             fs.rmSync(localFilePath, { force: true });
@@ -320,27 +375,32 @@ export async function checkTelegramChannels() {
           const pageData = await scrapePostPage(postPageUrl, matchingSite);
 
           if (pageData && pageData.bestDownloadUrl) {
-            const dlUrl = pageData.bestDownloadUrl;
+            let dlUrl = pageData.bestDownloadUrl;
             console.log(`   🎯 Download link found: ${dlUrl}`);
 
-            if (/\.(ass|srt|zip|rar|7z)$/i.test(dlUrl) || dlUrl.includes('top4top.io') || dlUrl.includes('mediafire.com')) {
+            if (dlUrl.includes('top4top.io') && !dlUrl.includes('/f_')) {
+              const resolvedTop4top = await resolveTop4topDownloadUrl(dlUrl);
+              if (resolvedTop4top) dlUrl = resolvedTop4top;
+            }
+
+            // Only attempt direct download if it points to a direct file or top4top
+            if (/\.(ass|srt|zip|rar|7z)$/i.test(dlUrl) || dlUrl.includes('top4top.io')) {
               try {
                 const tempFile = path.join(OUT_DIR, `fansub_dl_${msg.id}`);
                 await downloadFileToDisk(dlUrl, tempFile, { Referer: postPageUrl });
 
-                const headerBuffer = Buffer.alloc(100);
-                const fd = fs.openSync(tempFile, 'r');
-                fs.readSync(fd, headerBuffer, 0, 100, 0);
-                fs.closeSync(fd);
+                const validated = validateFileMagic(tempFile);
+                if (!validated) {
+                  console.warn(`   ⚠️ Downloaded fansub file was invalid/HTML (not a valid subtitle/archive). Skipping.`);
+                  fs.rmSync(tempFile, { force: true });
+                  continue;
+                }
 
-                const isZip = headerBuffer.subarray(0, 4).toString('hex') === '504b0304';
-                const ext = isZip ? '.zip' : (/\.ass/i.test(dlUrl) ? '.ass' : '.zip');
-                const cleanFileName = getSafeTelegramFileName(titleLine, ext);
+                const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
                 const finalPath = path.join(OUT_DIR, cleanFileName);
-
                 fs.renameSync(tempFile, finalPath);
 
-                const caption = formatCleanCaption(titleLine, isZip);
+                const caption = formatCleanCaption(titleLine, validated.isArchive);
                 console.log(`   📤 Publishing to channel: "${caption}"`);
                 const sendResult = await sendDocument(finalPath, caption);
 
