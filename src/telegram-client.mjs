@@ -21,20 +21,29 @@ const CHANNEL_FANSUB     = '1031770723';   // Arabic Anime Publisher
 const CHANNEL_ERAI       = '2084152036';   // Erai-Raws
 
 // ====================================================================
-// Source abbreviation mapping for Erai-Raws
+// Source abbreviation mapping to full official platform names
 // ====================================================================
-const SOURCE_ABBREV = {
-  'crunchyroll': 'CR',
-  'hidive':      'HIDIVE',
-  'netflix':     'NF',
-  'disney+':     'DSNP',
-  'amazon':      'AMZN',
-  'amazon prime': 'AMZN',
-  'shahid':      'Shahid',
-  'funimation':  'Funi',
-  'bilibili':    'B-Global',
-  'adi':         'ADI',
-  'abema':       'ABEMA',
+const SOURCE_FULL_NAME = {
+  'cr':           'Crunchyroll',
+  'crunchyroll':  'Crunchyroll',
+  'hidive':       'HIDIVE',
+  'nf':           'Netflix',
+  'netflix':      'Netflix',
+  'dsnp':         'Disney+',
+  'disney+':      'Disney+',
+  'disney':       'Disney+',
+  'amzn':         'Amazon',
+  'amazon':       'Amazon',
+  'amazon prime': 'Amazon',
+  'prime':        'Amazon',
+  'shahid':       'Shahid',
+  'funimation':   'Funimation',
+  'funi':         'Funimation',
+  'bilibili':     'Bilibili',
+  'b-global':     'B-Global',
+  'adn':          'ADN',
+  'adi':          'ADN',
+  'abema':        'ABEMA',
 };
 
 // ====================================================================
@@ -56,6 +65,49 @@ export function savePostedIds(set) {
   } catch (e) {
     console.error('Failed to save posted IDs:', e.message);
   }
+}
+
+export function getCoreAnimeEpisodeKey(title) {
+  return title
+    .toLowerCase()
+    .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
+    .replace(/^\[[^\]]+\]\s*/, '') // strip leading platform/team bracket
+    .replace(/Ⅱ/g, '2')
+    .replace(/Ⅲ/g, '3')
+    .replace(/Ⅳ/g, '4')
+    .replace(/Ⅴ/g, '5')
+    .replace(/&amp;/g, '&')
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+export function getReleaseKeys(title, isOfficial = false) {
+  const fullNorm = title
+    .toLowerCase()
+    .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
+    .replace(/Ⅱ/g, '2')
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/^_+|_+$/g, '');
+
+  const coreKey = getCoreAnimeEpisodeKey(title);
+  const keys = [fullNorm];
+
+  if (isOfficial && coreKey) {
+    keys.push(`official_${coreKey}`);
+  }
+  return keys;
+}
+
+export function isReleaseAlreadyPosted(posted, keys) {
+  return keys.some(k => posted.has(k));
+}
+
+export function markReleaseAsPosted(posted, msgKey, keys = []) {
+  if (msgKey) posted.add(msgKey);
+  for (const k of keys) {
+    if (k) posted.add(k);
+  }
+  savePostedIds(posted);
 }
 
 export function normalizeReleaseKey(rawTitle) {
@@ -250,7 +302,7 @@ async function resolveTop4topDownloadUrl(top4topUrl) {
 
 /**
  * Parse an Erai-Raws Telegram message.
- * Returns { title, source, sourceAbbrev, hasArabic, torrentUrl, nyaaUrl } or null.
+ * Returns { title, source, sourceName, hasArabic, torrentUrl, nyaaUrl } or null.
  */
 function parseEraiMessage(msg) {
   const text = msg.message || '';
@@ -267,9 +319,9 @@ function parseEraiMessage(msg) {
   // Check for Arabic flag 🇸🇦
   const hasArabic = text.includes('🇸🇦');
 
-  // Get source abbreviation
-  const srcLower = source.toLowerCase();
-  const sourceAbbrev = SOURCE_ABBREV[srcLower] || source;
+  // Map to full source name (e.g. CR -> Crunchyroll, AMZN -> Amazon, NF -> Netflix)
+  const srcLower = source.toLowerCase().trim();
+  const sourceName = SOURCE_FULL_NAME[srcLower] || source || 'Official';
 
   // Extract URLs from entities (hyperlinks in "View Link" and "Torrent Link")
   let nyaaUrl = '';
@@ -286,11 +338,11 @@ function parseEraiMessage(msg) {
     }
   }
 
-  return { title, source, sourceAbbrev, hasArabic, torrentUrl, nyaaUrl };
+  return { title, source, sourceName, hasArabic, torrentUrl, nyaaUrl };
 }
 
 /**
- * Check if aria2c and mkvextract are available (GitHub Actions environment).
+ * Check if aria2c and mkvextract are available.
  */
 function hasRequiredTools() {
   try {
@@ -304,15 +356,12 @@ function hasRequiredTools() {
 
 /**
  * Download torrent via aria2c → extract Arabic subtitle track via mkvextract.
- * Returns the path to the extracted .ass file, or null on failure.
  */
 async function downloadAndExtractArabicSub(torrentUrl, workDir) {
-  // 1. Download the .torrent file
   const torrentPath = path.join(workDir, 'erai.torrent');
   await downloadFileToDisk(torrentUrl, torrentPath);
   console.log(`   📥 Torrent file downloaded (${fs.statSync(torrentPath).size} bytes)`);
 
-  // 2. Download the MKV via aria2c
   const downloadDir = path.join(workDir, 'mkv_dl');
   fs.mkdirSync(downloadDir, { recursive: true });
   try {
@@ -321,14 +370,13 @@ async function downloadAndExtractArabicSub(torrentUrl, workDir) {
       `aria2c --seed-time=0 --max-upload-limit=1K --file-allocation=none ` +
       `--max-concurrent-downloads=5 --split=5 --max-connection-per-server=5 ` +
       `--continue=true --dir="${downloadDir}" "${torrentPath}"`,
-      { stdio: 'pipe', timeout: 10 * 60 * 1000 } // 10 min timeout
+      { stdio: 'pipe', timeout: 10 * 60 * 1000 }
     );
   } catch (e) {
     console.error(`   ❌ aria2c download failed:`, e.message?.slice(0, 200));
     return null;
   }
 
-  // 3. Find the MKV file
   const mkvFiles = [];
   function findMkvs(dir) {
     for (const f of fs.readdirSync(dir)) {
@@ -347,7 +395,6 @@ async function downloadAndExtractArabicSub(torrentUrl, workDir) {
   const mkvPath = mkvFiles[0];
   console.log(`   🎬 MKV found: ${path.basename(mkvPath)} (${(fs.statSync(mkvPath).size / 1024 / 1024).toFixed(1)} MB)`);
 
-  // 4. Identify Arabic subtitle track with mkvmerge --identify
   let trackInfo;
   try {
     trackInfo = execSync(`mkvmerge --identify --identification-format json "${mkvPath}"`, {
@@ -371,11 +418,6 @@ async function downloadAndExtractArabicSub(torrentUrl, workDir) {
 
   if (!arabicTrack) {
     console.warn(`   ⚠️ No Arabic subtitle track found in MKV.`);
-    // List available tracks for debugging
-    const subTracks = (info.tracks || []).filter(t => t.type === 'subtitles');
-    subTracks.forEach(t => {
-      console.log(`      Track ${t.id}: lang=${t.properties?.language} ietf=${t.properties?.language_ietf} name="${t.properties?.track_name || ''}"`);
-    });
     return null;
   }
 
@@ -386,7 +428,6 @@ async function downloadAndExtractArabicSub(torrentUrl, workDir) {
 
   console.log(`   🔍 Found Arabic track #${trackId} (${arabicTrack.properties?.track_name || arabicTrack.properties?.language}) codec=${arabicTrack.codec}`);
 
-  // 5. Extract the Arabic subtitle track
   try {
     execSync(`mkvextract tracks "${mkvPath}" ${trackId}:"${extractedPath}"`, {
       stdio: 'pipe',
@@ -404,7 +445,6 @@ async function downloadAndExtractArabicSub(torrentUrl, workDir) {
 
   console.log(`   ✅ Arabic subtitle extracted: ${(fs.statSync(extractedPath).size / 1024).toFixed(1)} KB`);
 
-  // 6. Delete the large MKV to free space
   try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(torrentPath, { force: true }); } catch {}
 
@@ -426,7 +466,7 @@ export async function checkTelegramChannels() {
   const toolsAvailable = hasRequiredTools();
 
   console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
-  if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found – Erai-Raws processing will be skipped.`);
+  if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found in this environment – Erai-Raws processing will run in GitHub Actions.`);
 
   const client = new TelegramClient(
     new StringSession(sessionStr),
@@ -479,24 +519,24 @@ export async function checkTelegramChannels() {
           const eraiData = parseEraiMessage(msg);
           if (!eraiData) continue;
 
-          // Only process releases with Arabic subtitles
+          // Only process releases with Arabic subtitles 🇸🇦
           if (!eraiData.hasArabic) {
-            posted.add(msgKey);
-            savePostedIds(posted);
+            markReleaseAsPosted(posted, msgKey);
             continue;
           }
 
-          const formattedTitle = `[${eraiData.sourceAbbrev}] ${eraiData.title}`;
-          const normKey = normalizeReleaseKey(formattedTitle);
+          // Format title with full official name: [Crunchyroll] Title - Ep / [Amazon] Title - Ep
+          const formattedTitle = `[${eraiData.sourceName}] ${eraiData.title}`;
+          const releaseKeys = getReleaseKeys(formattedTitle, true);
 
-          if (posted.has(normKey)) {
-            posted.add(msgKey);
-            savePostedIds(posted);
+          if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+            console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted (via KokoBoko or prior run). Skipping.`);
+            markReleaseAsPosted(posted, msgKey, releaseKeys);
             continue;
           }
 
           if (!toolsAvailable) {
-            console.log(`   ⏭️ [Erai-Raws] Skipping "${formattedTitle}" – aria2c/mkvextract not available.`);
+            console.log(`   ⏭️ [Erai-Raws] Skipping "${formattedTitle}" – aria2c/mkvextract not available locally.`);
             continue;
           }
 
@@ -506,7 +546,7 @@ export async function checkTelegramChannels() {
           }
 
           console.log(`\n✨ [Erai-Raws] "${formattedTitle}"`);
-          console.log(`   📦 Source: ${eraiData.source} → [${eraiData.sourceAbbrev}]`);
+          console.log(`   📦 Source: ${eraiData.source} → [${eraiData.sourceName}]`);
           console.log(`   🔗 Torrent: ${eraiData.torrentUrl}`);
 
           const eraiWorkDir = path.join(OUT_DIR, `erai_${msg.id}`);
@@ -528,9 +568,7 @@ export async function checkTelegramChannels() {
               if (sendResult?.ok) {
                 console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
                 newFound++;
-                posted.add(msgKey);
-                posted.add(normKey);
-                savePostedIds(posted);
+                markReleaseAsPosted(posted, msgKey, releaseKeys);
               } else {
                 console.error(`   ❌ Failed to send document:`, sendResult);
               }
@@ -551,11 +589,11 @@ export async function checkTelegramChannels() {
         // ==============================================================
         const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
         const titleLine = isKokoboko ? formatCleanTitle(lines[0] || 'Anime Release') : extractTeamAndFormatTitle(text);
-        const normKey = normalizeReleaseKey(titleLine);
+        const isOfficial = isKokoboko;
+        const releaseKeys = getReleaseKeys(titleLine, isOfficial);
 
-        if (posted.has(normKey)) {
-          posted.add(msgKey);
-          savePostedIds(posted);
+        if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+          markReleaseAsPosted(posted, msgKey, releaseKeys);
           continue;
         }
 
@@ -594,9 +632,7 @@ export async function checkTelegramChannels() {
                 if (sendResult?.ok) {
                   console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
                   newFound++;
-                  posted.add(msgKey);
-                  posted.add(normKey);
-                  savePostedIds(posted);
+                  markReleaseAsPosted(posted, msgKey, releaseKeys);
                 } else {
                   console.error(`   ❌ Failed to send document:`, sendResult);
                 }
@@ -635,9 +671,7 @@ export async function checkTelegramChannels() {
               if (sendResult?.ok) {
                 console.log(`   ✅ Successfully posted!`);
                 newFound++;
-                posted.add(msgKey);
-                posted.add(normKey);
-                savePostedIds(posted);
+                markReleaseAsPosted(posted, msgKey, releaseKeys);
               }
             }
 
@@ -692,9 +726,7 @@ export async function checkTelegramChannels() {
                 if (sendResult?.ok) {
                   console.log(`   ✅ Successfully posted!`);
                   newFound++;
-                  posted.add(msgKey);
-                  posted.add(normKey);
-                  savePostedIds(posted);
+                  markReleaseAsPosted(posted, msgKey, releaseKeys);
                 }
 
                 fs.rmSync(finalPath, { force: true });
