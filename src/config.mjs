@@ -7,7 +7,7 @@ export const CONFIG = {
     TARGET_CHANNEL: process.env.TELEGRAM_TARGET_CHANNEL || '-1004296201769',
     API_ID: parseInt(process.env.TELEGRAM_API_ID || '36075557', 10),
     API_HASH: process.env.TELEGRAM_API_HASH || '68f30da0127d11d0a3d063dc5093e8dd',
-    SESSION: process.env.TELEGRAM_SESSION || '1BAAOMTQ5LjE1NC4xNjcuOTEAUGCD6iceCq51K4smbC1tK2ij0PfAYSSTs9epkp3yuAS8aPj441v5sP7QaSNG4rR3XxYRRrleos3+uEYYrHV3Y/mkH12j1GDhY47NFDnV6SOADjf6tUMlVJ6ZnBvkOUKOlCleQyvkoq9Vb4a/ehFkTyuDCrx7+2o9GflbwmXGcBfLSj5uFJvKHHjCfPakLwq3xkZRrM75Ba4WvwckJ51ro2F7w9VERkn75m7LQdhhGjH7NMNSCIfplVME50qvUZ2LHQrxlMeOEt9pN6cxzqaoPg1g8jZiz65oW4AoQsksx7U+JS2ZiLTucBvPE8q5WISDCRfNQdkhYw/zd8jYvV6oDGQ='
+    SESSION: process.env.TELEGRAM_SESSION || '1BAAOMTQ5LjE1NC4xNjcuOTEAUFj1/2SmTq1lKuE4I33kdOY9i5UZDi6+uZ3ApqZ3C6wz1aEA+rEqBgYKzKN2/ZPIuVcYB3lXYYPnYXR8jCMCdHSvFUzHtXLkOlQ6FR00hM8GX7aDNGWvjO3FP/2Q5a59gA4GjLDB0/MdjrBtb+7gUebnc174sRhSHABjxWtHQ1pirHcaNlWjdz1nEAAMOHGOrlGC8AgZNXvkle2E15cIQfi7v2MfoNZd/GDpc0lxi3sLDY0Y52ksiBxLvwfdNpHCrSYKTKM1BnjlJf+Feh8u3i4NHRixWD50jCemHDUthTfrQq+VF3ty2dvS5ZZac6DSoLTVHecWFcCio8ZpMg4opaY='
   },
 
   SITES: [
@@ -24,7 +24,7 @@ export const CONFIG = {
       name: 'Revive',
       base: 'https://revivesubs.com',
       feed: 'https://revivesubs.com/feed/',
-      user: process.env.REVIVE_USER || 'Kazuha',
+      user: process.env.REVIVE_USER || 'amrm31638@gmail.com',
       pass: process.env.REVIVE_PASS || '246810121416m'
     },
     {

@@ -7,7 +7,12 @@ class SessionJar {
     this.cookies = new Map();
   }
   absorb(res) {
-    const setCookies = res.headers.getSetCookie?.() ?? [];
+    let setCookies = [];
+    if (typeof res.headers.getSetCookie === 'function') {
+      setCookies = res.headers.getSetCookie() || [];
+    } else if (res.headers.get('set-cookie')) {
+      setCookies = [res.headers.get('set-cookie')];
+    }
     for (const line of setCookies) {
       const [pair] = line.split(';');
       const eq = pair.indexOf('=');
@@ -20,17 +25,60 @@ class SessionJar {
 }
 
 const siteSessions = new Map();
+const SESSION_TTL = 2 * 60 * 60 * 1000; // Refresh session cookie every 2 hours
 
 async function ensureSiteSession(siteConfig) {
   if (!siteConfig || !siteConfig.user || !siteConfig.pass) return null;
-  let jar = siteSessions.get(siteConfig.id);
-  if (!jar) {
-    jar = new SessionJar();
-    siteSessions.set(siteConfig.id, jar);
+  const now = Date.now();
+  const cached = siteSessions.get(siteConfig.id);
+  if (cached && (now - cached.created < SESSION_TTL)) {
+    return cached.jar;
+  }
+  const jar = new SessionJar();
+  siteSessions.set(siteConfig.id, { jar, created: now });
+
+  // 1. Check if site is Laravel / Custom Auth (e.g. Revive Subs)
+  if (siteConfig.id === 'revive' || (siteConfig.base && siteConfig.base.includes('revivesubs'))) {
+    try {
+      const getRes = await fetch(`${siteConfig.base}/login`, {
+        headers: { 'User-Agent': UA }
+      });
+      jar.absorb(getRes);
+      const html = await getRes.text();
+      const $ = cheerio.load(html);
+      const token = $('meta[name="csrf-token"]').attr('content') || $('input[name="_token"]').val();
+
+      const params = new URLSearchParams();
+      if (token) params.append('_token', token);
+      params.append('email', siteConfig.user);
+      params.append('password', siteConfig.pass);
+      params.append('remember', 'on');
+
+      const postRes = await fetch(`${siteConfig.base}/login`, {
+        method: 'POST',
+        headers: {
+          'User-Agent': UA,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Cookie': jar.header(),
+          'Referer': `${siteConfig.base}/login`
+        },
+        body: params.toString(),
+        redirect: 'manual'
+      });
+      jar.absorb(postRes);
+      return jar;
+    } catch (e) {
+      console.warn(`Login to Laravel site ${siteConfig.name} failed:`, e.message);
+      return jar;
+    }
   }
 
+  // 2. Standard WordPress Authentication (Rhythm, LazySano, Anime-San, Celestial)
   try {
-    await fetch(`${siteConfig.base}/wp-login.php`, { headers: { 'User-Agent': UA } }).then(r => jar.absorb(r));
+    const wpInit = await fetch(`${siteConfig.base}/wp-login.php`, {
+      headers: { 'User-Agent': UA }
+    });
+    jar.absorb(wpInit);
 
     const params = new URLSearchParams({
       log: siteConfig.user,
@@ -54,7 +102,7 @@ async function ensureSiteSession(siteConfig) {
     });
     jar.absorb(res);
   } catch (e) {
-    console.warn(`Login to ${siteConfig.name} failed:`, e.message);
+    console.warn(`Login to WordPress site ${siteConfig.name} failed:`, e.message);
   }
   return jar;
 }
@@ -71,8 +119,33 @@ const IGNORED_DOMAINS = [
   'telegram.me',
   'wordpress.org',
   'blogger.com',
-  'google.com/url'
+  'google.com/url',
+  'support.google.com',
+  'policies.google.com'
 ];
+
+export async function followRedirectUrl(url, maxHops = 3) {
+  if (!url || !url.startsWith('http')) return url;
+  let curr = url;
+  for (let i = 0; i < maxHops; i++) {
+    try {
+      const res = await fetch(curr, {
+        method: 'HEAD',
+        redirect: 'manual',
+        headers: { 'User-Agent': UA }
+      });
+      const loc = res.headers.get('location');
+      if (loc && (res.status >= 300 && res.status < 400)) {
+        curr = new URL(loc, curr).toString();
+      } else {
+        break;
+      }
+    } catch {
+      break;
+    }
+  }
+  return curr;
+}
 
 export async function scrapePostPage(pageUrl, siteConfig = null) {
   let cookieHeader = '';
@@ -101,40 +174,95 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
 
   const allLinks = [];
   $('a[href]').each((_, el) => {
-    const href = $(el).attr('href');
-    const text = $(el).text().trim();
+    const href = $(el).attr('href')?.trim();
+    const text = $(el).text().trim().replace(/\s+/g, ' ');
     if (href && /^https?:\/\//i.test(href)) {
       const isIgnored = IGNORED_DOMAINS.some(d => href.includes(d));
       if (!isIgnored) {
-        allLinks.push({ href, text });
+        // Check parent/surrounding context text
+        const parentContext = $(el).closest('div, section, article, p, table, tr, td, li').text().trim().replace(/\s+/g, ' ');
+        allLinks.push({ href, text, parentContext });
       }
     }
   });
 
-  const directSub = allLinks.find(l => 
-    /\.(ass|srt|zip|rar|7z)$/i.test(l.href) || 
-    /^(ملف الترجمة|الترجمة|softsub|fonts|الخطوط)$/i.test(l.text)
-  );
+  // 1. Check for dedicated Subtitle / Font links
+  // Patterns: "ملف الترجمة والخطوط", "الترجمة والخطوط", "ملف الترجمة", "الخطوط", "softsub", "fonts", "sub", "subs"
+  const subKeywordsRegex = /(?:ملف(?:ات)?\s*الترجمة|الترجمة\s*و?الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?|fonts?)/i;
+  const actionButtonRegex = /^(?:هنا|اضغط\s*هنا|إضغط\s*هنا|اضغط|إضغط|التحميل|تحميل|تنزيل|download|direct|ddl)$/i;
 
-  const top4top = allLinks.find(l => l.href.includes('top4top.io'))?.href || null;
-  const mediafire = allLinks.find(l => l.href.includes('mediafire.com'))?.href || null;
-  const mega = allLinks.find(l => l.href.includes('mega.nz'))?.href || null;
-  const drive = allLinks.find(l => l.href.includes('drive.google.com'))?.href || null;
-  const torrent = allLinks.find(l => l.href.includes('.torrent') || l.href.includes('nyaa.si'))?.href || null;
+  let directSubLink = null;
 
-  const bestDownloadUrl = directSub ? directSub.href : (top4top || mediafire || mega || drive || torrent || null);
+  // A. Link text explicitly indicates subtitle file
+  for (const l of allLinks) {
+    if (subKeywordsRegex.test(l.text) || /\.(ass|srt|zip|rar|7z)$/i.test(l.href)) {
+      directSubLink = l.href;
+      break;
+    }
+  }
+
+  // B. Contextual match: link inside a container/heading about subtitle
+  if (!directSubLink) {
+    for (const l of allLinks) {
+      if (subKeywordsRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subKeywordsRegex.test(l.text) || l.href.includes('top4top.io') || l.href.includes('mediafire.com'))) {
+        directSubLink = l.href;
+        break;
+      }
+    }
+  }
+
+  // C. Find specific cloud & direct download providers (HEVC, H264, Softsub)
+  let top4top = null;
+  let mediafire = null;
+  let mega = null;
+  let drive = null;
+  let proton = null;
+  let pixeldrain = null;
+  let torrent = null;
+  let hevcLink = null;
+  let h264Link = null;
+
+  for (const l of allLinks) {
+    const hrefLower = l.href.toLowerCase();
+    const textLower = l.text.toLowerCase();
+    const ctxLower = l.parentContext.toLowerCase();
+
+    const isSoft = textLower.includes('soft') || ctxLower.includes('soft') || !ctxLower.includes('hard');
+
+    if (hrefLower.includes('top4top.io') && !top4top) top4top = l.href;
+    if (hrefLower.includes('mediafire.com') && isSoft && !mediafire) mediafire = l.href;
+    if (hrefLower.includes('mega.nz') && isSoft && !mega) mega = l.href;
+    if ((hrefLower.includes('drive.google.com') || hrefLower.includes('docs.google.com')) && isSoft && !drive) drive = l.href;
+    if (hrefLower.includes('proton.me') && isSoft && !proton) proton = l.href;
+    if (hrefLower.includes('pixeldrain.com') && isSoft && !pixeldrain) pixeldrain = l.href;
+    if ((hrefLower.includes('.torrent') || hrefLower.includes('nyaa.si')) && !torrent) torrent = l.href;
+
+    if ((textLower.includes('hevc') || textLower.includes('x265')) && isSoft && !hevcLink) hevcLink = l.href;
+    if ((textLower.includes('h264') || textLower.includes('h.264') || textLower.includes('x264')) && isSoft && !h264Link) h264Link = l.href;
+  }
+
+  // If directSubLink is an internal redirector (e.g. urls.mugi-subs.com/...), resolve it
+  if (directSubLink && /urls\.|redirect|go\.|link\./i.test(directSubLink)) {
+    directSubLink = await followRedirectUrl(directSubLink);
+  }
+
+  const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || null);
 
   return {
     title,
     pageUrl,
     bestDownloadUrl,
     videoLinks: {
-      directSub: directSub ? directSub.href : null,
+      directSub: directSubLink,
       top4top,
       mediafire,
       mega,
       drive,
-      torrent
+      proton,
+      pixeldrain,
+      torrent,
+      hevc: hevcLink,
+      h264: h264Link
     }
   };
 }

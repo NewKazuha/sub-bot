@@ -1,6 +1,7 @@
 import { execSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import AdmZip from 'adm-zip';
 
 const WORK_DIR = path.resolve('temp_work');
 const OUT_DIR = path.resolve('temp_extracted');
@@ -169,8 +170,15 @@ export async function processAndExtract(url, itemTitle = 'Episode') {
   if (fs.existsSync(fontsDir) && fs.readdirSync(fontsDir).length > 0) {
     fontZipPath = path.join(OUT_DIR, `${safeTitle}_Fonts.zip`);
     try {
-      run(`cd "${fontsDir}" && zip -r -9 "${fontZipPath}" .`);
-    } catch {}
+      const zip = new AdmZip();
+      for (const f of fs.readdirSync(fontsDir)) {
+        const fp = path.join(fontsDir, f);
+        if (fs.statSync(fp).isFile()) zip.addLocalFile(fp);
+      }
+      zip.writeZip(fontZipPath);
+    } catch (e) {
+      console.warn('Font zipping error:', e.message);
+    }
   }
 
   fs.rmSync(WORK_DIR, { recursive: true, force: true });
