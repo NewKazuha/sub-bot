@@ -129,22 +129,81 @@ export async function followRedirectUrl(url, maxHops = 3) {
   let curr = url;
   for (let i = 0; i < maxHops; i++) {
     try {
-      const res = await fetch(curr, {
+      // Many link shorteners (including Blogger redirect pages) reject HEAD.
+      // Try HEAD first, then use a redirect-only GET without downloading the body.
+      let res = await fetch(curr, {
         method: 'HEAD',
         redirect: 'manual',
         headers: { 'User-Agent': UA }
       });
+      if (![301, 302, 303, 307, 308].includes(res.status)) {
+        try { await res.body?.cancel(); } catch {}
+        res = await fetch(curr, {
+          method: 'GET',
+          redirect: 'manual',
+          headers: { 'User-Agent': UA, 'Range': 'bytes=0-0' }
+        });
+      }
       const loc = res.headers.get('location');
       if (loc && (res.status >= 300 && res.status < 400)) {
         curr = new URL(loc, curr).toString();
       } else {
         break;
       }
+      try { await res.body?.cancel(); } catch {}
     } catch {
       break;
     }
   }
   return curr;
+}
+
+function normaliseLinkUrl(rawUrl, pageUrl) {
+  if (!rawUrl) return null;
+  try {
+    const url = new URL(rawUrl.trim(), pageUrl);
+    return /^https?:$/i.test(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function getLinkTarget($, el, pageUrl) {
+  // Some Arabic fansub themes place the target in a data attribute or an
+  // onclick handler instead of href. Support both forms used by their buttons.
+  const raw = $(el).attr('href') || $(el).attr('data-href') ||
+    $(el).attr('data-url') || $(el).attr('data-link');
+  const normal = normaliseLinkUrl(raw, pageUrl);
+  if (normal) return normal;
+
+  const onclick = $(el).attr('onclick') || '';
+  const match = onclick.match(/(?:window\.location(?:\.href)?|location\.href)\s*=\s*['"]([^'"]+)['"]/i);
+  return normaliseLinkUrl(match?.[1], pageUrl);
+}
+
+async function resolveSubtitleFromDirectory(directoryUrl) {
+  try {
+    const res = await fetch(directoryUrl, { headers: { 'User-Agent': UA } });
+    if (!res.ok) return null;
+    const contentType = res.headers.get('content-type') || '';
+    if (!/html|text\//i.test(contentType)) return null;
+
+    const $ = cheerio.load(await res.text());
+    const candidates = [];
+    $('a[href]').each((_, el) => {
+      const href = normaliseLinkUrl($(el).attr('href'), directoryUrl);
+      const label = $(el).text().trim();
+      if (href && (/\.(?:ass|srt|zip|rar|7z)(?:$|[?#])/i.test(href) || /\.(?:ass|srt|zip|rar|7z)\b/i.test(label))) {
+        candidates.push(href);
+      }
+    });
+
+    // Prefer an archive because fansub releases commonly bundle fonts with it.
+    return candidates.find(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url)) || candidates[0] || null;
+  } catch (e) {
+    console.warn(`Could not inspect subtitle directory ${directoryUrl}:`, e.message);
+    return null;
+  }
 }
 
 export async function scrapePostPage(pageUrl, siteConfig = null) {
@@ -173,10 +232,10 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
                 'Anime Release';
 
   const allLinks = [];
-  $('a[href]').each((_, el) => {
-    const href = $(el).attr('href')?.trim();
+  $('a, [data-href], [data-url], [data-link], [onclick]').each((_, el) => {
+    const href = getLinkTarget($, el, pageUrl);
     const text = $(el).text().trim().replace(/\s+/g, ' ');
-    if (href && /^https?:\/\//i.test(href)) {
+    if (href) {
       const isIgnored = IGNORED_DOMAINS.some(d => href.includes(d));
       if (!isIgnored) {
         // Check parent/surrounding context text
@@ -187,8 +246,9 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
   });
 
   // 1. Check for dedicated Subtitle / Font links
-  // Patterns: "ملف الترجمة والخطوط", "الترجمة والخطوط", "ملف الترجمة", "الخطوط", "softsub", "fonts", "sub", "subs"
-  const subKeywordsRegex = /(?:ملف(?:ات)?\s*الترجمة|الترجمة\s*و?الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?|fonts?)/i;
+  // Patterns used by the fansub sites: "ملف الترجمة والخطوط", "ملف الترجمة",
+  // "Softsub", and buttons labelled "هنا" under these headings.
+  const subKeywordsRegex = /(?:ملف(?:ات)?\s*(?:الترجمة|الترجمات)(?:\s*و\s*الخطوط)?|(?:الترجمة|الترجمات)\s*و?\s*الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?|fonts?)/i;
   const actionButtonRegex = /^(?:هنا|اضغط\s*هنا|إضغط\s*هنا|اضغط|إضغط|التحميل|تحميل|تنزيل|download|direct|ddl)$/i;
 
   let directSubLink = null;
@@ -241,10 +301,31 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
     if ((textLower.includes('h264') || textLower.includes('h.264') || textLower.includes('x264')) && isSoft && !h264Link) h264Link = l.href;
   }
 
-  // If directSubLink is an internal redirector (e.g. urls.mugi-subs.com/...), resolve it
-  if (directSubLink && /urls\.|redirect|go\.|link\./i.test(directSubLink)) {
+  // Resolve shorteners before choosing a download method. This covers the
+  // buttons used by Mugi, Mejaow and Blogger sites (TinyURL/URLs/go links).
+  if (directSubLink && /(?:urls\.|redirect|go\.|link\.|tinyurl\.com|bit\.ly|t\.co|ouo\.|shrink)/i.test(directSubLink)) {
     directSubLink = await followRedirectUrl(directSubLink);
   }
+
+  // Rocks-Team style DDL links lead to a directory named "ملفات الترجمة"
+  // rather than a file. Pick the actual subtitle/archive from that listing.
+  if (directSubLink && /(?:ddl\.[^/]+\/0:|(?:subtitle|subtitles|ملفات(?:%20|\s)*الترجمة))/i.test(directSubLink) &&
+      !/\.(?:ass|srt|zip|rar|7z)(?:$|[?#])/i.test(directSubLink)) {
+    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink);
+    if (resolvedFile) directSubLink = resolvedFile;
+  }
+
+  // A subtitle button can itself be a short link. Once expanded, expose the
+  // underlying provider as well so the caller can use its folder/file resolver
+  // after a plain HTTP download is unsuitable (notably Drive and MediaFire).
+  const resolvedLower = (directSubLink || '').toLowerCase();
+  if (resolvedLower.includes('top4top.io') && !top4top) top4top = directSubLink;
+  if (resolvedLower.includes('mediafire.com') && !mediafire) mediafire = directSubLink;
+  if ((resolvedLower.includes('drive.google.com') || resolvedLower.includes('docs.google.com')) && !drive) drive = directSubLink;
+  if (resolvedLower.includes('mega.nz') && !mega) mega = directSubLink;
+  if (resolvedLower.includes('proton.me') && !proton) proton = directSubLink;
+  if (resolvedLower.includes('pixeldrain.com') && !pixeldrain) pixeldrain = directSubLink;
+  if ((resolvedLower.includes('.torrent') || resolvedLower.includes('nyaa.si')) && !torrent) torrent = directSubLink;
 
   const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || null);
 

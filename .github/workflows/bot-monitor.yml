@@ -2,7 +2,7 @@ name: Anime Sub Auto-Poster Monitor
 
 on:
   schedule:
-    # Backup cron trigger every 15 minutes
+    # One independent monitor cycle every 15 minutes.
     - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
@@ -12,7 +12,6 @@ concurrency:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   check-and-post:
@@ -39,13 +38,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip
           pip install --no-cache-dir mega.py gdown
 
-      - name: Run Continuous Feed Monitor (14 minutes)
+      - name: Run Continuous Feed Monitor (9 minutes)
         env:
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
-          RUN_DURATION_MINUTES: 14
-          CHECK_INTERVAL_SECONDS: 45
+          # Leave time for dependency setup and state persistence before the
+          # next 15-minute schedule. This avoids overlapping/cancelled runs.
+          RUN_DURATION_MINUTES: 9
+          CHECK_INTERVAL_SECONDS: 60
         run: |
           node src/action-runner.mjs
 
@@ -58,11 +59,3 @@ jobs:
           git commit -m "Update posted releases list [skip ci]" || true
           git pull --rebase origin main || true
           git push origin main || true
-
-      - name: Self-Trigger Next Continuous Run
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🚀 Triggering next continuous monitor window immediately..."
-          gh workflow run bot-monitor.yml || true
