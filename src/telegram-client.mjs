@@ -714,6 +714,7 @@ export async function checkTelegramChannels() {
         if (firstLine) {
           getReleaseKeys(firstLine, true).forEach(k => posted.add(k));
           getReleaseKeys(firstLine, false).forEach(k => posted.add(k));
+          getFansubReleaseKeys(firstLine).forEach(k => posted.add(k));
         }
         if (tm.media?.document?.attributes) {
           const fn = tm.media.document.attributes.find(a => a.fileName)?.fileName;
@@ -758,15 +759,24 @@ export async function checkTelegramChannels() {
         const isRengoku  = idStr.includes(CHANNEL_RENGOKU)  || titleLower.includes('rengoku');
         const isErai     = idStr.includes(CHANNEL_ERAI)     || titleLower.includes('erai-raws');
         const isLazySano = idStr.includes(CHANNEL_LAZYSANO) || titleLower.includes('lazysano') || titleLower.includes('レイジーさん');
+        const isFansubPublisher = idStr.includes(CHANNEL_FANSUB) || titleLower.includes('arabic anime publisher');
 
         console.log(`\n🔍 Checking: "${chat.title}" (ID: ${chat.id})`);
         const msgs = await client.getMessages(chat.id, { limit: 15 });
 
-      for (const msg of msgs) {
-        const msgKey = `tg_${chat.id}_${msg.id}`;
-        if (posted.has(msgKey)) continue;
+        for (const msg of msgs) {
+          const msgKey = `tg_${chat.id}_${msg.id}`;
+          const text = msg.message || '';
 
-        const text = msg.message || '';
+          if (posted.has(msgKey)) {
+            // Older releases were recorded with broad cross-source keys. A
+            // source message marked by that old logic must be retried unless
+            // its team-specific release key is present from the target channel.
+            if (!isFansubPublisher || isReleaseAlreadyPosted(posted, getFansubReleaseKeys(extractTeamAndFormatTitle(text)))) {
+              continue;
+            }
+            console.log(`   🔁 Retrying previously skipped fansub message ${msg.id} with team-scoped deduplication.`);
+          }
 
         // ==============================================================
         // SOURCE 1: Erai-Raws (Official Subtitles via Torrent - Strictly .ass)
