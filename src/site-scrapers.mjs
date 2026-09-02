@@ -1,6 +1,11 @@
 import * as cheerio from 'cheerio';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const HTTP_TIMEOUT_MS = 60_000;
+
+function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
+  return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+}
 
 class SessionJar {
   constructor() {
@@ -40,7 +45,7 @@ async function ensureSiteSession(siteConfig) {
   // 1. Check if site is Laravel / Custom Auth (e.g. Revive Subs)
   if (siteConfig.id === 'revive' || (siteConfig.base && siteConfig.base.includes('revivesubs'))) {
     try {
-      const getRes = await fetch(`${siteConfig.base}/login`, {
+      const getRes = await fetchWithTimeout(`${siteConfig.base}/login`, {
         headers: { 'User-Agent': UA }
       });
       jar.absorb(getRes);
@@ -54,7 +59,7 @@ async function ensureSiteSession(siteConfig) {
       params.append('password', siteConfig.pass);
       params.append('remember', 'on');
 
-      const postRes = await fetch(`${siteConfig.base}/login`, {
+      const postRes = await fetchWithTimeout(`${siteConfig.base}/login`, {
         method: 'POST',
         headers: {
           'User-Agent': UA,
@@ -75,7 +80,7 @@ async function ensureSiteSession(siteConfig) {
 
   // 2. Standard WordPress Authentication (Rhythm, LazySano, Anime-San, Celestial)
   try {
-    const wpInit = await fetch(`${siteConfig.base}/wp-login.php`, {
+    const wpInit = await fetchWithTimeout(`${siteConfig.base}/wp-login.php`, {
       headers: { 'User-Agent': UA }
     });
     jar.absorb(wpInit);
@@ -89,7 +94,7 @@ async function ensureSiteSession(siteConfig) {
       redirect_to: `${siteConfig.base}/`
     });
 
-    const res = await fetch(`${siteConfig.base}/wp-login.php`, {
+    const res = await fetchWithTimeout(`${siteConfig.base}/wp-login.php`, {
       method: 'POST',
       headers: {
         'User-Agent': UA,
@@ -131,14 +136,14 @@ export async function followRedirectUrl(url, maxHops = 3) {
     try {
       // Many link shorteners (including Blogger redirect pages) reject HEAD.
       // Try HEAD first, then use a redirect-only GET without downloading the body.
-      let res = await fetch(curr, {
+      let res = await fetchWithTimeout(curr, {
         method: 'HEAD',
         redirect: 'manual',
         headers: { 'User-Agent': UA }
       });
       if (![301, 302, 303, 307, 308].includes(res.status)) {
         try { await res.body?.cancel(); } catch {}
-        res = await fetch(curr, {
+        res = await fetchWithTimeout(curr, {
           method: 'GET',
           redirect: 'manual',
           headers: { 'User-Agent': UA, 'Range': 'bytes=0-0' }
@@ -183,7 +188,7 @@ function getLinkTarget($, el, pageUrl) {
 
 async function resolveSubtitleFromDirectory(directoryUrl) {
   try {
-    const res = await fetch(directoryUrl, { headers: { 'User-Agent': UA } });
+    const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
     if (!res.ok) return null;
     const contentType = res.headers.get('content-type') || '';
     if (!/html|text\//i.test(contentType)) return null;
@@ -215,7 +220,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
 
   let html = '';
   try {
-    const res = await fetch(pageUrl, {
+    const res = await fetchWithTimeout(pageUrl, {
       headers: { 'User-Agent': UA, 'Cookie': cookieHeader }
     });
     html = await res.text();

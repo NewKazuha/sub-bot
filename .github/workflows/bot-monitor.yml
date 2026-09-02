@@ -38,15 +38,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip
           pip install --no-cache-dir mega.py gdown
 
-      - name: Run Continuous Feed Monitor (9 minutes)
+      - name: Run a single monitor pass
         env:
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
-          # Leave time for dependency setup and state persistence before the
-          # next 15-minute schedule. This avoids overlapping/cancelled runs.
-          RUN_DURATION_MINUTES: 9
-          CHECK_INTERVAL_SECONDS: 60
+          # The workflow is already scheduled every 15 minutes. A single pass
+          # prevents queued runs from piling up and being cancelled.
+          RUN_DURATION_MINUTES: 0
         run: |
           node src/action-runner.mjs
 

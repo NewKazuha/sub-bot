@@ -6,6 +6,12 @@ import { pipeline } from 'node:stream/promises';
 import { createWriteStream } from 'node:fs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const HTTP_TIMEOUT_MS = 60_000;
+const MEGA_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+
+function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
+  return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+}
 
 // ====================================================================
 // Episode matching utilities
@@ -87,8 +93,18 @@ export async function listMegaFolder(folderUrl) {
 export async function downloadMegaNode(megaNode, destPath) {
   const dlStream = megaNode.download();
   const fileStream = createWriteStream(destPath);
-  await pipeline(dlStream, fileStream);
-  return destPath;
+  const timeout = setTimeout(() => {
+    const err = new Error(`Mega download timed out after ${MEGA_DOWNLOAD_TIMEOUT_MS / 60_000} minutes`);
+    dlStream.destroy(err);
+    fileStream.destroy(err);
+  }, MEGA_DOWNLOAD_TIMEOUT_MS);
+
+  try {
+    await pipeline(dlStream, fileStream);
+    return destPath;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null) {
@@ -137,7 +153,7 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null) 
 
 export async function resolveMediafireDirectDownload(mfUrl) {
   try {
-    const res = await fetch(mfUrl, {
+    const res = await fetchWithTimeout(mfUrl, {
       headers: { 'User-Agent': UA }
     });
     if (!res.ok) return null;
@@ -158,7 +174,7 @@ export async function listMediafireFolder(folderUrl) {
 
   const apiUrl = `https://www.mediafire.com/api/1.4/folder/get_content.php?folder_key=${folderKey}&content_type=files&response_format=json`;
   try {
-    const res = await fetch(apiUrl, {
+    const res = await fetchWithTimeout(apiUrl, {
       headers: { 'User-Agent': UA }
     });
     const data = await res.json();
@@ -261,7 +277,7 @@ export async function listDriveFolder(folderUrl) {
     const folderId = idMatch[1];
 
     const listUrl = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
-    const res = await fetch(listUrl, {
+    const res = await fetchWithTimeout(listUrl, {
       headers: { 'User-Agent': UA },
       redirect: 'follow'
     });

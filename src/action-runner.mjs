@@ -11,6 +11,13 @@ async function runContinuousMonitor() {
   console.log(`⏰ Polling Interval: Every ${CHECK_INTERVAL_SECONDS} seconds`);
   console.log(`======================================================\n`);
 
+  if (RUN_DURATION_MINUTES <= 0) {
+    console.log('🔄 Running one monitor pass.');
+    await checkNewReleases();
+    console.log('🏁 Monitor pass finished.');
+    return;
+  }
+
   const startTime = Date.now();
   const endTime = startTime + RUN_DURATION_MINUTES * 60 * 1000;
 

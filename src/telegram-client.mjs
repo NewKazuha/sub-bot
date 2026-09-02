@@ -20,6 +20,11 @@ import {
 
 const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
+const HTTP_TIMEOUT_MS = 60_000;
+
+function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
+  return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+}
 
 export function safeMoveFile(src, dest) {
   if (!fs.existsSync(src)) return false;
@@ -98,7 +103,7 @@ const ANIME_ALIASES = [
   { pattern: /(?:spy.*family)/i, canon: 'spy_family' },
   { pattern: /(?:solo\s*leveling)/i, canon: 'solo_leveling' },
   { pattern: /(?:kaiju.*(?:no.*)?8)/i, canon: 'kaiju_8' },
-  { pattern: /(?:youjo\s*senki|saga\s*of\s*tanya)/i, canon: 'youjo_senki' },
+  { pattern: /(?:youjo\s*senki|youjo\s*shenki|saga\s*of\s*tanya)/i, canon: 'youjo_senki' },
   { pattern: /(?:re:\s*zero|rezero)/i, canon: 'rezero' },
   { pattern: /(?:shangri.*la\s*frontier)/i, canon: 'shangri_la_frontier' },
   { pattern: /(?:sakamoto\s*days)/i, canon: 'sakamoto_days' },
@@ -248,6 +253,37 @@ export function getReleaseKeys(title, isOfficial = false) {
   return Array.from(new Set(keys.filter(Boolean)));
 }
 
+// Fansub releases are deliberately deduplicated within the same team only.
+// An official release (or another fansub team's release) must not suppress a
+// team's own subtitle merely because the anime title and episode match.
+export function getFansubReleaseKeys(title) {
+  const fullNorm = title
+    .toLowerCase()
+    .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
+    .replace(/Ⅱ/g, '2')
+    .replace(/Ⅲ/g, '3')
+    .replace(/Ⅳ/g, '4')
+    .replace(/Ⅴ/g, '5')
+    .replace(/Ⅵ/g, '6')
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/^_+|_+$/g, '');
+  const teamMatch = title.match(/^\[([^\]]+)\]/);
+  const teamKey = (teamMatch?.[1] || 'unknown')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/^_+|_+$/g, '');
+  const coreKey = getCoreAnimeEpisodeKey(title);
+  const canonName = getCanonicalAnimeKey(title);
+  const epNum = extractEpisodeNumber(title);
+  const keys = [`fansub_${teamKey}_${fullNorm}`];
+
+  if (epNum && (canonName || coreKey)) {
+    keys.push(`fansub_${teamKey}_${canonName || coreKey}_ep_${epNum}`);
+  }
+
+  return Array.from(new Set(keys.filter(Boolean)));
+}
+
 export function isReleaseAlreadyPosted(posted, keys) {
   return keys.some(k => posted.has(k));
 }
@@ -371,7 +407,9 @@ export function validateFileMagic(filePath) {
 }
 
 export async function downloadFileToDisk(url, destPath, headers = {}) {
+  const signal = AbortSignal.timeout(10 * 60 * 1000);
   const res = await fetch(url, {
+    signal,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
       ...headers
@@ -390,7 +428,7 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
 // ====================================================================
 async function resolveSubdlDownloadUrl(infoUrl) {
   try {
-    const res = await fetch(infoUrl, {
+    const res = await fetchWithTimeout(infoUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
     });
     if (!res.ok) return null;
@@ -413,7 +451,7 @@ async function resolveSubdlDownloadUrl(infoUrl) {
 
 async function resolveTop4topDownloadUrl(top4topUrl) {
   try {
-    const res = await fetch(top4topUrl, {
+    const res = await fetchWithTimeout(top4topUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
     });
     if (!res.ok) return null;
@@ -441,7 +479,7 @@ async function resolveTop4topDownloadUrl(top4topUrl) {
 
 async function resolveMediafireDownloadUrl(mfUrl) {
   try {
-    const res = await fetch(mfUrl, {
+    const res = await fetchWithTimeout(mfUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
     if (!res.ok) return null;
@@ -945,7 +983,7 @@ export async function checkTelegramChannels() {
               }
 
               const titleLine = formatCleanTitle(docBaseName);
-              const releaseKeys = getReleaseKeys(titleLine, false);
+              const releaseKeys = getFansubReleaseKeys(titleLine);
 
               if (isReleaseAlreadyPosted(posted, releaseKeys)) {
                 markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -994,7 +1032,7 @@ export async function checkTelegramChannels() {
           }
 
           if (titleLine) {
-            const releaseKeys = getReleaseKeys(titleLine, false);
+            const releaseKeys = getFansubReleaseKeys(titleLine);
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
               markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
@@ -1074,7 +1112,7 @@ export async function checkTelegramChannels() {
         // SOURCE 4: Arabic Anime Publisher (Fansub Releases)
         // ==============================================================
         const titleLine = extractTeamAndFormatTitle(text);
-        const releaseKeys = getReleaseKeys(titleLine, false);
+        const releaseKeys = getFansubReleaseKeys(titleLine);
 
         if (isReleaseAlreadyPosted(posted, releaseKeys)) {
           markReleaseAsPosted(posted, msgKey, releaseKeys);
