@@ -40,6 +40,10 @@ jobs:
 
       - name: Run a single monitor pass
         env:
+          # Some Arabic fansub sites use certificate chains trusted by the
+          # runner's system store but absent from Node's bundled CA set.
+          # Keep TLS validation enabled while allowing Node to use that store.
+          NODE_OPTIONS: --use-system-ca
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}

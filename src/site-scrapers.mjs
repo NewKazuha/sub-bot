@@ -129,6 +129,10 @@ async function ensureSiteSession(siteConfig) {
       redirect: 'manual'
     });
     jar.absorb(res);
+    const loggedIn = [...jar.cookies.keys()].some(name => /^wordpress_(?:sec_|logged_in_)/i.test(name));
+    if (!loggedIn) {
+      console.warn(`Login to WordPress site ${siteConfig.name} was not accepted; protected posts cannot be read.`);
+    }
   } catch (e) {
     console.warn(`Login to WordPress site ${siteConfig.name} failed:`, e.message);
   }
@@ -236,10 +240,7 @@ async function resolveSubtitleFromDirectory(directoryUrl) {
 
 export async function scrapePostPage(pageUrl, siteConfig = null) {
   let cookieHeader = '';
-  // Rhythm release pages and their Mega links are public. Its WordPress login
-  // endpoint often stalls GitHub-hosted runners, which prevented the scraper
-  // from reaching an otherwise accessible release page.
-  if (siteConfig && siteConfig.user && siteConfig.id !== 'rhythm') {
+  if (siteConfig && siteConfig.user) {
     const jar = await ensureSiteSession(siteConfig);
     if (jar) cookieHeader = jar.header();
   }
@@ -251,12 +252,12 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
     });
     html = await res.text();
   } catch (e) {
-    if (siteConfig?.id === 'rhythm' && isCertificateValidationError(e)) {
+    if (siteConfig && isCertificateValidationError(e)) {
       try {
-        console.warn(`Node TLS validation failed for Rhythm; using the system CA bundle.`);
+        console.warn(`Node TLS validation failed for ${siteConfig.name}; using the system CA bundle.`);
         html = fetchHtmlWithCurl(pageUrl, cookieHeader);
       } catch (curlError) {
-        console.error(`Failed to fetch Rhythm page with system CA bundle: ${pageUrl}`, curlError.message);
+        console.error(`Failed to fetch ${siteConfig.name} page with system CA bundle: ${pageUrl}`, curlError.message);
         return null;
       }
     } else {
