@@ -47,6 +47,16 @@ jobs:
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
+          RHYTHM_USER: ${{ secrets.RHYTHM_USER }}
+          RHYTHM_PASS: ${{ secrets.RHYTHM_PASS }}
+          LAZYSANO_USER: ${{ secrets.LAZYSANO_USER }}
+          LAZYSANO_PASS: ${{ secrets.LAZYSANO_PASS }}
+          CELESTIAL_USER: ${{ secrets.CELESTIAL_USER }}
+          CELESTIAL_PASS: ${{ secrets.CELESTIAL_PASS }}
+          REVIVE_USER: ${{ secrets.REVIVE_USER }}
+          REVIVE_PASS: ${{ secrets.REVIVE_PASS }}
+          ANIMESAN_USER: ${{ secrets.ANIMESAN_USER }}
+          ANIMESAN_PASS: ${{ secrets.ANIMESAN_PASS }}
           # The workflow is already scheduled every 15 minutes. A single pass
           # prevents queued runs from piling up and being cancelled.
           RUN_DURATION_MINUTES: 0
