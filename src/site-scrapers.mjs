@@ -1,10 +1,33 @@
 import * as cheerio from 'cheerio';
+import { execFileSync } from 'node:child_process';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
 
 function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
   return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+}
+
+function isCertificateValidationError(error) {
+  const detail = `${error?.code || ''} ${error?.cause?.code || ''} ${error?.message || ''} ${error?.cause?.message || ''}`;
+  return /(?:CERT_|UNABLE_TO_VERIFY|SELF_SIGNED|UNTRUSTED)/i.test(detail);
+}
+
+function fetchHtmlWithCurl(url, cookieHeader = '') {
+  // curl uses the runner's maintained system CA bundle. This is a secure
+  // fallback for Rhythm only when Node's bundled CA store rejects its chain.
+  const command = process.platform === 'win32' ? 'curl.exe' : 'curl';
+  const args = [
+    '--fail', '--silent', '--show-error', '--max-time', '60',
+    '--user-agent', UA
+  ];
+  if (cookieHeader) args.push('--cookie', cookieHeader);
+  args.push(url);
+  return execFileSync(command, args, {
+    encoding: 'utf8',
+    timeout: 65_000,
+    maxBuffer: 10 * 1024 * 1024
+  });
 }
 
 class SessionJar {
@@ -213,7 +236,10 @@ async function resolveSubtitleFromDirectory(directoryUrl) {
 
 export async function scrapePostPage(pageUrl, siteConfig = null) {
   let cookieHeader = '';
-  if (siteConfig && siteConfig.user) {
+  // Rhythm release pages and their Mega links are public. Its WordPress login
+  // endpoint often stalls GitHub-hosted runners, which prevented the scraper
+  // from reaching an otherwise accessible release page.
+  if (siteConfig && siteConfig.user && siteConfig.id !== 'rhythm') {
     const jar = await ensureSiteSession(siteConfig);
     if (jar) cookieHeader = jar.header();
   }
@@ -225,8 +251,18 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
     });
     html = await res.text();
   } catch (e) {
+    if (siteConfig?.id === 'rhythm' && isCertificateValidationError(e)) {
+      try {
+        console.warn(`Node TLS validation failed for Rhythm; using the system CA bundle.`);
+        html = fetchHtmlWithCurl(pageUrl, cookieHeader);
+      } catch (curlError) {
+        console.error(`Failed to fetch Rhythm page with system CA bundle: ${pageUrl}`, curlError.message);
+        return null;
+      }
+    } else {
     console.error(`Failed to fetch page: ${pageUrl}`, e.message);
     return null;
+    }
   }
 
   const $ = cheerio.load(html);
