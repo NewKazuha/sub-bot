@@ -1173,16 +1173,22 @@ export async function checkTelegramChannels() {
 
         // Case B: Post links in Fansub Channel (Multi-cloud / Torrent / Direct)
         const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-        const postPageUrl = urlMatches.find(u =>
-          !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com')
-        );
+        const postPageCandidates = [...new Set(urlMatches)]
+          .filter(u => !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com'))
+          .map(url => {
+            const site = CONFIG.SITES.find(s => {
+              try { return url.includes(new URL(s.base).hostname); } catch { return false; }
+            });
+            // Joint REVIVE/Rhythm releases must not stop at REVIVE's interactive
+            // login wall when an accessible Rhythm mirror is also provided.
+            const priority = site?.id === 'rhythm' ? 0 : site?.id === 'revive' ? 2 : 1;
+            return { url, site, priority };
+          })
+          .sort((a, b) => a.priority - b.priority);
 
-        if (postPageUrl) {
+        for (const { url: postPageUrl, site: matchingSite } of postPageCandidates) {
           console.log(`\n✨ [Fansub Post] "${titleLine}"`);
           console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
-          const matchingSite = CONFIG.SITES.find(s => {
-            try { return postPageUrl.includes(new URL(s.base).hostname); } catch { return false; }
-          });
           const pageData = await scrapePostPage(postPageUrl, matchingSite);
 
           if (pageData) {
@@ -1282,9 +1288,10 @@ export async function checkTelegramChannels() {
                     console.log(`   ✅ Successfully posted!`);
                     newFound++;
                     markReleaseAsPosted(posted, msgKey, releaseKeys);
+                    fs.rmSync(finalPath, { force: true });
+                    break;
                   }
                   fs.rmSync(finalPath, { force: true });
-                  continue;
                 }
               }
 
@@ -1304,10 +1311,11 @@ export async function checkTelegramChannels() {
                     console.log(`   ✅ Successfully posted!`);
                     newFound++;
                     markReleaseAsPosted(posted, msgKey, releaseKeys);
+                    fs.rmSync(finalPath, { force: true });
+                    break;
                   }
 
                   fs.rmSync(finalPath, { force: true });
-                  continue;
                 }
               }
             } catch (e) {
@@ -1317,6 +1325,7 @@ export async function checkTelegramChannels() {
             }
           }
         }
+        if (isReleaseAlreadyPosted(posted, releaseKeys)) continue;
       }
     } catch (chatErr) {
       console.warn(`   ⚠️ Error reading channel "${chat.title}":`, chatErr.message);

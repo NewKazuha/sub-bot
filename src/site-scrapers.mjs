@@ -76,6 +76,16 @@ async function ensureSiteSession(siteConfig) {
       const $ = cheerio.load(html);
       const token = $('meta[name="csrf-token"]').attr('content') || $('input[name="_token"]').val();
 
+      // Revive protects its login with Cloudflare Turnstile.  A GitHub Actions
+      // runner cannot legitimately complete an interactive challenge, so a
+      // password-only POST is guaranteed to be rejected even when the
+      // credentials are valid.  Keep the anonymous session (public posts may
+      // still be readable) and let the caller try the next URL in a joint post.
+      if ($('input[name="cf-turnstile-response"]').length) {
+        console.warn(`Login to ${siteConfig.name} requires Cloudflare Turnstile; skipping automated login and using public pages only.`);
+        return jar;
+      }
+
       const params = new URLSearchParams();
       if (token) params.append('_token', token);
       params.append('email', siteConfig.user);
