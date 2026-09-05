@@ -412,15 +412,45 @@ export function validateFileMagic(filePath) {
 
 export async function downloadFileToDisk(url, destPath, headers = {}) {
   const signal = AbortSignal.timeout(10 * 60 * 1000);
-  const res = await fetch(url, {
+  const requestOptions = {
     signal,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
       ...headers
     }
-  });
+  };
+  let res = await fetch(url, requestOptions);
 
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+
+  // Large public Google Drive files first return an HTML virus-scan warning.
+  // Submit its public, one-time confirmation parameters before saving; without
+  // this the extractor receives HTML instead of the MKV/subtitle file.
+  const isGoogleDrive = /(?:drive\.google\.com|drive\.usercontent\.google\.com)/i.test(`${url} ${res.url}`);
+  if (isGoogleDrive && /text\/html/i.test(res.headers.get('content-type') || '')) {
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    const form = $('form').first();
+    const action = form.attr('action');
+    const params = new URLSearchParams();
+    form.find('input[name]').each((_, input) => {
+      const name = $(input).attr('name');
+      const value = $(input).attr('value') || '';
+      if (name) params.set(name, value);
+    });
+
+    if (action && params.has('confirm')) {
+      const confirmedUrl = new URL(action, res.url);
+      confirmedUrl.search = params.toString();
+      console.log('   ↪️ Confirming public Google Drive download.');
+      res = await fetch(confirmedUrl, requestOptions);
+      if (!res.ok) throw new Error(`Google Drive confirmation returned HTTP ${res.status}`);
+    }
+  }
+
+  if (/text\/html/i.test(res.headers.get('content-type') || '')) {
+    throw new Error('Download returned HTML instead of a file');
+  }
 
   const fileStream = fs.createWriteStream(destPath, { flags: 'w' });
   await finished(Readable.fromWeb(res.body).pipe(fileStream));
