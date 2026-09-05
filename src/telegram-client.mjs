@@ -303,6 +303,10 @@ export function formatCleanTitle(raw) {
     .trim();
 }
 
+function isOfficialPlatformRelease(title) {
+  return /^\[\s*(?:cr(?:unchyroll)?|nf|netflix|dsnp|disney\+?|amzn|amazon(?:\s+prime)?|prime|hidive|shahid|bilibili|b-global|adn|abema|erai[-_\s]*raws)\s*\]/i.test(title);
+}
+
 export function extractTeamAndFormatTitle(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
@@ -344,7 +348,7 @@ export function extractTeamAndFormatTitle(text) {
 
 export function formatCleanCaption(title, isZip = false, isOfficial = false) {
   let clean = formatCleanTitle(title);
-  const isOfficialPlatform = isOfficial || /^\[\s*(?:crunchyroll|netflix|disney\+?|amazon|hidive|shahid|bilibili|adn|abema|erai[-_\s]*raws)\s*\]/i.test(clean);
+  const isOfficialPlatform = isOfficial || isOfficialPlatformRelease(clean);
   if (isZip && !isOfficialPlatform && !clean.toLowerCase().includes('[+fonts]')) {
     return `${clean} [+Fonts]`;
   }
@@ -762,17 +766,27 @@ export async function checkTelegramChannels() {
         const isFansubPublisher = idStr.includes(CHANNEL_FANSUB) || titleLower.includes('arabic anime publisher');
 
         console.log(`\n🔍 Checking: "${chat.title}" (ID: ${chat.id})`);
-        const msgs = await client.getMessages(chat.id, { limit: 15 });
+        // Sources can publish a batch far larger than one scheduled interval.
+        // Keep enough history to retry a failed batch instead of losing it once
+        // newer messages push it beyond the old 15-message window.
+        const msgs = await client.getMessages(chat.id, { limit: 100 });
 
         for (const msg of msgs) {
           const msgKey = `tg_${chat.id}_${msg.id}`;
           const text = msg.message || '';
+          const subdlTitle = (isKokoboko || isRengoku)
+            ? formatCleanTitle(text.split('\n').map(l => l.trim()).find(Boolean) || '')
+            : '';
+          const isFansubSubdl = Boolean(subdlTitle) && /subdl\.com\/s\/info\//i.test(text) && !isOfficialPlatformRelease(subdlTitle);
+          const retryFansubTitle = isFansubPublisher
+            ? extractTeamAndFormatTitle(text)
+            : subdlTitle;
 
           if (posted.has(msgKey)) {
             // Older releases were recorded with broad cross-source keys. A
             // source message marked by that old logic must be retried unless
             // its team-specific release key is present from the target channel.
-            if (!isFansubPublisher || isReleaseAlreadyPosted(posted, getFansubReleaseKeys(extractTeamAndFormatTitle(text)))) {
+            if (!(isFansubPublisher || isFansubSubdl) || isReleaseAlreadyPosted(posted, getFansubReleaseKeys(retryFansubTitle))) {
               continue;
             }
             console.log(`   🔁 Retrying previously skipped fansub message ${msg.id} with team-scoped deduplication.`);
@@ -854,7 +868,13 @@ export async function checkTelegramChannels() {
         if (isKokoboko || isRengoku) {
           const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
           const rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
-          const releaseKeys = getReleaseKeys(rawTitle, true);
+          // Rengoku also republishes Fansub releases.  Only a platform label
+          // (e.g. Crunchyroll/Amazon) is an official release; team-labelled
+          // messages must be deduplicated within that team, not globally.
+          const isOfficialSubdl = isOfficialPlatformRelease(rawTitle);
+          const releaseKeys = isOfficialSubdl
+            ? getReleaseKeys(rawTitle, true)
+            : getFansubReleaseKeys(rawTitle);
 
           if (isReleaseAlreadyPosted(posted, releaseKeys)) {
             markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -949,7 +969,7 @@ export async function checkTelegramChannels() {
                 }
 
                 // Subdl files are taken as-is (.ass for single, .zip for batches)
-                const caption = formatCleanCaption(rawTitle, validated.isArchive, true);
+                const caption = formatCleanCaption(rawTitle, validated.isArchive, isOfficialSubdl);
                 console.log(`   📤 Publishing to channel: "${caption}" (filename: ${cleanFileName})`);
                 const sendResult = await sendDocument(finalPath, caption);
 

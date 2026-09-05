@@ -287,16 +287,23 @@ export async function listDriveFolder(folderUrl) {
     const $ = cheerio.load(html);
     const files = [];
 
-    $('[data-id]').each((_, el) => {
-      const id = $(el).attr('data-id');
-      const name = $(el).find('.flip-entry-title').text().trim() ||
-                   $(el).attr('data-tooltip') ||
-                   $(el).text().trim();
-      if (id && name && name.length > 1) {
+    // Google Drive's embedded view used to expose data-id attributes.  It now
+    // puts the item ID in `id="entry-<id>"` and the canonical item link in the
+    // nested anchor, so support both page layouts.
+    $('[data-id], .flip-entry').each((_, el) => {
+      const entry = $(el);
+      const href = entry.find('a[href]').first().attr('href') || '';
+      const entryId = (entry.attr('id') || '').match(/^entry-([\w-]{20,})$/)?.[1];
+      const hrefId = href.match(/(?:file\/d\/|folders\/)([\w-]{20,})/)?.[1];
+      const id = entry.attr('data-id') || entryId || hrefId;
+      const name = entry.find('.flip-entry-title').text().trim() ||
+                   entry.attr('data-tooltip') ||
+                   entry.text().trim();
+      if (id && name && name.length > 1 && !files.some(f => f.id === id)) {
         files.push({
           name,
           id,
-          isFolder: $(el).hasClass('flip-entry-list-folder') || $(el).find('.flip-entry-list-folder').length > 0
+          isFolder: /\/folders\//i.test(href) || entry.hasClass('flip-entry-list-folder') || entry.find('.flip-entry-list-folder').length > 0
         });
       }
     });
