@@ -47,7 +47,8 @@ export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TEL
 
     const res = await fetch(`${API_BASE}/sendDocument`, {
       method: 'POST',
-      body: formData
+      body: formData,
+      signal: AbortSignal.timeout(120000)
     });
     return await res.json();
   } catch (e) {
