@@ -1,9 +1,9 @@
 name: Anime Sub Auto-Poster Monitor
 
 on:
-  schedule:
-    # One independent monitor cycle every 15 minutes.
-    - cron: '*/15 * * * *'
+  # schedule:
+  #   # One independent monitor cycle every 15 minutes.
+  #   - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
 concurrency:
