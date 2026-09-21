@@ -7,8 +7,9 @@ import { execSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import AdmZip from 'adm-zip';
+import SevenZip from '7zip-bin';
 import { CONFIG } from './config.mjs';
-import { scrapePostPage } from './site-scrapers.mjs';
+import { scrapePostPage, resolveSubtitleFromDirectory } from './site-scrapers.mjs';
 import { sendDocument } from './telegram.mjs';
 import {
   findBestFileInMegaFolder,
@@ -49,36 +50,36 @@ export function safeMoveFile(src, dest) {
 // ====================================================================
 // Source channel IDs
 // ====================================================================
-const CHANNEL_KOKOBOKO   = '1224725097';   // KokoBoko [Subdl] (Official)
-const CHANNEL_RENGOKU    = '2217287273';   // Rengoku [Subdl] (Official)
-const CHANNEL_ERAI       = '2084152036';   // Erai-Raws (Official)
-const CHANNEL_LAZYSANO   = '1650610194';   // LazySano (Fansub)
-const CHANNEL_FANSUB     = '1031770723';   // Arabic Anime Publisher (Fansub)
+const CHANNEL_KOKOBOKO = '1224725097';   // KokoBoko [Subdl] (Official)
+const CHANNEL_RENGOKU = '2217287273';   // Rengoku [Subdl] (Official)
+const CHANNEL_ERAI = '2084152036';   // Erai-Raws (Official)
+const CHANNEL_LAZYSANO = '1650610194';   // LazySano (Fansub)
+const CHANNEL_FANSUB = '1031770723';   // Arabic Anime Publisher (Fansub)
 
 // ====================================================================
 // Source abbreviation mapping to full official platform names
 // ====================================================================
 const SOURCE_FULL_NAME = {
-  'cr':           'Crunchyroll',
-  'crunchyroll':  'Crunchyroll',
-  'hidive':       'HIDIVE',
-  'nf':           'Netflix',
-  'netflix':      'Netflix',
-  'dsnp':         'Disney+',
-  'disney+':      'Disney+',
-  'disney':       'Disney+',
-  'amzn':         'Amazon',
-  'amazon':       'Amazon',
+  'cr': 'Crunchyroll',
+  'crunchyroll': 'Crunchyroll',
+  'hidive': 'HIDIVE',
+  'nf': 'Netflix',
+  'netflix': 'Netflix',
+  'dsnp': 'Disney+',
+  'disney+': 'Disney+',
+  'disney': 'Disney+',
+  'amzn': 'Amazon',
+  'amazon': 'Amazon',
   'amazon prime': 'Amazon',
-  'prime':        'Amazon',
-  'shahid':       'Shahid',
-  'funimation':   'Funimation',
-  'funi':         'Funimation',
-  'bilibili':     'Bilibili',
-  'b-global':     'B-Global',
-  'adn':          'ADN',
-  'adi':          'ADN',
-  'abema':        'ABEMA',
+  'prime': 'Amazon',
+  'shahid': 'Shahid',
+  'funimation': 'Funimation',
+  'funi': 'Funimation',
+  'bilibili': 'Bilibili',
+  'b-global': 'B-Global',
+  'adn': 'ADN',
+  'adi': 'ADN',
+  'abema': 'ABEMA',
 };
 
 // ====================================================================
@@ -142,7 +143,7 @@ export function loadPostedIds() {
     if (fs.existsSync(POSTED_FILE)) {
       return new Set(JSON.parse(fs.readFileSync(POSTED_FILE, 'utf8')));
     }
-  } catch {}
+  } catch { }
   return new Set();
 }
 
@@ -155,12 +156,39 @@ export function savePostedIds(set) {
   }
 }
 
+const ARABIC_EPISODE_WORDS = [
+  { p: /الحادية\s*عشر[ةه]?/i, ep: '11' },
+  { p: /الثانية\s*عشر[ةه]?/i, ep: '12' },
+  { p: /الثالثة\s*عشر[ةه]?/i, ep: '13' },
+  { p: /الرابعة\s*عشر[ةه]?/i, ep: '14' },
+  { p: /الخامسة\s*عشر[ةه]?/i, ep: '15' },
+  { p: /السادسة\s*عشر[ةه]?/i, ep: '16' },
+  { p: /السابعة\s*عشر[ةه]?/i, ep: '17' },
+  { p: /الثامنة\s*عشر[ةه]?/i, ep: '18' },
+  { p: /التاسعة\s*عشر[ةه]?/i, ep: '19' },
+  { p: /العشر[ووي]ن/i, ep: '20' },
+  { p: /الأول[ىي]/i, ep: '01' },
+  { p: /الثانية/i, ep: '02' },
+  { p: /الثالثة/i, ep: '03' },
+  { p: /الرابعة/i, ep: '04' },
+  { p: /الخامسة/i, ep: '05' },
+  { p: /السادسة/i, ep: '06' },
+  { p: /السابعة/i, ep: '07' },
+  { p: /الثامنة/i, ep: '08' },
+  { p: /التاسعة/i, ep: '09' },
+  { p: /العاشرة/i, ep: '10' }
+];
+
 export function extractEpisodeNumber(text) {
   if (!text) return '';
   const cleaned = text.replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '');
-  
-  // Match patterns like: " - 46", " E46", " EP46", " Episode 46", " #46", " [46]", " 46"
-  const m = cleaned.match(/(?:-\s*|ep(?:isode)?\s*|e\s*|#\s*|\s+)(\d{1,4})(?:\s*v\d+)?(?:\s*\[|\s*\(|\s*\.|\s*$)/i);
+
+  for (const item of ARABIC_EPISODE_WORDS) {
+    if (item.p.test(cleaned)) return item.ep;
+  }
+
+  // Match patterns like: " - 46", " E46", " EP46", " Episode 46", " #46", " [46]", " 46", "~ 46"
+  const m = cleaned.match(/(?:-\s*|ep(?:isode)?\s*|e\s*|#\s*|\s+|~)(\d{1,4})(?:\s*v\d+)?(?:\s*\[|\s*\(|\s*\.|\s*$)/i);
   if (m) return m[1].replace(/^0+/, '') || '0';
   return '';
 }
@@ -297,14 +325,139 @@ export function markReleaseAsPosted(posted, msgKey, keys = []) {
 }
 
 export function formatCleanTitle(raw) {
-  return raw
+  let cleaned = raw
     .replace(/^[📍📌🎬\s]+/, '')
     .replace(/\[\+fonts?\]/gi, '')
     .trim();
+  cleaned = cleaned.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
+  return cleaned;
 }
 
 function isOfficialPlatformRelease(title) {
   return /^\[\s*(?:cr(?:unchyroll)?|nf|netflix|dsnp|disney\+?|amzn|amazon(?:\s+prime)?|prime|hidive|shahid|bilibili|b-global|adn|abema|erai[-_\s]*raws)\s*\]/i.test(title);
+}
+
+export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
+  let base = path.basename(fileName)
+    .replace(/\.(mkv|mp4|ass|srt|zip|rar|7z)$/i, '')
+    .trim();
+
+  // Strip team tag at the start if present
+  let fileTeam = '';
+  const teamMatch = base.match(/^\[([^\]]+)\]/);
+  if (teamMatch) {
+    fileTeam = teamMatch[1].trim();
+    base = base.slice(teamMatch[0].length).trim();
+  }
+
+  // Strip quality tags, codecs, CRCs, resolutions
+  base = base
+    .replace(/\[(?:1080p|720p|480p|bd|bdrip|hevc|x26[45]|aac|flac|[0-9a-f]{8})[^\]]*\]/gi, '')
+    .replace(/\((?:1080p|720p|480p|bd|bdrip|hevc|x26[45]|aac|flac|[0-9a-f]{8})[^\)]*\)/gi, '')
+    .replace(/\[\s*\]/g, '')
+    .replace(/\(\s*\)/g, '')
+    .replace(/\)+$/g, '')
+    .trim();
+
+  base = base.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim();
+  base = base.replace(/\s*(?:ep|e|#)\s*(\d{1,4})/gi, ' - $1');
+  base = base.replace(/\s*-\s*(\d{1,4})/g, ' - $1');
+  base = base.replace(/([a-zA-Z])\s+(\d{1,4})(?:\s*END)?$/i, '$1 - $2');
+  base = base.replace(/\s+/g, ' ').trim();
+
+  const hasEnglish = /[a-zA-Z]/.test(base);
+  const hasArabic = /[\u0600-\u06FF\u0750-\u077F]/.test(base);
+
+  // Ignore generic names like "extracted_sub", "subtitle", "track", "sub", "sub_1234", "untitled", "fonts", "release", "archive", "sample"
+  if (/^(?:extracted(?:[-_\s]*(?:sub|subtitle))?|subtitle|sub(?:[-_\s]*\d+)?|track\d*|untitled|default|fonts?|releases?|sample(?:[-_\s]*release)?|archives?|packs?|batch(?:es)?|doc(?:[-_\s]*\d+)?|ep(?:[-_\s]*\d+)?)$/i.test(base)) {
+    return null;
+  }
+
+  if (hasEnglish && !hasArabic && base.length >= 3) {
+    let effectiveTeam = teamName || fileTeam;
+    effectiveTeam = effectiveTeam.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (/^hoshizora(?:[-_\s]*subs?)?$/i.test(effectiveTeam)) effectiveTeam = 'ReDEJA';
+    return effectiveTeam ? `[${effectiveTeam}] ${base}` : base;
+  }
+  return null;
+}
+
+export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContentPaths = []) {
+  const teamMatch = rawTitle.match(/^\[([^\]]+)\]/);
+  let team = teamMatch ? teamMatch[1] : '';
+  if (/^hoshizora(?:[-_\s]*subs?)?$/i.test(team)) team = 'ReDEJA';
+
+  const titleNoTeam = rawTitle.replace(/^\[[^\]]+\]\s*/, '').trim();
+  const isArabic = /[\u0600-\u06FF\u0750-\u077F]/.test(titleNoTeam);
+  if (!isArabic) {
+    return team ? `[${team}] ${titleNoTeam}` : rawTitle;
+  }
+
+  const origEp = extractEpisodeNumber(rawTitle);
+
+  // Expand candidate names (including files inside archives)
+  const candidateNames = [];
+  for (const fn of fileNames) {
+    if (!fn) continue;
+    let isArc = false;
+    try {
+      if (typeof fn === 'string' && fs.existsSync(fn) && validateFileMagic(fn)?.isArchive) {
+        isArc = true;
+        const innerFiles = listArchiveFiles(fn);
+        // Prioritize .ass and .srt files inside archive
+        const innerSubs = innerFiles.filter(f => /\.(ass|srt)$/i.test(f));
+        const otherInner = innerFiles.filter(f => !/\.(ass|srt)$/i.test(f));
+        candidateNames.push(...innerSubs, ...otherInner);
+      }
+    } catch {}
+    if (!isArc) candidateNames.push(fn);
+  }
+
+  // Check candidate file names
+  for (const fn of candidateNames) {
+    if (!fn) continue;
+    let resolved = cleanEnglishTitleFromFilename(fn, team);
+    if (resolved) {
+      if (origEp) {
+        const resolvedEp = extractEpisodeNumber(resolved);
+        if (!resolvedEp) {
+          resolved = `${resolved} - ${origEp.padStart(2, '0')}`;
+        }
+      }
+      console.log(`   🔤 Converted Arabic title "${rawTitle}" -> English "${resolved}" from file: ${path.basename(fn)}`);
+      return resolved;
+    }
+  }
+
+  // Check ASS file headers
+  for (const p of assContentPaths) {
+    if (!p || !fs.existsSync(p)) continue;
+    try {
+      const content = fs.readFileSync(p, 'utf8');
+      const lines = content.slice(0, 3000).split('\n');
+      for (const line of lines) {
+        const m = line.match(/^Title:\s*(.+)/i);
+        if (m) {
+          let t = m[1].replace(/\s*-\s*(?:Arabic|العربية|عربي)\s*$/i, '').trim();
+          if (!/^(?:untitled|default\s+aegisub|script|extracted)/i.test(t)) {
+            let resolved = cleanEnglishTitleFromFilename(t, team);
+            if (resolved) {
+              if (origEp) {
+                const resolvedEp = extractEpisodeNumber(resolved);
+                if (!resolvedEp) {
+                  resolved = `${resolved} - ${origEp.padStart(2, '0')}`;
+                }
+              }
+              console.log(`   🔤 Converted Arabic title "${rawTitle}" -> English "${resolved}" from ASS Title: ${t}`);
+              return resolved;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return team ? `[${team}] ${titleNoTeam}` : rawTitle;
 }
 
 export function extractTeamAndFormatTitle(text) {
@@ -312,12 +465,12 @@ export function extractTeamAndFormatTitle(text) {
   const rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
 
   if (/^\[[^\]]+\]/.test(rawTitle)) {
-    return rawTitle;
+    return rawTitle.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
   }
 
   let team = '';
   for (const line of lines) {
-    const match = line.match(/^(?:By|من قبل|ترجمة|بواسطة)\s+@?([a-zA-Z0-9_\- ]+)/i);
+    const match = line.match(/^(?:By|من قبل|ترجمة|بواسطة|فريق)\s+@?([a-zA-Z0-9_\- ]+)/i);
     if (match) {
       team = match[1].trim();
       break;
@@ -326,30 +479,84 @@ export function extractTeamAndFormatTitle(text) {
 
   if (team) {
     team = team
-      .replace(/fansubs?|subs?|subtitles?|team|فريق/gi, '')
+      .replace(/\b(?:fansubs?|subs?|subtitles?|team|فريق)\b/gi, '')
       .replace(/[_-]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
 
-    if (team.toLowerCase() === 'celestial dragons') team = 'Celestial-Dragons';
-    if (team.toLowerCase() === 'lazysano' || team.toLowerCase() === 'lazysanosubs') team = 'LazySano';
-    if (team.toLowerCase() === 'asahi') team = 'Asahi';
-    if (team.toLowerCase() === 'rhythm') team = 'Rhythm';
-    if (team.toLowerCase() === 'kusanage') team = 'Kusanage';
-    if (team.toLowerCase() === 'a55bb') team = 'A55BB';
+    const tLower = team.toLowerCase();
+    if (tLower === 'celestial dragons' || tLower === 'celestial') team = 'Celestial-Dragons';
+    else if (tLower === 'lazysano' || tLower === 'lazysanosubs') team = 'LazySano';
+    else if (tLower === 'asahi') team = 'Asahi';
+    else if (tLower === 'rhythm') team = 'Rhythm';
+    else if (tLower === 'kusanage') team = 'Kusanage';
+    else if (tLower === 'a55bb') team = 'A55BB';
+    else if (/^suzume(?:\s*soko)?$/i.test(team)) team = 'Suzume-Soko';
+    else if (/^kiyoshi$/i.test(team)) team = 'Kiyoshi';
+    else if (/^hoshizora(?:[-_\s]*subs?)?$/i.test(team) || tLower === 'redeja') team = 'ReDEJA';
+    else if (tLower === 'zarax' || tLower === 'zaraxsub') team = 'ZaraXsub';
+    else if (tLower === 'rocks' || tLower === 'rocks team') team = 'Rocks-Team';
+    else if (tLower === 'mugi' || tLower === 'mugi subs') team = 'Mugi-Subs';
+    else if (tLower === 'revive') team = 'REVIVE';
+    else if (tLower === 'greyrats' || tLower === 'greyratssubs') team = 'Greyrats';
+    else if (tLower === 'merasubs' || tLower === 'mera') team = 'Merasubs';
+    else if (tLower === 'bruuhim' || tLower === 'bruuhimsubs') team = 'Bruuhim';
+    else if (tLower === 'aurora' || tLower === 'aurorateam' || tLower === 'aurora team') team = 'Aurora-Team';
+    else if (team) {
+      team = team.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('-');
+    }
 
     if (team) {
       return `[${team}] ${rawTitle}`;
     }
   }
 
-  return rawTitle;
+  if (!team) {
+    const urlMatch = text.match(/https?:\/\/(?:www\.)?([a-zA-Z0-9_\-]+)\.(?:blogspot\.com|com|net|org|pro|site|me|co|io|workers\.dev|pages\.dev)/i);
+    if (urlMatch) {
+      const host = urlMatch[1].toLowerCase();
+      if (host.includes('mugi')) team = 'Mugi-Subs';
+      else if (host.includes('kusanage')) team = 'Kusanage';
+      else if (host.includes('zarax')) team = 'ZaraXsub';
+      else if (host.includes('rocks')) team = 'Rocks-Team';
+      else if (host.includes('rhythm')) team = 'Rhythm';
+      else if (host.includes('revive')) team = 'REVIVE';
+      else if (host.includes('mejaow')) team = 'Mejaow';
+      else if (host.includes('suzume')) team = 'Suzume-Soko';
+      else if (host.includes('kiyoshi')) team = 'Kiyoshi';
+      else if (host.includes('hoshizora') || host.includes('redeja')) team = 'ReDEJA';
+      else if (host.includes('a55bb')) team = 'A55BB';
+      else if (host.includes('celestial')) team = 'Celestial-Dragons';
+      else if (host.includes('lazysano')) team = 'LazySano';
+      else if (host.includes('animesan')) team = 'Anime-San';
+      else if (host.includes('stellarsaber')) team = 'Stellarsaber';
+      else if (host.includes('bruuhim')) team = 'Bruuhim';
+      else if (host.includes('aurora')) team = 'Aurora-Team';
+    }
+  }
+
+  if (!team) {
+    if (/suzume[-_\s]*soko|suzumesoko/i.test(text)) team = 'Suzume-Soko';
+    else if (/kiyoshi/i.test(text)) team = 'Kiyoshi';
+    else if (/hoshizora|redeja/i.test(text)) team = 'ReDEJA';
+    else if (/a55bb/i.test(text)) team = 'A55BB';
+    else if (/zaraxsub/i.test(text)) team = 'ZaraXsub';
+    else if (/kusanage/i.test(text)) team = 'Kusanage';
+    else if (/rocks[-_\s]*team/i.test(text)) team = 'Rocks-Team';
+    else if (/mugi[-_\s]*subs/i.test(text)) team = 'Mugi-Subs';
+    else if (/greyrats/i.test(text)) team = 'Greyrats';
+    else if (/merasubs/i.test(text)) team = 'Merasubs';
+  }
+
+  return team ? `[${team}] ${rawTitle}` : rawTitle;
 }
 
-export function formatCleanCaption(title, isZip = false, isOfficial = false) {
+export function formatCleanCaption(title, isZip = false, isOfficial = false, hasFonts = null) {
   let clean = formatCleanTitle(title);
+  clean = clean.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
   const isOfficialPlatform = isOfficial || isOfficialPlatformRelease(clean);
-  if (isZip && !isOfficialPlatform && !clean.toLowerCase().includes('[+fonts]')) {
+  const fontsIncluded = hasFonts !== null ? hasFonts : (isZip && !isOfficialPlatform);
+  if (fontsIncluded && !clean.toLowerCase().includes('[+fonts]')) {
     return `${clean} [+Fonts]`;
   }
   return clean;
@@ -411,12 +618,39 @@ export function validateFileMagic(filePath) {
 }
 
 export function listArchiveFiles(archivePath) {
-  const ext = path.extname(archivePath).toLowerCase();
+  const magic = validateFileMagic(archivePath);
+  const ext = (magic?.ext || path.extname(archivePath)).toLowerCase();
   if (ext === '.zip') {
     try {
       const zip = new AdmZip(archivePath);
       return zip.getEntries().filter(e => !e.isDirectory).map(e => e.entryName);
-    } catch {}
+    } catch { }
+  }
+  if (ext === '.7z' || ext === '.rar' || magic?.isArchive) {
+    try {
+      const stdout = execSync(`"${SevenZip.path7za}" l "${archivePath}"`, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      const lines = stdout.split(/\r?\n/);
+      const files = [];
+      let headerPassed = false;
+      for (const line of lines) {
+        if (line.includes('-------------------')) {
+          headerPassed = !headerPassed;
+          continue;
+        }
+        if (headerPassed) {
+          const match = line.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+([A-Za-z.]+)\s+\d+\s+(?:\d+)?\s+(.+)$/);
+          if (match) {
+            const attr = match[1];
+            const name = match[2].trim();
+            if (!attr.includes('D') && name) files.push(name);
+          }
+        }
+      }
+      if (files.length > 0) return files;
+    } catch { }
   }
   try {
     const stdout = execSync(`tar -tf "${archivePath}"`, {
@@ -434,13 +668,22 @@ export function listArchiveFiles(archivePath) {
 
 export function extractArchive(archivePath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
-  const ext = path.extname(archivePath).toLowerCase();
+  const magic = validateFileMagic(archivePath);
+  const ext = (magic?.ext || path.extname(archivePath)).toLowerCase();
   if (ext === '.zip') {
     try {
       const zip = new AdmZip(archivePath);
       zip.extractAllTo(destDir, true);
       return true;
-    } catch {}
+    } catch { }
+  }
+  if (ext === '.7z' || ext === '.rar' || magic?.isArchive) {
+    try {
+      execSync(`"${SevenZip.path7za}" x "${archivePath}" -o"${destDir}" -y`, {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      return true;
+    } catch { }
   }
   try {
     execSync(`tar -xf "${archivePath}" -C "${destDir}"`, {
@@ -460,7 +703,7 @@ export function packFolderToZip(folderPath, destZipPath) {
       const fullPath = path.join(dir, item.name);
       if (item.isDirectory()) {
         addRecursive(fullPath, zipSubDir ? `${zipSubDir}/${item.name}` : item.name);
-      } else if (/\.(ass|srt)$/i.test(item.name)) {
+      } else if (/\.(ass|srt|ttf|otf|woff2?)$/i.test(item.name)) {
         zip.addLocalFile(fullPath, zipSubDir);
       }
     }
@@ -520,23 +763,74 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
 // ====================================================================
 // SUBDL, Top4Top, and Mediafire resolvers
 // ====================================================================
-async function resolveSubdlDownloadUrl(infoUrl) {
+function fetchSubdlHtmlWithCurl(url) {
+  try {
+    const command = process.platform === 'win32' ? 'curl.exe' : 'curl';
+    const args = `"${command}" -s -L --compressed -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.9" "${url}"`;
+    return execSync(args, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 30000 });
+  } catch (e) {
+    console.warn('SUBDL curl fallback error:', e.message);
+    return null;
+  }
+}
+
+export async function resolveSubdlDownloadData(infoUrl) {
+  let html = '';
   try {
     const res = await fetchWithTimeout(infoUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
-    const doc = cheerio.load(html);
-    let dlUrl = null;
-    doc('a[href]').each((_, el) => {
-      const href = doc(el).attr('href') || '';
-      if (href.includes('dl.subdl.com/subtitle/')) {
-        dlUrl = href;
-        return false;
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
       }
     });
-    return dlUrl;
+    if (res.ok) {
+      const candidate = await res.text();
+      if (!candidate.includes('Just a moment...') && !/<title>\s*Just a moment/i.test(candidate)) {
+        html = candidate;
+      }
+    }
+  } catch {}
+
+  if (!html) {
+    html = fetchSubdlHtmlWithCurl(infoUrl);
+  }
+  if (!html) return null;
+
+  const doc = cheerio.load(html);
+  const allLinks = [];
+  doc('a[href]').each((_, el) => {
+    const href = doc(el).attr('href') || '';
+    if (href.includes('dl.subdl.com/subtitle/')) {
+      if (!allLinks.includes(href)) allLinks.push(href);
+    }
+  });
+
+  if (allLinks.length === 0) {
+    const rawMatches = [...html.matchAll(/href=["']([^"']*dl\.subdl\.com\/subtitle\/[^"']*)["']/gi)];
+    for (const m of rawMatches) {
+      if (!allLinks.includes(m[1])) allLinks.push(m[1]);
+    }
+  }
+
+  if (allLinks.length === 0) return null;
+
+  // The main complete batch zip archive on Subdl matches /subtitle/\d+-\d+
+  const batchZipLink = allLinks.find(l => /dl\.subdl\.com\/subtitle\/\d+-\d+/i.test(l));
+  const individualLinks = allLinks.filter(l => !/dl\.subdl\.com\/subtitle\/\d+-\d+/i.test(l));
+
+  return {
+    batchZipLink: batchZipLink || null,
+    individualLinks,
+    allLinks
+  };
+}
+
+export async function resolveSubdlDownloadUrl(infoUrl) {
+  try {
+    const data = await resolveSubdlDownloadData(infoUrl);
+    if (!data) return null;
+    return data.batchZipLink || data.individualLinks[0] || data.allLinks[0] || null;
   } catch (e) {
     console.warn('SUBDL resolve error:', e.message);
     return null;
@@ -632,13 +926,41 @@ function hasRequiredTools() {
 // Extraction rule:
 // If isOfficial = true (e.g. Erai-Raws), strictly extract .ass ONLY, NO fonts, NO zip.
 // If isOfficial = false (e.g. Fansub), extract fonts and zip into [+Fonts].zip if fonts present.
-function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = false, preferArabic = false) {
+function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = false, preferArabic = false, customSubName = '') {
   if (!fs.existsSync(filePath)) return null;
 
   // 1. Direct valid archive or subtitle file
   const magic = validateFileMagic(filePath);
   if (magic) {
-    return { filePath, isArchive: magic.isArchive, ext: magic.ext };
+    if (magic.isArchive && customSubName) {
+      const arcUnpackDir = path.join(workDir, 'arc_unpack');
+      if (extractArchive(filePath, arcUnpackDir)) {
+        const allFiles = [];
+        function scanA(dir) {
+          for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, f.name);
+            if (f.isDirectory()) scanA(full);
+            else allFiles.push(full);
+          }
+        }
+        scanA(arcUnpackDir);
+        const subFiles = allFiles.filter(f => /\.(ass|srt)$/i.test(f));
+        if (subFiles.length === 1) {
+          const subExt = path.extname(subFiles[0]).toLowerCase();
+          const properSubName = getSafeTelegramFileName(customSubName, subExt);
+          const renamedPath = path.join(path.dirname(subFiles[0]), properSubName);
+          if (subFiles[0] !== renamedPath) {
+            safeMoveFile(subFiles[0], renamedPath);
+          }
+          const repackedZip = path.join(workDir, 'repacked_release.zip');
+          packFolderToZip(arcUnpackDir, repackedZip);
+          if (fs.existsSync(repackedZip) && fs.statSync(repackedZip).size > 100) {
+            return { filePath: repackedZip, isArchive: true, ext: '.zip', resolvedTitle: customSubName };
+          }
+        }
+      }
+    }
+    return { filePath, isArchive: magic.isArchive, ext: magic.ext, resolvedTitle: customSubName };
   }
 
   // 2. MKV / Video file with softsubs & fonts
@@ -670,7 +992,18 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
       const trackId = selectedTrack.id;
       const codec = (selectedTrack.codec || '').toLowerCase();
       const subExt = codec.includes('subrip') || codec.includes('srt') ? '.srt' : '.ass';
-      const extractedSubPath = path.join(workDir, `extracted_sub${subExt}`);
+
+      const videoBase = path.basename(filePath, path.extname(filePath));
+      const cleanedVideoBase = cleanEnglishTitleFromFilename(videoBase) || videoBase;
+
+      let subBaseName = '';
+      if (customSubName) {
+        subBaseName = getSafeTelegramFileName(customSubName, '');
+      } else {
+        subBaseName = getSafeTelegramFileName(cleanedVideoBase, '');
+      }
+      if (!subBaseName || subBaseName === 'extracted_sub') subBaseName = 'subtitle';
+      const extractedSubPath = path.join(workDir, `${subBaseName}${subExt}`);
 
       execSync(`mkvextract tracks "${filePath}" ${trackId}:"${extractedSubPath}"`, {
         stdio: 'pipe',
@@ -681,7 +1014,7 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
 
       // Official releases (Erai-Raws) strictly receive .ass ONLY - no font extraction, no zip!
       if (isOfficial) {
-        return { filePath: extractedSubPath, isArchive: false, ext: subExt };
+        return { filePath: extractedSubPath, isArchive: false, ext: subExt, resolvedTitle: customSubName || cleanedVideoBase };
       }
 
       // Fansub releases: extract fonts if present and package in .zip
@@ -699,7 +1032,7 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
         try {
           execSync(`mkvextract attachments "${filePath}" ${extractArgs}`, { stdio: 'pipe', timeout: 60000 });
           const zipPath = path.join(workDir, 'release_fonts.zip');
-          
+
           const zip = new AdmZip();
           zip.addLocalFile(extractedSubPath);
           for (const f of fs.readdirSync(fontsDir)) {
@@ -711,14 +1044,14 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
           zip.writeZip(zipPath);
 
           if (fs.existsSync(zipPath) && fs.statSync(zipPath).size > 100) {
-            return { filePath: zipPath, isArchive: true, ext: '.zip' };
+            return { filePath: zipPath, isArchive: true, ext: '.zip', resolvedTitle: customSubName || cleanedVideoBase };
           }
         } catch (e) {
           console.warn('   ⚠️ Font extraction/zipping error:', e.message);
         }
       }
 
-      return { filePath: extractedSubPath, isArchive: false, ext: subExt };
+      return { filePath: extractedSubPath, isArchive: false, ext: subExt, resolvedTitle: customSubName || cleanedVideoBase };
     } catch (e) {
       console.warn('   ⚠️ MKV extraction error:', e.message);
       return null;
@@ -728,7 +1061,7 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
   return null;
 }
 
-async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOfficial = false, preferArabic = true) {
+async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOfficial = false, preferArabic = true, customSubName = '') {
   const torrentPath = path.join(workDir, 'release.torrent');
   await downloadFileToDisk(torrentUrl, torrentPath);
   console.log(`   📥 Torrent file downloaded (${fs.statSync(torrentPath).size} bytes)`);
@@ -763,12 +1096,17 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
   const mkvPath = mkvFiles[0];
   console.log(`   🎬 MKV found: ${path.basename(mkvPath)} (${(fs.statSync(mkvPath).size / 1024 / 1024).toFixed(1)} MB)`);
 
-  const result = extractSubtitleAndFontsFromAnyFile(mkvPath, workDir, isOfficial, preferArabic);
+  let resolvedTitle = customSubName;
+  if (mkvPath) {
+    resolvedTitle = resolveEnglishTitleIfArabic(customSubName, [mkvPath]);
+  }
 
-  try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch {}
-  try { fs.rmSync(torrentPath, { force: true }); } catch {}
+  const result = extractSubtitleAndFontsFromAnyFile(mkvPath, workDir, isOfficial, preferArabic, resolvedTitle);
 
-  return result;
+  try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch { }
+  try { fs.rmSync(torrentPath, { force: true }); } catch { }
+
+  return result ? { ...result, resolvedTitle } : null;
 }
 
 // ====================================================================
@@ -831,11 +1169,11 @@ export async function checkTelegramChannels() {
       const isChatGroup = title.includes('chat') || title.includes('group') || title.includes('نقاشات') || title.includes('محادثة');
       if (isChatGroup) return false;
 
-      const isFansubPublisher = idStr.includes(CHANNEL_FANSUB)   || title.includes('arabic anime publisher');
+      const isFansubPublisher = idStr.includes(CHANNEL_FANSUB) || title.includes('arabic anime publisher');
       const isOfficialKokoboko = idStr.includes(CHANNEL_KOKOBOKO) || title.includes('kokoboko [subdl]');
-      const isOfficialRengoku  = idStr.includes(CHANNEL_RENGOKU)  || title.includes('rengoku [subdl]');
-      const isEraiRaws         = idStr.includes(CHANNEL_ERAI)      || title.includes('erai-raws');
-      const isLazySano         = idStr.includes(CHANNEL_LAZYSANO)  || title.includes('lazysano') || title.includes('レイジーさん');
+      const isOfficialRengoku = idStr.includes(CHANNEL_RENGOKU) || title.includes('rengoku [subdl]');
+      const isEraiRaws = idStr.includes(CHANNEL_ERAI) || title.includes('erai-raws');
+      const isLazySano = idStr.includes(CHANNEL_LAZYSANO) || title.includes('lazysano') || title.includes('レイジーさん');
 
       return isFansubPublisher || isOfficialKokoboko || isOfficialRengoku || isEraiRaws || isLazySano;
     });
@@ -850,8 +1188,8 @@ export async function checkTelegramChannels() {
         const idStr = String(chat.id);
         const titleLower = (chat.title || '').toLowerCase();
         const isKokoboko = idStr.includes(CHANNEL_KOKOBOKO) || titleLower.includes('kokoboko');
-        const isRengoku  = idStr.includes(CHANNEL_RENGOKU)  || titleLower.includes('rengoku');
-        const isErai     = idStr.includes(CHANNEL_ERAI)     || titleLower.includes('erai-raws');
+        const isRengoku = idStr.includes(CHANNEL_RENGOKU) || titleLower.includes('rengoku');
+        const isErai = idStr.includes(CHANNEL_ERAI) || titleLower.includes('erai-raws');
         const isLazySano = idStr.includes(CHANNEL_LAZYSANO) || titleLower.includes('lazysano') || titleLower.includes('レイジーさん');
         const isFansubPublisher = idStr.includes(CHANNEL_FANSUB) || titleLower.includes('arabic anime publisher');
 
@@ -882,346 +1220,56 @@ export async function checkTelegramChannels() {
             console.log(`   🔁 Retrying previously skipped fansub message ${msg.id} with team-scoped deduplication.`);
           }
 
-        // ==============================================================
-        // SOURCE 1: Erai-Raws (Official Subtitles via Torrent - Strictly .ass)
-        // ==============================================================
-        if (isErai) {
-          const eraiData = parseEraiMessage(msg);
-          if (!eraiData) continue;
+          // ==============================================================
+          // SOURCE 1: Erai-Raws (Official Subtitles via Torrent - Strictly .ass)
+          // ==============================================================
+          if (isErai) {
+            const eraiData = parseEraiMessage(msg);
+            if (!eraiData) continue;
 
-          if (!eraiData.hasArabic) {
-            markReleaseAsPosted(posted, msgKey);
-            continue;
-          }
-
-          const formattedTitle = `[${eraiData.sourceName}] ${eraiData.title}`;
-          const releaseKeys = getReleaseKeys(formattedTitle, true);
-
-          if (isReleaseAlreadyPosted(posted, releaseKeys)) {
-            console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted as official release. Skipping.`);
-            markReleaseAsPosted(posted, msgKey, releaseKeys);
-            continue;
-          }
-
-          if (!toolsAvailable) {
-            console.log(`   ⏭️ [Erai-Raws] Skipping "${formattedTitle}" – aria2c/mkvextract not available locally.`);
-            continue;
-          }
-
-          if (!eraiData.torrentUrl) {
-            console.warn(`   ⚠️ [Erai-Raws] No torrent URL found for "${formattedTitle}". Skipping.`);
-            continue;
-          }
-
-          console.log(`\n✨ [Erai-Raws Official] "${formattedTitle}"`);
-          console.log(`   📦 Source: ${eraiData.source} → [${eraiData.sourceName}]`);
-          console.log(`   🔗 Torrent: ${eraiData.torrentUrl}`);
-
-          const eraiWorkDir = path.join(OUT_DIR, `erai_${msg.id}`);
-          fs.mkdirSync(eraiWorkDir, { recursive: true });
-
-          try {
-            // isOfficial = true ensures strictly .ass extraction without fonts or zip
-            const extracted = await downloadAndExtractSubtitleFromTorrent(eraiData.torrentUrl, eraiWorkDir, true, true);
-
-            if (extracted && extracted.filePath) {
-              const cleanFileName = getSafeTelegramFileName(formattedTitle, extracted.ext);
-              const finalPath = path.join(OUT_DIR, cleanFileName);
-              safeMoveFile(extracted.filePath, finalPath);
-
-              const caption = formatCleanCaption(formattedTitle, false, true);
-              console.log(`   📤 Publishing official sub: "${caption}" (filename: ${cleanFileName})`);
-              const sendResult = await sendDocument(finalPath, caption);
-
-              if (sendResult?.ok) {
-                console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
-                newFound++;
-                markReleaseAsPosted(posted, msgKey, releaseKeys);
-              } else {
-                console.error(`   ❌ Failed to send document:`, sendResult);
-              }
-
-              fs.rmSync(finalPath, { force: true });
+            if (!eraiData.hasArabic) {
+              markReleaseAsPosted(posted, msgKey);
+              continue;
             }
-          } catch (e) {
-            console.error(`   ❌ Erai-Raws processing error:`, e.message);
-          } finally {
-            try { fs.rmSync(eraiWorkDir, { recursive: true, force: true }); } catch {}
-          }
 
-          continue;
-        }
+            const formattedTitle = `[${eraiData.sourceName}] ${eraiData.title}`;
+            const releaseKeys = getReleaseKeys(formattedTitle, true);
 
-        // ==============================================================
-        // SOURCE 2: Subdl Channels (KokoBoko & Rengoku - As-Is .ass or .zip)
-        // ==============================================================
-        if (isKokoboko || isRengoku) {
-          // --- CASE A: File directly attached in KokoBoko/Rengoku message ---
-          if (msg.media && msg.media.document) {
-            const doc = msg.media.document;
-            const originalName = doc.attributes?.find(a => a.fileName)?.fileName || '';
-            const docExt = path.extname(originalName).toLowerCase();
-
-            if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(docExt)) {
-              let cleanTitle = '';
-              let linkedMsgId = null;
-
-              const lines = (msg.message || '').split('\n').map(l => l.trim()).filter(Boolean);
-              if (lines.length > 0 && lines[0].length > 3) {
-                cleanTitle = formatCleanTitle(lines[0]);
-              }
-
-              // If message has no proper title or doesn't have [Platform], look at adjacent message (within +-2 IDs)
-              if (!cleanTitle || !/^\[[^\]]+\]/.test(cleanTitle)) {
-                const adjMsg = msgs.find(m =>
-                  m &&
-                  Math.abs(m.id - msg.id) <= 2 &&
-                  m.id !== msg.id &&
-                  m.message &&
-                  (m.message.includes('subdl.com') || m.message.includes('📍') || /\[(Crunchyroll|Netflix|Disney|Shahid|Bilibili|ADN|Abema|Amazon)\]/i.test(m.message))
-                );
-
-                if (adjMsg) {
-                  const adjLines = (adjMsg.message || '').split('\n').map(l => l.trim()).filter(Boolean);
-                  if (adjLines[0]) {
-                    cleanTitle = formatCleanTitle(adjLines[0]);
-                    linkedMsgId = adjMsg.id;
-                  }
-                }
-              }
-
-              if (!cleanTitle) {
-                const baseName = originalName.replace(/\.(ass|srt|zip|rar|7z)$/i, '').trim();
-                cleanTitle = formatCleanTitle(baseName);
-                if (!/^\[[^\]]+\]/.test(cleanTitle)) cleanTitle = `[Subdl] ${cleanTitle}`;
-              }
-
-              const releaseKeys = getReleaseKeys(cleanTitle, true);
-              if (isReleaseAlreadyPosted(posted, releaseKeys)) {
-                markReleaseAsPosted(posted, msgKey, releaseKeys);
-                if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
-                continue;
-              }
-
-              console.log(`\n✨ [Subdl Direct File] "${cleanTitle}" (${originalName})`);
-              const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${originalName}`);
-
-              try {
-                const buffer = await client.downloadMedia(msg);
-                if (buffer && Buffer.isBuffer(buffer)) {
-                  fs.writeFileSync(localFilePath, buffer);
-                  let validated = validateFileMagic(localFilePath);
-
-                  if (validated) {
-                    let effectiveDownloadPath = localFilePath;
-
-                    if (validated.isArchive) {
-                      const archiveFiles = listArchiveFiles(localFilePath);
-                      const subFiles = archiveFiles.filter(f => /\.(ass|srt)$/i.test(f));
-                      const isBatch = subFiles.length > 1 || /\[\s*\d+\s*(?:~|-)\s*\d+\s*\]/i.test(cleanTitle) || /كامل|batch|pack/i.test(cleanTitle);
-
-                      if (!isBatch && subFiles.length === 1) {
-                        const extractDir = path.join(OUT_DIR, `unpack_single_${msg.id}`);
-                        if (extractArchive(localFilePath, extractDir)) {
-                          const singleFileName = path.basename(subFiles[0]);
-                          const foundFile = path.join(extractDir, subFiles[0]);
-                          const singleExt = path.extname(singleFileName).toLowerCase();
-                          const unzippedSubPath = path.join(OUT_DIR, `subdl_${msg.id}${singleExt}`);
-                          if (fs.existsSync(foundFile)) {
-                            safeMoveFile(foundFile, unzippedSubPath);
-                            const unzippedVal = validateFileMagic(unzippedSubPath);
-                            if (unzippedVal) {
-                              effectiveDownloadPath = unzippedSubPath;
-                              validated = unzippedVal;
-                            }
-                          }
-                          try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
-                        }
-                      } else {
-                        // For batch releases, repack as clean .zip if it was .rar/.7z for universal mobile/desktop support
-                        if (validated.ext === '.rar' || validated.ext === '.7z') {
-                          const extractDir = path.join(OUT_DIR, `unpack_batch_${msg.id}`);
-                          if (extractArchive(localFilePath, extractDir)) {
-                            const repackedZip = path.join(OUT_DIR, `batch_${msg.id}.zip`);
-                            packFolderToZip(extractDir, repackedZip);
-                            const zipVal = validateFileMagic(repackedZip);
-                            if (zipVal) {
-                              effectiveDownloadPath = repackedZip;
-                              validated = zipVal;
-                            }
-                            try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
-                          }
-                        }
-                      }
-                    }
-
-                    const cleanFileName = getSafeTelegramFileName(cleanTitle, validated.ext);
-                    const finalPath = path.join(OUT_DIR, cleanFileName);
-                    safeMoveFile(effectiveDownloadPath, finalPath);
-                    if (effectiveDownloadPath !== localFilePath) {
-                      try { fs.rmSync(localFilePath, { force: true }); } catch {}
-                    }
-
-                    const caption = formatCleanCaption(cleanTitle, validated.isArchive, true);
-                    console.log(`   📤 Publishing Subdl direct file: "${caption}" (filename: ${cleanFileName})`);
-                    const sendResult = await sendDocument(finalPath, caption);
-
-                    if (sendResult?.ok) {
-                      console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
-                      newFound++;
-                      markReleaseAsPosted(posted, msgKey, releaseKeys);
-                      if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
-                    } else {
-                      console.error(`   ❌ Failed to send document:`, sendResult);
-                    }
-
-                    fs.rmSync(finalPath, { force: true });
-                    continue;
-                  }
-                  fs.rmSync(localFilePath, { force: true });
-                }
-              } catch (e) {
-                console.warn(`   ⚠️ Subdl direct file error:`, e.message);
-              }
+            if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+              console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted as official release. Skipping.`);
+              markReleaseAsPosted(posted, msgKey, releaseKeys);
+              continue;
             }
-          }
 
-          // --- CASE B: Text / Link release in KokoBoko/Rengoku ---
-          const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-          const rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
-          // Rengoku also republishes Fansub releases.  Only a platform label
-          // (e.g. Crunchyroll/Amazon) is an official release; team-labelled
-          // messages must be deduplicated within that team, not globally.
-          const isOfficialSubdl = isOfficialPlatformRelease(rawTitle);
-          const releaseKeys = isOfficialSubdl
-            ? getReleaseKeys(rawTitle, true)
-            : getFansubReleaseKeys(rawTitle);
+            if (!toolsAvailable) {
+              console.log(`   ⏭️ [Erai-Raws] Skipping "${formattedTitle}" – aria2c/mkvextract not available locally.`);
+              continue;
+            }
 
-          if (isReleaseAlreadyPosted(posted, releaseKeys)) {
-            markReleaseAsPosted(posted, msgKey, releaseKeys);
-            continue;
-          }
+            if (!eraiData.torrentUrl) {
+              console.warn(`   ⚠️ [Erai-Raws] No torrent URL found for "${formattedTitle}". Skipping.`);
+              continue;
+            }
 
-          // Check if there is an adjacent message with a direct document covering this release
-          const adjDocMsg = msgs.find(m =>
-            m &&
-            Math.abs(m.id - msg.id) <= 2 &&
-            m.id !== msg.id &&
-            m.media?.document
-          );
-          if (adjDocMsg) {
-            // The attached document will be handled directly
-            continue;
-          }
+            console.log(`\n✨ [Erai-Raws Official] "${formattedTitle}"`);
+            console.log(`   📦 Source: ${eraiData.source} → [${eraiData.sourceName}]`);
+            console.log(`   🔗 Torrent: ${eraiData.torrentUrl}`);
 
-          const subdlMatch = text.match(/https?:\/\/(?:www\.)?subdl\.com\/s\/info\/[a-zA-Z0-9]+/i);
-          if (subdlMatch) {
-            const subdlInfoUrl = subdlMatch[0];
-            console.log(`\n✨ [Subdl Official Release via Link] "${rawTitle}"`);
-            console.log(`   🌐 Resolving SUBDL link: ${subdlInfoUrl}`);
-            const dlUrl = await resolveSubdlDownloadUrl(subdlInfoUrl);
+            const eraiWorkDir = path.join(OUT_DIR, `erai_${msg.id}`);
+            fs.mkdirSync(eraiWorkDir, { recursive: true });
 
-            if (dlUrl) {
-              try {
-                console.log(`   📥 Downloading from SUBDL: ${dlUrl}`);
-                const tempDownload = path.join(OUT_DIR, `temp_subdl_${msg.id}`);
-                await downloadFileToDisk(dlUrl, tempDownload, { Referer: subdlInfoUrl });
+            try {
+              // isOfficial = true ensures strictly .ass extraction without fonts or zip
+              const extracted = await downloadAndExtractSubtitleFromTorrent(eraiData.torrentUrl, eraiWorkDir, true, true, formattedTitle);
 
-                let validated = validateFileMagic(tempDownload);
-                let effectiveDownloadPath = tempDownload;
-
-                if (!validated) {
-                  // Check if downloaded text file contains Top4Top / Mediafire / Mega link
-                  try {
-                    const textContent = fs.readFileSync(tempDownload, 'utf8');
-                    const top4topMatch = textContent.match(/https?:\/\/[^\s"'<>]*top4top\.io\/[^\s"'<>]+/i);
-                    const mfMatch = textContent.match(/https?:\/\/[^\s"'<>]*mediafire\.com\/[^\s"'<>]+/i);
-                    const megaMatch = textContent.match(/https?:\/\/[^\s"'<>]*mega\.nz\/[^\s"'<>]+/i);
-
-                    if (top4topMatch) {
-                      console.log(`   🌐 Found Top4Top link in SUBDL text note: ${top4topMatch[0]}`);
-                      const direct = await resolveTop4topDownloadUrl(top4topMatch[0]);
-                      if (direct) {
-                        const top4topDest = path.join(OUT_DIR, `top4top_${Date.now()}`);
-                        await downloadFileToDisk(direct, top4topDest);
-                        validated = validateFileMagic(top4topDest);
-                        if (validated) effectiveDownloadPath = top4topDest;
-                      }
-                    } else if (mfMatch) {
-                      console.log(`   🌐 Found Mediafire link in SUBDL text note: ${mfMatch[0]}`);
-                      const mfBest = await findBestFileInMediafire(mfMatch[0]);
-                      if (mfBest?.directUrl) {
-                        const mfDest = path.join(OUT_DIR, `mf_${Date.now()}`);
-                        await downloadFileToDisk(mfBest.directUrl, mfDest);
-                        validated = validateFileMagic(mfDest);
-                        if (validated) effectiveDownloadPath = mfDest;
-                      }
-                    }
-                  } catch (e) {
-                    console.warn(`   ⚠️ Fallback link parsing error:`, e.message);
-                  }
-                }
-
-                if (!validated) {
-                  console.warn(`   ⚠️ Downloaded SUBDL file was invalid or HTML. Skipping.`);
-                  fs.rmSync(tempDownload, { force: true });
-                  if (effectiveDownloadPath !== tempDownload) fs.rmSync(effectiveDownloadPath, { force: true });
-                  continue;
-                }
-
-                if (validated && validated.isArchive) {
-                  const archiveFiles = listArchiveFiles(effectiveDownloadPath);
-                  const subFiles = archiveFiles.filter(f => /\.(ass|srt)$/i.test(f));
-                  const isBatch = subFiles.length > 1 || /\[\s*\d+\s*(?:~|-)\s*\d+\s*\]/i.test(rawTitle) || /كامل|batch|pack/i.test(rawTitle);
-
-                  if (!isBatch && subFiles.length === 1) {
-                    const extractDir = path.join(OUT_DIR, `unpack_single_subdl_${msg.id}`);
-                    if (extractArchive(effectiveDownloadPath, extractDir)) {
-                      const singleFileName = path.basename(subFiles[0]);
-                      const foundFile = path.join(extractDir, subFiles[0]);
-                      const singleExt = path.extname(singleFileName).toLowerCase();
-                      const unzippedSubPath = path.join(OUT_DIR, `subdl_${msg.id}${singleExt}`);
-                      if (fs.existsSync(foundFile)) {
-                        safeMoveFile(foundFile, unzippedSubPath);
-                        const unzippedVal = validateFileMagic(unzippedSubPath);
-                        if (unzippedVal) {
-                          if (effectiveDownloadPath !== tempDownload) {
-                            try { fs.rmSync(effectiveDownloadPath, { force: true }); } catch {}
-                          }
-                          effectiveDownloadPath = unzippedSubPath;
-                          validated = unzippedVal;
-                        }
-                      }
-                      try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
-                    }
-                  } else if (isBatch && (validated.ext === '.rar' || validated.ext === '.7z')) {
-                    const extractDir = path.join(OUT_DIR, `unpack_batch_subdl_${msg.id}`);
-                    if (extractArchive(effectiveDownloadPath, extractDir)) {
-                      const repackedZip = path.join(OUT_DIR, `batch_subdl_${msg.id}.zip`);
-                      packFolderToZip(extractDir, repackedZip);
-                      const zipVal = validateFileMagic(repackedZip);
-                      if (zipVal) {
-                        if (effectiveDownloadPath !== tempDownload) {
-                          try { fs.rmSync(effectiveDownloadPath, { force: true }); } catch {}
-                        }
-                        effectiveDownloadPath = repackedZip;
-                        validated = zipVal;
-                      }
-                      try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
-                    }
-                  }
-                }
-
-                const cleanFileName = getSafeTelegramFileName(rawTitle, validated.ext);
+              if (extracted && extracted.filePath) {
+                const effectiveTitle = extracted.resolvedTitle || formattedTitle;
+                const cleanFileName = getSafeTelegramFileName(effectiveTitle, extracted.ext);
                 const finalPath = path.join(OUT_DIR, cleanFileName);
-                safeMoveFile(effectiveDownloadPath, finalPath);
-                if (effectiveDownloadPath !== tempDownload) {
-                  try { fs.rmSync(tempDownload, { force: true }); } catch {}
-                }
+                safeMoveFile(extracted.filePath, finalPath);
 
-                // Subdl files are taken as-is (.ass for single, .zip for batches)
-                const caption = formatCleanCaption(rawTitle, validated.isArchive, isOfficialSubdl);
-                console.log(`   📤 Publishing to channel: "${caption}" (filename: ${cleanFileName})`);
+                const caption = formatCleanCaption(effectiveTitle, false, true);
+                console.log(`   📤 Publishing official sub: "${caption}" (filename: ${cleanFileName})`);
                 const sendResult = await sendDocument(finalPath, caption);
 
                 if (sendResult?.ok) {
@@ -1233,112 +1281,518 @@ export async function checkTelegramChannels() {
                 }
 
                 fs.rmSync(finalPath, { force: true });
-                continue;
-              } catch (e) {
-                console.error(`   ❌ Error downloading/posting SUBDL release:`, e.message);
               }
+            } catch (e) {
+              console.error(`   ❌ Erai-Raws processing error:`, e.message);
+            } finally {
+              try { fs.rmSync(eraiWorkDir, { recursive: true, force: true }); } catch { }
             }
+
+            continue;
           }
 
-          continue;
-        }
+          // ==============================================================
+          // SOURCE 2: Subdl Channels (KokoBoko & Rengoku - As-Is .ass or .zip)
+          // ==============================================================
+          if (isKokoboko || isRengoku) {
+            // --- CASE A: File directly attached in KokoBoko/Rengoku message ---
+            if (msg.media && msg.media.document) {
+              const doc = msg.media.document;
+              const originalName = doc.attributes?.find(a => a.fileName)?.fileName || '';
+              const docExt = path.extname(originalName).toLowerCase();
 
-        // ==============================================================
-        // SOURCE 3: LazySano Channel (Dedicated Fansub Channel)
-        // ==============================================================
-        if (isLazySano) {
-          // Case A: File directly attached in LazySano message
-          if (msg.media && msg.media.document) {
-            const doc = msg.media.document;
-            const originalName = doc.attributes?.find(a => a.fileName)?.fileName || '';
-            const ext = path.extname(originalName).toLowerCase();
+              if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(docExt)) {
+                let cleanTitle = '';
+                let linkedMsgId = null;
 
-            if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
-              let docBaseName = originalName
-                .replace(/\.(ass|srt|zip|rar|7z)$/i, '')
-                .replace(/\s*\((?:1080p|720p|480p)\)/gi, '')
-                .trim();
-
-              if (!docBaseName.toLowerCase().startsWith('[lazysano]')) {
-                docBaseName = `[LazySano] ${docBaseName}`;
-              }
-
-              const titleLine = formatCleanTitle(docBaseName);
-              const releaseKeys = getFansubReleaseKeys(titleLine);
-
-              if (isReleaseAlreadyPosted(posted, releaseKeys)) {
-                markReleaseAsPosted(posted, msgKey, releaseKeys);
-                continue;
-              }
-
-              console.log(`\n✨ [LazySano Direct File] "${titleLine}" (${originalName})`);
-              const localFilePath = path.join(OUT_DIR, originalName);
-
-              try {
-                const buffer = await client.downloadMedia(msg);
-                if (buffer && Buffer.isBuffer(buffer)) {
-                  fs.writeFileSync(localFilePath, buffer);
-
-                  const validated = validateFileMagic(localFilePath);
-                  if (validated) {
-                    const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
-                    const finalPath = path.join(OUT_DIR, cleanFileName);
-                    safeMoveFile(localFilePath, finalPath);
-
-                    const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                    console.log(`   📤 Publishing LazySano release: "${caption}"`);
-                    const sendResult = await sendDocument(finalPath, caption);
-
-                    if (sendResult?.ok) {
-                      console.log(`   ✅ Successfully posted!`);
-                      newFound++;
-                      markReleaseAsPosted(posted, msgKey, releaseKeys);
-                    }
-                    fs.rmSync(finalPath, { force: true });
-                    continue;
-                  }
-                  fs.rmSync(localFilePath, { force: true });
+                const lines = (msg.message || '').split('\n').map(l => l.trim()).filter(Boolean);
+                if (lines.length > 0 && lines[0].length > 3) {
+                  cleanTitle = formatCleanTitle(lines[0]);
                 }
-              } catch (e) {
-                console.warn(`   ⚠️ LazySano direct file download error:`, e.message);
+
+                // If message has no proper title or doesn't have [Platform], look at adjacent message (within +-2 IDs)
+                if (!cleanTitle || !/^\[[^\]]+\]/.test(cleanTitle)) {
+                  const adjMsg = msgs.find(m =>
+                    m &&
+                    Math.abs(m.id - msg.id) <= 2 &&
+                    m.id !== msg.id &&
+                    m.message &&
+                    (m.message.includes('subdl.com') || m.message.includes('📍') || /\[(Crunchyroll|Netflix|Disney|Shahid|Bilibili|ADN|Abema|Amazon)\]/i.test(m.message))
+                  );
+
+                  if (adjMsg) {
+                    const adjLines = (adjMsg.message || '').split('\n').map(l => l.trim()).filter(Boolean);
+                    if (adjLines[0]) {
+                      cleanTitle = formatCleanTitle(adjLines[0]);
+                      linkedMsgId = adjMsg.id;
+                    }
+                  }
+                }
+
+                if (!cleanTitle) {
+                  const baseName = originalName.replace(/\.(ass|srt|zip|rar|7z)$/i, '').trim();
+                  cleanTitle = formatCleanTitle(baseName);
+                  if (!/^\[[^\]]+\]/.test(cleanTitle)) cleanTitle = `[Subdl] ${cleanTitle}`;
+                }
+
+                const releaseKeys = getReleaseKeys(cleanTitle, true);
+                if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                  markReleaseAsPosted(posted, msgKey, releaseKeys);
+                  if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
+                  continue;
+                }
+
+                console.log(`\n✨ [Subdl Direct File] "${cleanTitle}" (${originalName})`);
+                const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${originalName}`);
+
+                try {
+                  const buffer = await client.downloadMedia(msg);
+                  if (buffer && Buffer.isBuffer(buffer)) {
+                    fs.writeFileSync(localFilePath, buffer);
+                    let validated = validateFileMagic(localFilePath);
+
+                    if (validated) {
+                      let effectiveDownloadPath = localFilePath;
+
+                      let hasArchiveFonts = false;
+                      if (validated.isArchive) {
+                        const archiveFiles = listArchiveFiles(localFilePath);
+                        cleanTitle = resolveEnglishTitleIfArabic(cleanTitle, [originalName, ...archiveFiles]);
+                        const subFiles = archiveFiles.filter(f => /\.(ass|srt)$/i.test(f));
+                        const fontFiles = archiveFiles.filter(f => /\.(ttf|otf|woff2?)$/i.test(f));
+                        hasArchiveFonts = fontFiles.length > 0;
+
+                        if (subFiles.length === 0) {
+                          console.warn(`   ⚠️ Archive contains NO subtitles (.ass/.srt), only fonts/assets. Skipping.`);
+                          fs.rmSync(localFilePath, { force: true });
+                          continue;
+                        }
+
+                        const isBatch = subFiles.length > 1 || /(?:\[\s*\d{1,4}|\b\d{1,4})\s*(?:~|-|–|to)\s*\d{1,4}(?:\s*END)?(?:\s*\]|\b)/i.test(cleanTitle) || /كامل|batch|pack/i.test(cleanTitle);
+
+                        if (!isBatch && subFiles.length === 1 && !hasArchiveFonts) {
+                          const extractDir = path.join(OUT_DIR, `unpack_single_${msg.id}`);
+                          if (extractArchive(localFilePath, extractDir)) {
+                            const singleFileName = path.basename(subFiles[0]);
+                            const foundFile = path.join(extractDir, subFiles[0]);
+                            const singleExt = path.extname(singleFileName).toLowerCase();
+                            cleanTitle = resolveEnglishTitleIfArabic(cleanTitle, [singleFileName, originalName], [foundFile]);
+                            const unzippedSubPath = path.join(OUT_DIR, getSafeTelegramFileName(cleanTitle, singleExt));
+                            if (fs.existsSync(foundFile)) {
+                              safeMoveFile(foundFile, unzippedSubPath);
+                              const unzippedVal = validateFileMagic(unzippedSubPath);
+                              if (unzippedVal) {
+                                effectiveDownloadPath = unzippedSubPath;
+                                validated = unzippedVal;
+                              }
+                            }
+                            try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { }
+                          }
+                        } else {
+                          // For batch releases or releases with fonts, repack as clean universal .zip
+                          const extractDir = path.join(OUT_DIR, `unpack_batch_${msg.id}`);
+                          if (extractArchive(localFilePath, extractDir)) {
+                            const allExt = [];
+                            function scanSubdlA(dir) {
+                              for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+                                const full = path.join(dir, f.name);
+                                if (f.isDirectory()) scanSubdlA(full);
+                                else if (/\.(ass|srt)$/i.test(f.name)) allExt.push(full);
+                              }
+                            }
+                            scanSubdlA(extractDir);
+                            if (allExt.length === 1) {
+                              cleanTitle = resolveEnglishTitleIfArabic(cleanTitle, [path.basename(allExt[0]), originalName], [allExt[0]]);
+                              const sExt = path.extname(allExt[0]).toLowerCase();
+                              const properSubName = getSafeTelegramFileName(cleanTitle, sExt);
+                              const renamedSub = path.join(path.dirname(allExt[0]), properSubName);
+                              if (allExt[0] !== renamedSub) {
+                                safeMoveFile(allExt[0], renamedSub);
+                              }
+                            }
+                            const repackedZip = path.join(OUT_DIR, `batch_${msg.id}.zip`);
+                            packFolderToZip(extractDir, repackedZip);
+                            const zipVal = validateFileMagic(repackedZip);
+                            if (zipVal) {
+                              effectiveDownloadPath = repackedZip;
+                              validated = zipVal;
+                            }
+                            try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { }
+                          }
+                        }
+                      } else {
+                        cleanTitle = resolveEnglishTitleIfArabic(cleanTitle, [originalName, localFilePath], [localFilePath]);
+                      }
+
+                      const cleanFileName = getSafeTelegramFileName(cleanTitle, validated.ext);
+                      const finalPath = path.join(OUT_DIR, cleanFileName);
+                      safeMoveFile(effectiveDownloadPath, finalPath);
+                      if (effectiveDownloadPath !== localFilePath) {
+                        try { fs.rmSync(localFilePath, { force: true }); } catch { }
+                      }
+
+                      const caption = formatCleanCaption(cleanTitle, validated.isArchive, isOfficialPlatformRelease(cleanTitle), hasArchiveFonts);
+                      console.log(`   📤 Publishing Subdl direct file: "${caption}" (filename: ${cleanFileName})`);
+                      const sendResult = await sendDocument(finalPath, caption);
+
+                      if (sendResult?.ok) {
+                        console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
+                        newFound++;
+                        markReleaseAsPosted(posted, msgKey, releaseKeys);
+                        if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
+                      } else {
+                        console.error(`   ❌ Failed to send document:`, sendResult);
+                      }
+
+                      fs.rmSync(finalPath, { force: true });
+                      continue;
+                    }
+                    fs.rmSync(localFilePath, { force: true });
+                  }
+                } catch (e) {
+                  console.warn(`   ⚠️ Subdl direct file error:`, e.message);
+                }
               }
             }
-          }
 
-          // Case B: Post links in LazySano message
-          const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-          let titleLine = formatCleanTitle(lines[0] || '');
-          if (titleLine && !titleLine.startsWith('[LazySano]')) {
-            titleLine = `[LazySano] ${titleLine}`;
-          }
+            // --- CASE B: Text / Link release in KokoBoko/Rengoku ---
+            const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+            let rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
+            // Rengoku also republishes Fansub releases.  Only a platform label
+            // (e.g. Crunchyroll/Amazon) is an official release; team-labelled
+            // messages must be deduplicated within that team, not globally.
+            const isOfficialSubdl = isOfficialPlatformRelease(rawTitle);
+            const releaseKeys = isOfficialSubdl
+              ? getReleaseKeys(rawTitle, true)
+              : getFansubReleaseKeys(rawTitle);
 
-          if (titleLine) {
-            const releaseKeys = getFansubReleaseKeys(titleLine);
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
               markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
             }
 
-            const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-            const postPageUrl = urlMatches.find(u => !u.includes('t.me') && !u.includes('twitter'));
-            if (postPageUrl) {
-              const pageData = await scrapePostPage(postPageUrl);
-              if (pageData) {
-                let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
-                if (pageData.videoLinks?.top4top) {
-                  const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
-                  if (resolved) directUrl = resolved;
-                }
-                if (!directUrl && pageData.videoLinks?.mediafire) {
-                  const mfBest = await findBestFileInMediafire(pageData.videoLinks.mediafire);
-                  if (mfBest?.directUrl && mfBest.type === 'subtitle') directUrl = mfBest.directUrl;
-                }
-                if (!directUrl && pageData.videoLinks?.mega) {
-                  const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega);
-                  if (megaBest?.node && megaBest.type === 'subtitle') {
+            // Check if there is an adjacent message with a direct document covering this release
+            const adjDocMsg = msgs.find(m =>
+              m &&
+              Math.abs(m.id - msg.id) <= 2 &&
+              m.id !== msg.id &&
+              m.media?.document
+            );
+            if (adjDocMsg) {
+              // The attached document will be handled directly
+              continue;
+            }
+
+            const subdlMatch = text.match(/https?:\/\/(?:www\.)?subdl\.com\/s\/info\/[a-zA-Z0-9]+/i);
+            if (subdlMatch) {
+              const subdlInfoUrl = subdlMatch[0];
+              console.log(`\n✨ [Subdl Release via Link] "${rawTitle}"`);
+              console.log(`   🌐 Resolving SUBDL link: ${subdlInfoUrl}`);
+              const subdlData = await resolveSubdlDownloadData(subdlInfoUrl);
+
+              if (subdlData) {
+                const workDir = path.join(OUT_DIR, `work_subdl_${msg.id}`);
+                const unpackDir = path.join(workDir, 'unpacked');
+                fs.mkdirSync(unpackDir, { recursive: true });
+
+                try {
+                  const primaryDlUrl = subdlData.batchZipLink || subdlData.individualLinks[0] || subdlData.allLinks[0];
+                  if (!primaryDlUrl) {
+                    console.warn(`   ⚠️ No download link found on SUBDL page: ${subdlInfoUrl}`);
+                    continue;
+                  }
+
+                  console.log(`   📥 Downloading subtitle(s) from SUBDL: ${primaryDlUrl}`);
+                  const tempSubdl = path.join(workDir, `primary_subdl`);
+                  await downloadFileToDisk(primaryDlUrl, tempSubdl, { Referer: subdlInfoUrl });
+
+                  let subdlMagic = validateFileMagic(tempSubdl);
+
+                  // If Subdl download was text note, check for fallback links inside
+                  if (!subdlMagic) {
                     try {
-                      const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}_${megaBest.name}`);
-                      await downloadMegaNode(megaBest.node, tempDest);
+                      const textContent = fs.readFileSync(tempSubdl, 'utf8');
+                      const top4topMatch = textContent.match(/https?:\/\/[^\s"'<>]*top4top\.io\/[^\s"'<>]+/i);
+                      const mfMatch = textContent.match(/https?:\/\/[^\s"'<>]*mediafire\.com\/[^\s"'<>]+/i);
+                      if (top4topMatch) {
+                        const direct = await resolveTop4topDownloadUrl(top4topMatch[0]);
+                        if (direct) {
+                          const fbDest = path.join(workDir, `fallback_top4top`);
+                          await downloadFileToDisk(direct, fbDest);
+                          subdlMagic = validateFileMagic(fbDest);
+                          if (subdlMagic) safeMoveFile(fbDest, tempSubdl);
+                        }
+                      } else if (mfMatch) {
+                        const mfBest = await findBestFileInMediafire(mfMatch[0]);
+                        if (mfBest?.directUrl) {
+                          const fbDest = path.join(workDir, `fallback_mf`);
+                          await downloadFileToDisk(mfBest.directUrl, fbDest);
+                          subdlMagic = validateFileMagic(fbDest);
+                          if (subdlMagic) safeMoveFile(fbDest, tempSubdl);
+                        }
+                      }
+                    } catch (e) {
+                      console.warn(`   ⚠️ Fallback link parsing error:`, e.message);
+                    }
+                  }
+
+                  if (subdlMagic?.isArchive) {
+                    extractArchive(tempSubdl, unpackDir);
+                  } else if (subdlMagic) {
+                    const properName = getSafeTelegramFileName(rawTitle, subdlMagic.ext);
+                    safeMoveFile(tempSubdl, path.join(unpackDir, properName));
+                  }
+
+                  // If multi-episode batch and no batch zip link existed, download remaining individual links if any
+                  const isMultiEpTitle = /(?:\[\s*\d{1,4}|\b\d{1,4})\s*(?:~|-|–|to)\s*\d{1,4}(?:\s*END)?(?:\s*\]|\b)/i.test(rawTitle) || /كامل|batch|pack/i.test(rawTitle);
+                  if (isMultiEpTitle && !subdlData.batchZipLink && subdlData.individualLinks.length > 1) {
+                    for (let i = 1; i < subdlData.individualLinks.length; i++) {
+                      const epUrl = subdlData.individualLinks[i];
+                      const epPath = path.join(workDir, `ep_${i}`);
+                      try {
+                        await downloadFileToDisk(epUrl, epPath, { Referer: subdlInfoUrl });
+                        const epMagic = validateFileMagic(epPath);
+                        if (epMagic?.isArchive) extractArchive(epPath, unpackDir);
+                        else if (epMagic) safeMoveFile(epPath, path.join(unpackDir, `sub_${msg.id}_${i}${epMagic.ext}`));
+                      } catch {}
+                    }
+                  }
+
+                  // Check if message text specifies external fonts (Top4Top, Mediafire, Mega)
+                  const fontMatch = text.match(/(?:fonts|subs\s*&\s*fonts)[^:]*:\s*(https?:\/\/[^\s"'<>]+)/i) ||
+                                    text.match(/https?:\/\/(?:www\.)?(?:top4top\.io|mediafire\.com|mega\.nz)\/[^\s"'<>]+/i);
+                  if (fontMatch) {
+                    const fontUrl = fontMatch[1] || fontMatch[0];
+                    console.log(`   🌐 Found fonts link in message: ${fontUrl}`);
+                    let directFontUrl = null;
+                    if (/top4top\.io/i.test(fontUrl)) {
+                      directFontUrl = await resolveTop4topDownloadUrl(fontUrl);
+                    } else if (/mediafire\.com/i.test(fontUrl)) {
+                      const mfBest = await findBestFileInMediafire(fontUrl);
+                      directFontUrl = mfBest?.directUrl;
+                    }
+                    if (directFontUrl) {
+                      const fontTempPath = path.join(workDir, `fonts_temp`);
+                      try {
+                        await downloadFileToDisk(directFontUrl, fontTempPath);
+                        const fontMagic = validateFileMagic(fontTempPath);
+                        if (fontMagic?.isArchive) {
+                          extractArchive(fontTempPath, unpackDir);
+                        } else if (fontMagic) {
+                          safeMoveFile(fontTempPath, path.join(unpackDir, `font_${Date.now()}${fontMagic.ext}`));
+                        }
+                      } catch (fontErr) {
+                        console.warn(`   ⚠️ Could not download external fonts:`, fontErr.message);
+                      }
+                    }
+                  }
+
+                  // Scan all extracted files in unpackDir
+                  const allExtractedFiles = [];
+                  function scanDir(dir) {
+                    for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+                      const full = path.join(dir, f.name);
+                      if (f.isDirectory()) scanDir(full);
+                      else allExtractedFiles.push(full);
+                    }
+                  }
+                  scanDir(unpackDir);
+
+                  const subFiles = allExtractedFiles.filter(f => /\.(ass|srt)$/i.test(f));
+                  const fontFiles = allExtractedFiles.filter(f => /\.(ttf|otf|woff2?)$/i.test(f));
+                  const hasFonts = fontFiles.length > 0;
+
+                  // MANDATORY CHECK: Drop if 0 subtitles found (never publish font-only releases)
+                  if (subFiles.length === 0) {
+                    console.warn(`   ⚠️ Release "${rawTitle}" contains NO subtitles (.ass/.srt), only fonts/assets. Dropping.`);
+                    continue;
+                  }
+
+                  // Resolve English title from extracted subtitle filenames and ASS headers if rawTitle is Arabic
+                  rawTitle = resolveEnglishTitleIfArabic(rawTitle, subFiles, subFiles);
+
+                  // If single subtitle file in unpackDir, rename it to rawTitle if it has a generic or arabic name
+                  if (subFiles.length === 1) {
+                    const curBase = path.basename(subFiles[0], path.extname(subFiles[0])).toLowerCase();
+                    const isGenericOrArabic = /^(?:extracted(?:_sub|\s+subtitle)?|sub(?:_\d+)?|untitled|default)$/i.test(curBase) || /[\u0600-\u06FF]/.test(curBase);
+                    if (isGenericOrArabic) {
+                      const sExt = path.extname(subFiles[0]).toLowerCase();
+                      const properSubName = getSafeTelegramFileName(rawTitle, sExt);
+                      const renamedPath = path.join(path.dirname(subFiles[0]), properSubName);
+                      if (subFiles[0] !== renamedPath) {
+                        safeMoveFile(subFiles[0], renamedPath);
+                        subFiles[0] = renamedPath;
+                      }
+                    }
+                  }
+
+                  const isBatch = subFiles.length > 1 || isMultiEpTitle;
+
+                  let finalFilePath = '';
+                  let isArchiveRelease = false;
+
+                  if (!isBatch && subFiles.length === 1 && !hasFonts) {
+                    // Single subtitle without fonts: publish as naked .ass
+                    const ext = path.extname(subFiles[0]).toLowerCase();
+                    const cleanFileName = getSafeTelegramFileName(rawTitle, ext);
+                    finalFilePath = path.join(OUT_DIR, cleanFileName);
+                    safeMoveFile(subFiles[0], finalFilePath);
+                    isArchiveRelease = false;
+                  } else {
+                    // Multi-episode batch or subtitle with fonts: pack everything to universal .zip
+                    const repackedZip = path.join(OUT_DIR, `batch_${msg.id}.zip`);
+                    packFolderToZip(unpackDir, repackedZip);
+                    const cleanFileName = getSafeTelegramFileName(rawTitle, '.zip');
+                    finalFilePath = path.join(OUT_DIR, cleanFileName);
+                    safeMoveFile(repackedZip, finalFilePath);
+                    isArchiveRelease = true;
+                  }
+
+                  const caption = formatCleanCaption(rawTitle, isArchiveRelease, isOfficialSubdl, hasFonts);
+                  console.log(`   📤 Publishing to channel: "${caption}" (filename: ${path.basename(finalFilePath)})`);
+                  const sendResult = await sendDocument(finalFilePath, caption);
+
+                  if (sendResult?.ok) {
+                    console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
+                    newFound++;
+                    markReleaseAsPosted(posted, msgKey, releaseKeys);
+                  } else {
+                    console.error(`   ❌ Failed to send document:`, sendResult);
+                  }
+
+                  try { fs.rmSync(finalFilePath, { force: true }); } catch {}
+                  continue;
+                } catch (e) {
+                  console.error(`   ❌ Error downloading/posting SUBDL release:`, e.message);
+                } finally {
+                  try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+                }
+              }
+            }
+
+            continue;
+          }
+
+          // ==============================================================
+          // SOURCE 3: LazySano Channel (Dedicated Fansub Channel)
+          // ==============================================================
+          if (isLazySano) {
+            // Case A: File directly attached in LazySano message
+            if (msg.media && msg.media.document) {
+              const doc = msg.media.document;
+              const originalName = doc.attributes?.find(a => a.fileName)?.fileName || '';
+              const ext = path.extname(originalName).toLowerCase();
+
+              if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
+                let docBaseName = originalName
+                  .replace(/\.(ass|srt|zip|rar|7z)$/i, '')
+                  .replace(/\s*\((?:1080p|720p|480p)\)/gi, '')
+                  .trim();
+
+                if (!docBaseName.toLowerCase().startsWith('[lazysano]')) {
+                  docBaseName = `[LazySano] ${docBaseName}`;
+                }
+
+                const titleLine = formatCleanTitle(docBaseName);
+                const releaseKeys = getFansubReleaseKeys(titleLine);
+
+                if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                  markReleaseAsPosted(posted, msgKey, releaseKeys);
+                  continue;
+                }
+
+                console.log(`\n✨ [LazySano Direct File] "${titleLine}" (${originalName})`);
+                const localFilePath = path.join(OUT_DIR, originalName);
+
+                try {
+                  const buffer = await client.downloadMedia(msg);
+                  if (buffer && Buffer.isBuffer(buffer)) {
+                    fs.writeFileSync(localFilePath, buffer);
+
+                    const validated = validateFileMagic(localFilePath);
+                    if (validated) {
+                      const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
+                      const finalPath = path.join(OUT_DIR, cleanFileName);
+                      safeMoveFile(localFilePath, finalPath);
+
+                      const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                      console.log(`   📤 Publishing LazySano release: "${caption}"`);
+                      const sendResult = await sendDocument(finalPath, caption);
+
+                      if (sendResult?.ok) {
+                        console.log(`   ✅ Successfully posted!`);
+                        newFound++;
+                        markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      }
+                      fs.rmSync(finalPath, { force: true });
+                      continue;
+                    }
+                    fs.rmSync(localFilePath, { force: true });
+                  }
+                } catch (e) {
+                  console.warn(`   ⚠️ LazySano direct file download error:`, e.message);
+                }
+              }
+            }
+
+            // Case B: Post links in LazySano message
+            const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+            let titleLine = formatCleanTitle(lines[0] || '');
+            if (titleLine && !titleLine.startsWith('[LazySano]')) {
+              titleLine = `[LazySano] ${titleLine}`;
+            }
+
+            if (titleLine) {
+              const releaseKeys = getFansubReleaseKeys(titleLine);
+              if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                markReleaseAsPosted(posted, msgKey, releaseKeys);
+                continue;
+              }
+
+              const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+              const postPageUrl = urlMatches.find(u => !u.includes('t.me') && !u.includes('twitter'));
+              if (postPageUrl) {
+                const pageData = await scrapePostPage(postPageUrl);
+                if (pageData) {
+                  let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
+                  if (pageData.videoLinks?.top4top) {
+                    const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
+                    if (resolved) directUrl = resolved;
+                  }
+                  if (!directUrl && pageData.videoLinks?.mediafire) {
+                    const mfBest = await findBestFileInMediafire(pageData.videoLinks.mediafire);
+                    if (mfBest?.directUrl && mfBest.type === 'subtitle') directUrl = mfBest.directUrl;
+                  }
+                  if (!directUrl && pageData.videoLinks?.mega) {
+                    const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega);
+                    if (megaBest?.node && megaBest.type === 'subtitle') {
+                      try {
+                        const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}_${megaBest.name}`);
+                        await downloadMegaNode(megaBest.node, tempDest);
+                        const validated = validateFileMagic(tempDest);
+                        if (validated) {
+                          const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
+                          const finalPath = path.join(OUT_DIR, cleanFileName);
+                          safeMoveFile(tempDest, finalPath);
+
+                          const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                          console.log(`   📤 Publishing LazySano post link: "${caption}"`);
+                          const sendResult = await sendDocument(finalPath, caption);
+                          if (sendResult?.ok) {
+                            newFound++;
+                            markReleaseAsPosted(posted, msgKey, releaseKeys);
+                          }
+                          fs.rmSync(finalPath, { force: true });
+                          continue;
+                        }
+                        fs.rmSync(tempDest, { force: true });
+                      } catch { }
+                    }
+                  }
+                  if (directUrl) {
+                    try {
+                      const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}`);
+                      await downloadFileToDisk(directUrl, tempDest);
                       const validated = validateFileMagic(tempDest);
                       if (validated) {
                         const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
@@ -1356,256 +1810,260 @@ export async function checkTelegramChannels() {
                         continue;
                       }
                       fs.rmSync(tempDest, { force: true });
-                    } catch {}
+                    } catch { }
                   }
-                }
-                if (directUrl) {
-                  try {
-                    const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}`);
-                    await downloadFileToDisk(directUrl, tempDest);
-                    const validated = validateFileMagic(tempDest);
-                    if (validated) {
-                      const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
-                      const finalPath = path.join(OUT_DIR, cleanFileName);
-                      safeMoveFile(tempDest, finalPath);
-
-                      const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                      console.log(`   📤 Publishing LazySano post link: "${caption}"`);
-                      const sendResult = await sendDocument(finalPath, caption);
-                      if (sendResult?.ok) {
-                        newFound++;
-                        markReleaseAsPosted(posted, msgKey, releaseKeys);
-                      }
-                      fs.rmSync(finalPath, { force: true });
-                      continue;
-                    }
-                    fs.rmSync(tempDest, { force: true });
-                  } catch {}
                 }
               }
             }
-          }
 
-          continue;
-        }
-
-        // ==============================================================
-        // SOURCE 4: Arabic Anime Publisher (Fansub Releases)
-        // ==============================================================
-        const titleLine = extractTeamAndFormatTitle(text);
-        const releaseKeys = getFansubReleaseKeys(titleLine);
-
-        if (isReleaseAlreadyPosted(posted, releaseKeys)) {
-          markReleaseAsPosted(posted, msgKey, releaseKeys);
-          continue;
-        }
-
-        // Case A: Direct file attached to the message
-        if (msg.media && msg.media.document) {
-          const doc = msg.media.document;
-          const originalName = doc.attributes?.find(a => a.fileName)?.fileName || `sub_${msg.id}.ass`;
-          const ext = path.extname(originalName).toLowerCase();
-
-          if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
-            console.log(`\n✨ [Fansub Attachment] "${titleLine}" (${originalName})`);
-            const localFilePath = path.join(OUT_DIR, originalName);
-
-            try {
-              const buffer = await client.downloadMedia(msg);
-              if (buffer && Buffer.isBuffer(buffer)) {
-                fs.writeFileSync(localFilePath, buffer);
-
-                const validated = validateFileMagic(localFilePath);
-                if (validated) {
-                  const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
-                  const finalPath = path.join(OUT_DIR, cleanFileName);
-                  safeMoveFile(localFilePath, finalPath);
-
-                  const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                  console.log(`   📤 Publishing to channel: "${caption}"`);
-                  const sendResult = await sendDocument(finalPath, caption);
-
-                  if (sendResult?.ok) {
-                    console.log(`   ✅ Successfully posted!`);
-                    newFound++;
-                    markReleaseAsPosted(posted, msgKey, releaseKeys);
-                  }
-                  fs.rmSync(finalPath, { force: true });
-                  continue;
-                }
-                fs.rmSync(localFilePath, { force: true });
-              }
-            } catch (e) {
-              console.warn(`   ⚠️ Fansub attachment download error:`, e.message);
-            }
             continue;
           }
-        }
 
-        // Case B: Post links in Fansub Channel (Multi-cloud / Torrent / Direct)
-        const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-        const postPageCandidates = [...new Set(urlMatches)]
-          .filter(u => !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com'))
-          .map(url => {
-            const site = CONFIG.SITES.find(s => {
-              try { return url.includes(new URL(s.base).hostname); } catch { return false; }
-            });
-            // Joint REVIVE/Rhythm releases must not stop at REVIVE's interactive
-            // login wall when an accessible Rhythm mirror is also provided.
-            const priority = site?.id === 'rhythm' ? 0 : site?.id === 'revive' ? 2 : 1;
-            return { url, site, priority };
-          })
-          .sort((a, b) => a.priority - b.priority);
+          // ==============================================================
+          // SOURCE 4: Arabic Anime Publisher (Fansub Releases)
+          // ==============================================================
+          const hasAttachment = Boolean(msg.media && msg.media.document);
+          const hasLinks = /https?:\/\/[^\s"'<>]+/i.test(text);
+          if (!hasAttachment && !hasLinks) {
+            markReleaseAsPosted(posted, msgKey);
+            continue;
+          }
 
-        for (const { url: postPageUrl, site: matchingSite } of postPageCandidates) {
-          console.log(`\n✨ [Fansub Post] "${titleLine}"`);
-          console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
-          const pageData = await scrapePostPage(postPageUrl, matchingSite);
+          let titleLine = extractTeamAndFormatTitle(text);
+          let releaseKeys = getFansubReleaseKeys(titleLine);
 
-          if (pageData) {
-            const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
-            fs.mkdirSync(fansubWorkDir, { recursive: true });
+          if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+            markReleaseAsPosted(posted, msgKey, releaseKeys);
+            continue;
+          }
 
-            try {
-              let downloadedFilePath = null;
-              const targetEp = extractEpisodeNumber(titleLine);
+          // Case A: Direct file attached to the message
+          if (msg.media && msg.media.document) {
+            const doc = msg.media.document;
+            const originalName = doc.attributes?.find(a => a.fileName)?.fileName || `sub_${msg.id}.ass`;
+            const ext = path.extname(originalName).toLowerCase();
 
-              // 1. Direct or Top4Top download
-              let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
-              if (pageData.videoLinks?.top4top) {
-                const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
-                if (resolved) directUrl = resolved;
-              }
+            if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
+              console.log(`\n✨ [Fansub Attachment] "${titleLine}" (${originalName})`);
+              const localFilePath = path.join(OUT_DIR, originalName);
 
-              if (directUrl) {
-                try {
-                  console.log(`   📥 Direct download: ${directUrl}`);
-                  const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
-                  await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl });
-                  if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
-                } catch (e) {
-                  console.warn(`   ⚠️ Direct download failed:`, e.message);
-                }
-              }
+              try {
+                const buffer = await client.downloadMedia(msg);
+                if (buffer && Buffer.isBuffer(buffer)) {
+                  fs.writeFileSync(localFilePath, buffer);
 
-              // 2. Mediafire (Direct file or Folder)
-              if (!downloadedFilePath && pageData.videoLinks?.mediafire) {
-                console.log(`   📥 Resolving Mediafire: ${pageData.videoLinks.mediafire}`);
-                try {
-                  const mfBest = await findBestFileInMediafire(pageData.videoLinks.mediafire, targetEp);
-                  if (mfBest && mfBest.directUrl) {
-                    if (mfBest.type === 'subtitle' || toolsAvailable) {
-                      console.log(`   📥 Downloading from Mediafire (${mfBest.type}): ${mfBest.name}`);
-                      const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}_${mfBest.name}`);
-                      await downloadFileToDisk(mfBest.directUrl, tempDest, { Referer: postPageUrl });
-                      if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                  const validated = validateFileMagic(localFilePath);
+                  if (validated) {
+                    titleLine = resolveEnglishTitleIfArabic(titleLine, [originalName, localFilePath], [localFilePath]);
+                    if (validated.isArchive) {
+                      const archiveFiles = listArchiveFiles(localFilePath);
+                      titleLine = resolveEnglishTitleIfArabic(titleLine, [originalName, ...archiveFiles]);
                     }
-                  }
-                } catch (e) {
-                  console.warn(`   ⚠️ Mediafire download failed:`, e.message);
-                }
-              }
+                    const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
+                    const finalPath = path.join(OUT_DIR, cleanFileName);
+                    safeMoveFile(localFilePath, finalPath);
 
-              // 3. Mega (Direct file or Folder via pure JS megajs)
-              if (!downloadedFilePath && pageData.videoLinks?.mega) {
-                console.log(`   📥 Resolving Mega: ${pageData.videoLinks.mega}`);
-                try {
-                  const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega, targetEp);
-                  if (megaBest && megaBest.node) {
-                    if (megaBest.type === 'subtitle' || toolsAvailable) {
-                      console.log(`   📥 Downloading from Mega (${megaBest.type}): ${megaBest.name}`);
-                      const tempDest = path.join(fansubWorkDir, `mega_${Date.now()}_${megaBest.name}`);
-                      await downloadMegaNode(megaBest.node, tempDest);
-                      if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                    const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                    console.log(`   📤 Publishing to channel: "${caption}"`);
+                    const sendResult = await sendDocument(finalPath, caption);
+
+                    if (sendResult?.ok) {
+                      console.log(`   ✅ Successfully posted!`);
+                      newFound++;
+                      markReleaseAsPosted(posted, msgKey, releaseKeys);
                     }
-                  }
-                } catch (e) {
-                  console.warn(`   ⚠️ Mega JS download failed:`, e.message);
-                }
-              }
-
-              // 4. Google Drive (Direct file or Folder)
-              if (!downloadedFilePath && pageData.videoLinks?.drive) {
-                console.log(`   📥 Resolving Google Drive: ${pageData.videoLinks.drive}`);
-                try {
-                  const driveBest = await findBestFileInDrive(pageData.videoLinks.drive, targetEp);
-                  if (driveBest && driveBest.directUrl) {
-                    if (driveBest.type === 'subtitle' || toolsAvailable) {
-                      console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
-                      const tempDest = path.join(fansubWorkDir, `drive_${Date.now()}_${driveBest.name}`);
-                      await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
-                      if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
-                    }
-                  }
-                } catch (e) {
-                  console.warn(`   ⚠️ Google Drive download failed:`, e.message);
-                }
-              }
-
-              // 5. Torrent (Prioritized for speed & reliability in GitHub Actions)
-              if (!downloadedFilePath && pageData.videoLinks?.torrent && toolsAvailable) {
-                console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
-                const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false);
-                if (extractedTorrent && extractedTorrent.filePath) {
-                  const cleanFileName = getSafeTelegramFileName(titleLine, extractedTorrent.ext);
-                  const finalPath = path.join(OUT_DIR, cleanFileName);
-                  safeMoveFile(extractedTorrent.filePath, finalPath);
-
-                  const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
-                  console.log(`   📤 Publishing to channel: "${caption}"`);
-                  const sendResult = await sendDocument(finalPath, caption);
-
-                  if (sendResult?.ok) {
-                    console.log(`   ✅ Successfully posted!`);
-                    newFound++;
-                    markReleaseAsPosted(posted, msgKey, releaseKeys);
                     fs.rmSync(finalPath, { force: true });
-                    break;
+                    continue;
                   }
-                  fs.rmSync(finalPath, { force: true });
+                  fs.rmSync(localFilePath, { force: true });
                 }
+              } catch (e) {
+                console.warn(`   ⚠️ Fansub attachment download error:`, e.message);
               }
-
-              // Process downloaded file (MKV extract or direct archive)
-              if (downloadedFilePath) {
-                const extracted = extractSubtitleAndFontsFromAnyFile(downloadedFilePath, fansubWorkDir, false, false);
-                if (extracted && extracted.filePath) {
-                  const cleanFileName = getSafeTelegramFileName(titleLine, extracted.ext);
-                  const finalPath = path.join(OUT_DIR, cleanFileName);
-                  safeMoveFile(extracted.filePath, finalPath);
-
-                  const caption = formatCleanCaption(titleLine, extracted.isArchive, false);
-                  console.log(`   📤 Publishing to channel: "${caption}"`);
-                  const sendResult = await sendDocument(finalPath, caption);
-
-                  if (sendResult?.ok) {
-                    console.log(`   ✅ Successfully posted!`);
-                    newFound++;
-                    markReleaseAsPosted(posted, msgKey, releaseKeys);
-                    fs.rmSync(finalPath, { force: true });
-                    break;
-                  }
-
-                  fs.rmSync(finalPath, { force: true });
-                }
-              }
-            } catch (e) {
-              console.error(`   ❌ Fansub post processing error:`, e.message);
-            } finally {
-              try { fs.rmSync(fansubWorkDir, { recursive: true, force: true }); } catch {}
+              continue;
             }
           }
+
+          // Case B: Post links in Fansub Channel (Multi-cloud / Torrent / Direct)
+          const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+          const postPageCandidates = [...new Set(urlMatches)]
+            .filter(u => !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com'))
+            .map(url => {
+              const site = CONFIG.SITES.find(s => {
+                try { return url.includes(new URL(s.base).hostname); } catch { return false; }
+              });
+              // Joint REVIVE/Rhythm releases must not stop at REVIVE's interactive
+              // login wall when an accessible Rhythm mirror is also provided.
+              const priority = site?.id === 'rhythm' ? 0 : site?.id === 'revive' ? 2 : 1;
+              return { url, site, priority };
+            })
+            .sort((a, b) => a.priority - b.priority);
+
+          for (const { url: postPageUrl, site: matchingSite } of postPageCandidates) {
+            console.log(`\n✨ [Fansub Post] "${titleLine}"`);
+            console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
+            const pageData = await scrapePostPage(postPageUrl, matchingSite);
+
+            if (pageData) {
+              const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
+              fs.mkdirSync(fansubWorkDir, { recursive: true });
+
+              try {
+                let downloadedFilePath = null;
+                const targetEp = extractEpisodeNumber(titleLine);
+
+                // 1. Direct or Top4Top download
+                let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
+                if (pageData.videoLinks?.top4top) {
+                  const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
+                  if (resolved) directUrl = resolved;
+                }
+                if (directUrl && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directUrl) && !/\.(ass|srt|zip|rar|7z)$/i.test(directUrl)) {
+                  const resolved = await resolveSubtitleFromDirectory(directUrl, targetEp);
+                  if (resolved) directUrl = resolved;
+                }
+
+                if (directUrl) {
+                  try {
+                    console.log(`   📥 Direct download: ${directUrl}`);
+                    const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
+                    await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl });
+                    if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                  } catch (e) {
+                    console.warn(`   ⚠️ Direct download failed:`, e.message);
+                  }
+                }
+
+                // 2. Mediafire (Direct file or Folder)
+                if (!downloadedFilePath && pageData.videoLinks?.mediafire) {
+                  console.log(`   📥 Resolving Mediafire: ${pageData.videoLinks.mediafire}`);
+                  try {
+                    const mfBest = await findBestFileInMediafire(pageData.videoLinks.mediafire, targetEp);
+                    if (mfBest && mfBest.directUrl) {
+                      if (mfBest.type === 'subtitle' || toolsAvailable) {
+                        console.log(`   📥 Downloading from Mediafire (${mfBest.type}): ${mfBest.name}`);
+                        const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}_${mfBest.name}`);
+                        await downloadFileToDisk(mfBest.directUrl, tempDest, { Referer: postPageUrl });
+                        if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ⚠️ Mediafire download failed:`, e.message);
+                  }
+                }
+
+                // 3. Mega (Direct file or Folder via pure JS megajs)
+                if (!downloadedFilePath && pageData.videoLinks?.mega) {
+                  console.log(`   📥 Resolving Mega: ${pageData.videoLinks.mega}`);
+                  try {
+                    const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega, targetEp);
+                    if (megaBest && megaBest.node) {
+                      if (megaBest.type === 'subtitle' || toolsAvailable) {
+                        console.log(`   📥 Downloading from Mega (${megaBest.type}): ${megaBest.name}`);
+                        const tempDest = path.join(fansubWorkDir, `mega_${Date.now()}_${megaBest.name}`);
+                        await downloadMegaNode(megaBest.node, tempDest);
+                        if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ⚠️ Mega JS download failed:`, e.message);
+                  }
+                }
+
+                // 4. Google Drive (Direct file or Folder)
+                if (!downloadedFilePath && pageData.videoLinks?.drive) {
+                  console.log(`   📥 Resolving Google Drive: ${pageData.videoLinks.drive}`);
+                  try {
+                    const driveBest = await findBestFileInDrive(pageData.videoLinks.drive, targetEp);
+                    if (driveBest && driveBest.directUrl) {
+                      if (driveBest.type === 'subtitle' || toolsAvailable) {
+                        console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
+                        const tempDest = path.join(fansubWorkDir, `drive_${Date.now()}_${driveBest.name}`);
+                        await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
+                        if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ⚠️ Google Drive download failed:`, e.message);
+                  }
+                }
+
+                // 5. Torrent (Prioritized for speed & reliability in GitHub Actions)
+                if (!downloadedFilePath && pageData.videoLinks?.torrent && toolsAvailable) {
+                  console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
+                  const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine);
+                  if (extractedTorrent && extractedTorrent.filePath) {
+                    if (extractedTorrent.resolvedTitle) {
+                      titleLine = extractedTorrent.resolvedTitle;
+                    }
+                    const cleanFileName = getSafeTelegramFileName(titleLine, extractedTorrent.ext);
+                    const finalPath = path.join(OUT_DIR, cleanFileName);
+                    safeMoveFile(extractedTorrent.filePath, finalPath);
+
+                    const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
+                    console.log(`   📤 Publishing to channel: "${caption}"`);
+                    const sendResult = await sendDocument(finalPath, caption);
+
+                    if (sendResult?.ok) {
+                      console.log(`   ✅ Successfully posted!`);
+                      newFound++;
+                      markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      fs.rmSync(finalPath, { force: true });
+                      break;
+                    }
+                    fs.rmSync(finalPath, { force: true });
+                  }
+                }
+
+                // Process downloaded file (MKV extract or direct archive)
+                if (downloadedFilePath) {
+                  titleLine = resolveEnglishTitleIfArabic(titleLine, [downloadedFilePath], [downloadedFilePath]);
+                  if (validateFileMagic(downloadedFilePath)?.isArchive) {
+                    const innerFiles = listArchiveFiles(downloadedFilePath);
+                    titleLine = resolveEnglishTitleIfArabic(titleLine, [downloadedFilePath, ...innerFiles]);
+                  }
+
+                  const extracted = extractSubtitleAndFontsFromAnyFile(downloadedFilePath, fansubWorkDir, false, false, titleLine);
+                  if (extracted && extracted.filePath) {
+                    if (extracted.resolvedTitle) {
+                      titleLine = extracted.resolvedTitle;
+                    }
+                    const cleanFileName = getSafeTelegramFileName(titleLine, extracted.ext);
+                    const finalPath = path.join(OUT_DIR, cleanFileName);
+                    safeMoveFile(extracted.filePath, finalPath);
+
+                    const caption = formatCleanCaption(titleLine, extracted.isArchive, false);
+                    console.log(`   📤 Publishing to channel: "${caption}"`);
+                    const sendResult = await sendDocument(finalPath, caption);
+
+                    if (sendResult?.ok) {
+                      console.log(`   ✅ Successfully posted!`);
+                      newFound++;
+                      markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      fs.rmSync(finalPath, { force: true });
+                      break;
+                    }
+
+                    fs.rmSync(finalPath, { force: true });
+                  }
+                }
+              } catch (e) {
+                console.error(`   ❌ Fansub post processing error:`, e.message);
+              } finally {
+                try { fs.rmSync(fansubWorkDir, { recursive: true, force: true }); } catch { }
+              }
+            }
+          }
+          if (isReleaseAlreadyPosted(posted, releaseKeys)) continue;
         }
-        if (isReleaseAlreadyPosted(posted, releaseKeys)) continue;
+      } catch (chatErr) {
+        console.warn(`   ⚠️ Error reading channel "${chat.title}":`, chatErr.message);
       }
-    } catch (chatErr) {
-      console.warn(`   ⚠️ Error reading channel "${chat.title}":`, chatErr.message);
     }
-  }
   } catch (err) {
     console.error('Telegram channel listener error:', err.message);
   } finally {
-    try { await client.disconnect(); } catch {}
+    try { await client.disconnect(); } catch { }
   }
 
   savePostedIds(posted);

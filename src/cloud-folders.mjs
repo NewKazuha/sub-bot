@@ -345,11 +345,12 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null) {
   let files = await listDriveFolder(driveUrl);
   if (files.length === 0) return null;
 
-  // Navigate into Softsub subfolder if present
-  const softsubFolder = files.find(f => f.isFolder && /soft\s*sub/i.test(f.name));
-  if (softsubFolder) {
-    const subUrl = `https://drive.google.com/drive/folders/${softsubFolder.id}`;
-    files = await listDriveFolder(subUrl);
+  // Navigate into Softsub or Subtitles subfolder if present
+  const subFolder = files.find(f => f.isFolder && /(?:soft\s*sub|subtitles?|ملفات\s*الترجمة|الترجمة)/i.test(f.name));
+  if (subFolder) {
+    const subUrl = `https://drive.google.com/drive/folders/${subFolder.id}`;
+    const subFiles = await listDriveFolder(subUrl);
+    if (subFiles.length > 0) files = subFiles;
   }
 
   const clean = files.filter(f => !f.isFolder && !/hardsub|hard[\s_-]*sub/i.test(f.name));

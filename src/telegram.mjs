@@ -31,30 +31,44 @@ export async function sendMessage(text, { chatId = CONFIG.TELEGRAM.TARGET_CHANNE
   }
 }
 
-export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
-  try {
-    const fileName = path.basename(filePath);
-    const fileBuffer = fs.readFileSync(filePath);
-    const blob = new Blob([fileBuffer]);
+export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML', retries = 3 } = {}) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const fileName = path.basename(filePath);
+      const fileBuffer = fs.readFileSync(filePath);
+      const blob = new Blob([fileBuffer]);
 
-    const formData = new FormData();
-    formData.append('chat_id', String(chatId));
-    formData.append('document', blob, fileName);
-    if (caption) {
-      formData.append('caption', parseMode === 'HTML' ? escapeHtml(caption) : caption);
-      if (parseMode) formData.append('parse_mode', parseMode);
+      const formData = new FormData();
+      formData.append('chat_id', String(chatId));
+      formData.append('document', blob, fileName);
+      if (caption) {
+        formData.append('caption', parseMode === 'HTML' ? escapeHtml(caption) : caption);
+        if (parseMode) formData.append('parse_mode', parseMode);
+      }
+
+      const res = await fetch(`${API_BASE}/sendDocument`, {
+        method: 'POST',
+        body: formData,
+        signal: AbortSignal.timeout(180000)
+      });
+      const data = await res.json();
+      if (data?.ok) return data;
+      console.warn(`Telegram sendDocument attempt ${attempt} response:`, data);
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 3000 * attempt));
+      } else {
+        return data;
+      }
+    } catch (e) {
+      console.error(`Telegram sendDocument attempt ${attempt} error (${filePath}):`, e.message);
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 3000 * attempt));
+      } else {
+        return null;
+      }
     }
-
-    const res = await fetch(`${API_BASE}/sendDocument`, {
-      method: 'POST',
-      body: formData,
-      signal: AbortSignal.timeout(120000)
-    });
-    return await res.json();
-  } catch (e) {
-    console.error(`Telegram sendDocument error (${filePath}):`, e.message);
-    return null;
   }
+  return null;
 }
 
 export async function sendPhoto(photoUrl, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {

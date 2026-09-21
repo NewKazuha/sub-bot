@@ -223,7 +223,42 @@ function getLinkTarget($, el, pageUrl) {
   return normaliseLinkUrl(match?.[1], pageUrl);
 }
 
-async function resolveSubtitleFromDirectory(directoryUrl) {
+export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
+  try {
+    const res = await fetchWithTimeout(directoryUrl, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page_token: null, page_index: 0 })
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const files = json?.data?.files || [];
+    const subFiles = files.filter(f => /\.(ass|srt|zip|rar|7z)$/i.test(f.name || ''));
+    if (!subFiles.length) return null;
+
+    let chosen = subFiles[subFiles.length - 1];
+    if (targetEp) {
+      const epNorm = String(targetEp).replace(/^0+/, '');
+      const match = subFiles.find(f => {
+        const found = (f.name || '').match(/(\d{1,4})/g) || [];
+        return found.some(n => n.replace(/^0+/, '') === epNorm);
+      });
+      if (match) chosen = match;
+    }
+
+    const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
+    return `${base}${encodeURIComponent(chosen.name)}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null) {
+  if (/(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) {
+    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp);
+    if (goIndexFile) return goIndexFile;
+  }
+
   try {
     const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
     if (!res.ok) return null;
@@ -239,6 +274,15 @@ async function resolveSubtitleFromDirectory(directoryUrl) {
         candidates.push(href);
       }
     });
+
+    if (targetEp) {
+      const epNorm = String(targetEp).replace(/^0+/, '');
+      const match = candidates.find(u => {
+        const found = u.match(/(\d{1,4})/g) || [];
+        return found.some(n => n.replace(/^0+/, '') === epNorm);
+      });
+      if (match) return match;
+    }
 
     // Prefer an archive because fansub releases commonly bundle fonts with it.
     return candidates.find(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url)) || candidates[0] || null;
@@ -292,22 +336,42 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
       if (!isIgnored) {
         // Check parent/surrounding context text
         const parentContext = $(el).closest('div, section, article, p, table, tr, td, li').text().trim().replace(/\s+/g, ' ');
-        allLinks.push({ href, text, parentContext });
+
+        // Check container heading (ancestor heading or preceding sibling heading)
+        let containerHeading = '';
+        let curr = $(el).parent();
+        while (curr.length && !curr.is('body, html, main, .content-section')) {
+          const h = curr.children('h1, h2, h3, h4, h5, h6, strong, b, p > strong').first();
+          if (h.length) {
+            containerHeading = h.text().trim();
+            break;
+          }
+          const prev = curr.prevAll('h1, h2, h3, h4, h5, h6, strong, b, p').first();
+          if (prev.length) {
+            containerHeading = prev.text().trim();
+            break;
+          }
+          curr = curr.parent();
+        }
+
+        allLinks.push({ href, text, parentContext, containerHeading });
       }
     }
   });
 
   // 1. Check for dedicated Subtitle / Font links
   // Patterns used by the fansub sites: "ملف الترجمة والخطوط", "ملف الترجمة",
-  // "Softsub", and buttons labelled "هنا" under these headings.
-  const subKeywordsRegex = /(?:ملف(?:ات)?\s*(?:الترجمة|الترجمات)(?:\s*و\s*الخطوط)?|(?:الترجمة|الترجمات)\s*و?\s*الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?|fonts?)/i;
+  // "Softsub", and buttons labelled "هنا" or "التحميل" under these headings.
+  const subHeadingRegex = /(?:ملف(?:ات)?\s*(?:الترجمة|الترجمات)(?:\s*و\s*الخطوط)?|(?:الترجمة|الترجمات)\s*و?\s*الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?)/i;
   const actionButtonRegex = /^(?:هنا|اضغط\s*هنا|إضغط\s*هنا|اضغط|إضغط|التحميل|تحميل|تنزيل|download|direct|ddl)$/i;
 
   let directSubLink = null;
 
-  // A. Link text explicitly indicates subtitle file
+  // A. Link text explicitly indicates subtitle file or direct extension
   for (const l of allLinks) {
-    if (subKeywordsRegex.test(l.text) || /\.(ass|srt|zip|rar|7z)$/i.test(l.href)) {
+    if (subHeadingRegex.test(l.text) || /\.(ass|srt|zip|rar|7z)$/i.test(l.href) ||
+        /(?:workers\.dev|ddl\.[^/]+)\/0:.*(?:soft|subs?)/i.test(l.href) ||
+        /subs-[^/]+\.workers\.dev/i.test(l.href)) {
       directSubLink = l.href;
       break;
     }
@@ -316,7 +380,21 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
   // B. Contextual match: link inside a container/heading about subtitle
   if (!directSubLink) {
     for (const l of allLinks) {
-      if (subKeywordsRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subKeywordsRegex.test(l.text) || l.href.includes('top4top.io') || l.href.includes('mediafire.com'))) {
+      if (l.containerHeading && subHeadingRegex.test(l.containerHeading) &&
+          (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) ||
+           l.href.includes('top4top.io') || l.href.includes('mediafire.com') ||
+           l.href.includes('urls.mugi-subs.com') || l.href.includes('tinyurl.com') ||
+           l.href.includes('drive.google.com') || l.href.includes('mega.nz'))) {
+        directSubLink = l.href;
+        break;
+      }
+    }
+  }
+
+  // Fallback to parentContext
+  if (!directSubLink) {
+    for (const l of allLinks) {
+      if (subHeadingRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) || l.href.includes('top4top.io') || l.href.includes('mediafire.com'))) {
         directSubLink = l.href;
         break;
       }
@@ -337,7 +415,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
   for (const l of allLinks) {
     const hrefLower = l.href.toLowerCase();
     const textLower = l.text.toLowerCase();
-    const ctxLower = l.parentContext.toLowerCase();
+    const ctxLower = (l.containerHeading ? `${l.containerHeading} ${l.parentContext}` : l.parentContext).toLowerCase();
 
     const isSoft = textLower.includes('soft') || ctxLower.includes('soft') || !ctxLower.includes('hard');
 
@@ -359,9 +437,9 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
     directSubLink = await followRedirectUrl(directSubLink);
   }
 
-  // Rocks-Team style DDL links lead to a directory named "ملفات الترجمة"
-  // rather than a file. Pick the actual subtitle/archive from that listing.
-  if (directSubLink && /(?:ddl\.[^/]+\/0:|(?:subtitle|subtitles|ملفات(?:%20|\s)*الترجمة))/i.test(directSubLink) &&
+  // Rocks-Team and Mugi style DDL/worker links lead to a directory or GoIndex.
+  // Pick the actual subtitle/archive from that listing.
+  if (directSubLink && /(?:workers\.dev|ddl\.[^/]+\/0:|\/0:|(?:subtitle|subtitles|ملفات(?:%20|\s)*الترجمة))/i.test(directSubLink) &&
       !/\.(?:ass|srt|zip|rar|7z)(?:$|[?#])/i.test(directSubLink)) {
     const resolvedFile = await resolveSubtitleFromDirectory(directSubLink);
     if (resolvedFile) directSubLink = resolvedFile;
