@@ -29,6 +29,7 @@ function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
 
 export function safeMoveFile(src, dest) {
   if (!fs.existsSync(src)) return false;
+  if (path.resolve(src) === path.resolve(dest)) return true;
   try {
     if (fs.existsSync(dest)) {
       fs.rmSync(dest, { force: true });
