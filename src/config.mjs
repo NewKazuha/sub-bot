@@ -1,13 +1,41 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+// Automatically load local .env if present
+try {
+  const envFile = path.resolve('.env');
+  if (fs.existsSync(envFile)) {
+    const lines = fs.readFileSync(envFile, 'utf8').split('\n');
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (line && !line.startsWith('#') && line.includes('=')) {
+        const idx = line.indexOf('=');
+        const k = line.slice(0, idx).trim();
+        const v = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+        if (k && !process.env[k]) process.env[k] = v;
+      }
+    }
+  }
+} catch { }
+
+let sessionFileFallback = '';
+try {
+  const sessionFilePath = path.resolve('SESSION_STRING.txt');
+  if (fs.existsSync(sessionFilePath)) {
+    sessionFileFallback = fs.readFileSync(sessionFilePath, 'utf8').trim();
+  }
+} catch { }
+
 export const CONFIG = {
   PORT: process.env.PORT || 8080,
   POLL_INTERVAL_MINUTES: parseInt(process.env.POLL_INTERVAL_MINUTES || '5', 10),
   
   TELEGRAM: {
-    BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8860387976:AAE9DGLM24IvRZjWQtmOsJTDkq2FbtgcDW0',
+    BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
     TARGET_CHANNEL: process.env.TELEGRAM_TARGET_CHANNEL || '-1004296201769',
     API_ID: parseInt(process.env.TELEGRAM_API_ID || '36075557', 10),
     API_HASH: process.env.TELEGRAM_API_HASH || '68f30da0127d11d0a3d063dc5093e8dd',
-    SESSION: process.env.TELEGRAM_SESSION || '1BAAOMTQ5LjE1NC4xNjcuOTEAUE2H+ZKr0DKSCinPXpRdniX7pofOtg0q5Ze2/jN+jUvLS3UdjcZ1RmJnE4ZlGEm6EDCSV8wi3pxrzLG3KvuTRxoX6iYd90GWGNnw2tb9ZNAJ2kGW7HRnxRzwDc5nEQvr2bkHsK/jFZIIKqOoeMW1+a9EarveYYBSUIn+Im7tWemU3wgpfhERatEk3GC4kgxr1oxJ6xgnP6pRIb9gHuCyxhiHnnrvwTznJkFdTxNONXe4pnSWG51WnLwVDUNNBrlR8YMHLaEtQayTg8GumawLOrKbXUh/md4O4ui5XjwOtlgSM6ml0eZ/0o7DFdHLKiKHRsmKtoJwln7C4z1Seuc3QXw='
+    SESSION: process.env.TELEGRAM_SESSION || sessionFileFallback || ''
   },
 
   SITES: [

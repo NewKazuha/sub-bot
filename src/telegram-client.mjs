@@ -1110,6 +1110,46 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
 }
 
 // ====================================================================
+// Document publisher (Bot API with automatic MTProto Fallback)
+// ====================================================================
+export async function publishDocument(client, filePath, caption, options = {}) {
+  // 1. Try standard Telegram Bot API first
+  if (CONFIG.TELEGRAM.BOT_TOKEN) {
+    try {
+      const sendResult = await sendDocument(filePath, caption, options);
+      if (sendResult?.ok) {
+        return sendResult;
+      }
+      console.warn(`   ⚠️ Telegram Bot API failed:`, sendResult?.description || sendResult);
+    } catch (botErr) {
+      console.warn(`   ⚠️ Telegram Bot API error:`, botErr.message);
+    }
+  }
+
+  // 2. Seamless Fallback: Post directly via MTProto client session (as channel owner/admin)
+  if (client && client.connected) {
+    console.log(`   🔄 Fallback: Publishing directly via MTProto client session...`);
+    try {
+      const channel = await client.getEntity(CONFIG.TELEGRAM.TARGET_CHANNEL);
+      const sent = await client.sendFile(channel, {
+        file: filePath,
+        caption: caption,
+        parseMode: 'html',
+        forceDocument: true
+      });
+      if (sent) {
+        console.log(`   ✅ Successfully posted via MTProto! (Message ID: ${sent.id})`);
+        return { ok: true, result: { message_id: sent.id } };
+      }
+    } catch (mtErr) {
+      console.error(`   ❌ MTProto fallback upload failed:`, mtErr.message);
+    }
+  }
+
+  return { ok: false, description: 'All publication methods failed' };
+}
+
+// ====================================================================
 // Main check function
 // ====================================================================
 export async function checkTelegramChannels() {
@@ -1270,7 +1310,7 @@ export async function checkTelegramChannels() {
 
                 const caption = formatCleanCaption(effectiveTitle, false, true);
                 console.log(`   📤 Publishing official sub: "${caption}" (filename: ${cleanFileName})`);
-                const sendResult = await sendDocument(finalPath, caption);
+                const sendResult = await publishDocument(client, finalPath, caption);
 
                 if (sendResult?.ok) {
                   console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
@@ -1433,7 +1473,7 @@ export async function checkTelegramChannels() {
 
                       const caption = formatCleanCaption(cleanTitle, validated.isArchive, isOfficialPlatformRelease(cleanTitle), hasArchiveFonts);
                       console.log(`   📤 Publishing Subdl direct file: "${caption}" (filename: ${cleanFileName})`);
-                      const sendResult = await sendDocument(finalPath, caption);
+                      const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
@@ -1650,7 +1690,7 @@ export async function checkTelegramChannels() {
 
                   const caption = formatCleanCaption(rawTitle, isArchiveRelease, isOfficialSubdl, hasFonts);
                   console.log(`   📤 Publishing to channel: "${caption}" (filename: ${path.basename(finalFilePath)})`);
-                  const sendResult = await sendDocument(finalFilePath, caption);
+                  const sendResult = await publishDocument(client, finalFilePath, caption);
 
                   if (sendResult?.ok) {
                     console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
@@ -1717,7 +1757,7 @@ export async function checkTelegramChannels() {
 
                       const caption = formatCleanCaption(titleLine, validated.isArchive, false);
                       console.log(`   📤 Publishing LazySano release: "${caption}"`);
-                      const sendResult = await sendDocument(finalPath, caption);
+                      const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted!`);
@@ -1777,7 +1817,7 @@ export async function checkTelegramChannels() {
 
                           const caption = formatCleanCaption(titleLine, validated.isArchive, false);
                           console.log(`   📤 Publishing LazySano post link: "${caption}"`);
-                          const sendResult = await sendDocument(finalPath, caption);
+                          const sendResult = await publishDocument(client, finalPath, caption);
                           if (sendResult?.ok) {
                             newFound++;
                             markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -1801,7 +1841,7 @@ export async function checkTelegramChannels() {
 
                         const caption = formatCleanCaption(titleLine, validated.isArchive, false);
                         console.log(`   📤 Publishing LazySano post link: "${caption}"`);
-                        const sendResult = await sendDocument(finalPath, caption);
+                        const sendResult = await publishDocument(client, finalPath, caption);
                         if (sendResult?.ok) {
                           newFound++;
                           markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -1865,7 +1905,7 @@ export async function checkTelegramChannels() {
 
                     const caption = formatCleanCaption(titleLine, validated.isArchive, false);
                     console.log(`   📤 Publishing to channel: "${caption}"`);
-                    const sendResult = await sendDocument(finalPath, caption);
+                    const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);
@@ -2002,7 +2042,7 @@ export async function checkTelegramChannels() {
 
                     const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
                     console.log(`   📤 Publishing to channel: "${caption}"`);
-                    const sendResult = await sendDocument(finalPath, caption);
+                    const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);
@@ -2034,7 +2074,7 @@ export async function checkTelegramChannels() {
 
                     const caption = formatCleanCaption(titleLine, extracted.isArchive, false);
                     console.log(`   📤 Publishing to channel: "${caption}"`);
-                    const sendResult = await sendDocument(finalPath, caption);
+                    const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);

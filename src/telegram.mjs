@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG } from './config.mjs';
 
-const API_BASE = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}`;
+const getApiBase = () => `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}`;
 
 function escapeHtml(text) {
   return String(text)
@@ -12,6 +12,7 @@ function escapeHtml(text) {
 }
 
 export async function sendMessage(text, { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
+  if (!CONFIG.TELEGRAM.BOT_TOKEN) return { ok: false, description: 'No TELEGRAM_BOT_TOKEN configured' };
   try {
     const bodyObj = {
       chat_id: chatId,
@@ -19,7 +20,7 @@ export async function sendMessage(text, { chatId = CONFIG.TELEGRAM.TARGET_CHANNE
     };
     if (parseMode) bodyObj.parse_mode = parseMode;
 
-    const res = await fetch(`${API_BASE}/sendMessage`, {
+    const res = await fetch(`${getApiBase()}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(bodyObj)
@@ -32,6 +33,7 @@ export async function sendMessage(text, { chatId = CONFIG.TELEGRAM.TARGET_CHANNE
 }
 
 export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML', retries = 3 } = {}) {
+  if (!CONFIG.TELEGRAM.BOT_TOKEN) return { ok: false, description: 'No TELEGRAM_BOT_TOKEN configured' };
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const fileName = path.basename(filePath);
@@ -46,7 +48,7 @@ export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TEL
         if (parseMode) formData.append('parse_mode', parseMode);
       }
 
-      const res = await fetch(`${API_BASE}/sendDocument`, {
+      const res = await fetch(`${getApiBase()}/sendDocument`, {
         method: 'POST',
         body: formData,
         signal: AbortSignal.timeout(180000)
@@ -72,6 +74,7 @@ export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TEL
 }
 
 export async function sendPhoto(photoUrl, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
+  if (!CONFIG.TELEGRAM.BOT_TOKEN) return { ok: false, description: 'No TELEGRAM_BOT_TOKEN configured' };
   try {
     const bodyObj = {
       chat_id: chatId,
@@ -80,7 +83,7 @@ export async function sendPhoto(photoUrl, caption = '', { chatId = CONFIG.TELEGR
     };
     if (parseMode) bodyObj.parse_mode = parseMode;
 
-    const res = await fetch(`${API_BASE}/sendPhoto`, {
+    const res = await fetch(`${getApiBase()}/sendPhoto`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(bodyObj)
