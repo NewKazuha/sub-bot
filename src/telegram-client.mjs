@@ -334,7 +334,7 @@ export function formatCleanTitle(raw) {
   return cleaned;
 }
 
-function isOfficialPlatformRelease(title) {
+export function isOfficialPlatformRelease(title) {
   return /^\[\s*(?:cr(?:unchyroll)?|nf|netflix|dsnp|disney\+?|amzn|amazon(?:\s+prime)?|prime|hidive|shahid|bilibili|b-global|adn|abema|erai[-_\s]*raws)\s*\]/i.test(title);
 }
 
@@ -836,6 +836,80 @@ export async function resolveSubdlDownloadUrl(infoUrl) {
     console.warn('SUBDL resolve error:', e.message);
     return null;
   }
+}
+
+function extractKeywordsFromTitleOrFile(str) {
+  const norm = (str || '')
+    .toLowerCase()
+    .replace(/[._\-+,]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ');
+  return norm.split(/\s+/).filter(w =>
+    w.length >= 3 &&
+    !/^(?:zip|rar|7z|ass|srt|1080p|720p|480p|end|batch|pack|the|and|sub|subdl)$/i.test(w)
+  );
+}
+
+export function findMatchingPosterMsgForDoc(docMsg, allMsgs) {
+  const doc = docMsg.media?.document;
+  const originalName = doc?.attributes?.find(a => a.fileName)?.fileName || '';
+  const docKeywords = extractKeywordsFromTitleOrFile(originalName);
+
+  let bestMsg = null;
+  let bestScore = -1;
+
+  for (let offset = 1; offset <= 3; offset++) {
+    for (const sign of [-1, 1]) {
+      const targetId = docMsg.id + (sign * offset);
+      const cand = allMsgs.find(m => m && m.id === targetId);
+      if (!cand || !cand.message) continue;
+
+      const candText = cand.message;
+      const candKeywords = extractKeywordsFromTitleOrFile(candText);
+
+      let overlap = 0;
+      for (const kw of docKeywords) {
+        if (candKeywords.includes(kw)) overlap++;
+      }
+
+      let score = overlap * 10;
+      if (sign === -1) score += (4 - offset); // Preceding message gets priority bonus
+
+      if (candText.includes('📍') || /^\[[^\]]+\]/.test(candText.trim())) {
+        score += 2;
+      }
+
+      if (overlap >= 1 && score > bestScore) {
+        bestScore = score;
+        bestMsg = cand;
+      }
+    }
+  }
+
+  // Fallback: if no keyword overlap found, check immediate predecessor
+  if (!bestMsg) {
+    const prev = allMsgs.find(m => m && m.id === docMsg.id - 1);
+    if (prev && prev.message && (prev.message.includes('📍') || /^\[[^\]]+\]/.test(prev.message.trim()))) {
+      bestMsg = prev;
+    }
+  }
+
+  return bestMsg;
+}
+
+export function hasCoveringDocumentMsg(textMsg, allMsgs) {
+  for (let offset = 1; offset <= 3; offset++) {
+    for (const sign of [1, -1]) {
+      const targetId = textMsg.id + (sign * offset);
+      const candDoc = allMsgs.find(m => m && m.id === targetId && m.media?.document);
+      if (candDoc) {
+        const matchedPoster = findMatchingPosterMsgForDoc(candDoc, allMsgs);
+        if (matchedPoster && matchedPoster.id === textMsg.id) {
+          return candDoc;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 async function resolveTop4topDownloadUrl(top4topUrl) {
@@ -1351,32 +1425,39 @@ export async function checkTelegramChannels() {
                   cleanTitle = formatCleanTitle(lines[0]);
                 }
 
-                // If message has no proper title or doesn't have [Platform], look at adjacent message (within +-2 IDs)
+                // Look for matching poster message using keyword matching and chronology
                 if (!cleanTitle || !/^\[[^\]]+\]/.test(cleanTitle)) {
-                  const adjMsg = msgs.find(m =>
-                    m &&
-                    Math.abs(m.id - msg.id) <= 2 &&
-                    m.id !== msg.id &&
-                    m.message &&
-                    (m.message.includes('subdl.com') || m.message.includes('📍') || /\[(Crunchyroll|Netflix|Disney|Shahid|Bilibili|ADN|Abema|Amazon)\]/i.test(m.message))
-                  );
-
-                  if (adjMsg) {
-                    const adjLines = (adjMsg.message || '').split('\n').map(l => l.trim()).filter(Boolean);
-                    if (adjLines[0]) {
-                      cleanTitle = formatCleanTitle(adjLines[0]);
-                      linkedMsgId = adjMsg.id;
+                  const matchedPoster = findMatchingPosterMsgForDoc(msg, msgs);
+                  if (matchedPoster) {
+                    const posterLines = (matchedPoster.message || '').split('\n').map(l => l.trim()).filter(Boolean);
+                    if (posterLines[0]) {
+                      cleanTitle = formatCleanTitle(posterLines[0]);
+                      linkedMsgId = matchedPoster.id;
                     }
                   }
                 }
 
                 if (!cleanTitle) {
-                  const baseName = originalName.replace(/\.(ass|srt|zip|rar|7z)$/i, '').trim();
+                  const baseName = originalName
+                    .replace(/\.(ass|srt|zip|rar|7z)$/i, '')
+                    .replace(/_/g, ' ')
+                    .trim();
                   cleanTitle = formatCleanTitle(baseName);
-                  if (!/^\[[^\]]+\]/.test(cleanTitle)) cleanTitle = `[Subdl] ${cleanTitle}`;
+                  if (!/^\[[^\]]+\]/.test(cleanTitle)) {
+                    const teamMatch = baseName.match(/^([a-zA-Z0-9_\-]+)\s+/);
+                    if (teamMatch && /^(revive|rhythm|celestial|lazysano|suzume|kiyoshi|redeja|asahi|zarax|rocks|3yar|bruuhim|aurora)/i.test(teamMatch[1])) {
+                      cleanTitle = `[${teamMatch[1]}] ${baseName.slice(teamMatch[0].length).trim()}`;
+                    } else {
+                      cleanTitle = `[Subdl] ${cleanTitle}`;
+                    }
+                  }
                 }
 
-                const releaseKeys = getReleaseKeys(cleanTitle, true);
+                const isOfficialSubdl = isOfficialPlatformRelease(cleanTitle);
+                const releaseKeys = isOfficialSubdl
+                  ? getReleaseKeys(cleanTitle, true)
+                  : getFansubReleaseKeys(cleanTitle);
+
                 if (isReleaseAlreadyPosted(posted, releaseKeys)) {
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
                   if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
@@ -1512,15 +1593,10 @@ export async function checkTelegramChannels() {
               continue;
             }
 
-            // Check if there is an adjacent message with a direct document covering this release
-            const adjDocMsg = msgs.find(m =>
-              m &&
-              Math.abs(m.id - msg.id) <= 2 &&
-              m.id !== msg.id &&
-              m.media?.document
-            );
-            if (adjDocMsg) {
-              // The attached document will be handled directly
+            // Check if there is an attached document message specifically covering this release
+            const coveringDoc = hasCoveringDocumentMsg(msg, msgs);
+            if (coveringDoc) {
+              // The attached document covers this release and will be handled directly
               continue;
             }
 
