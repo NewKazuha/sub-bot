@@ -1188,8 +1188,11 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
 // Document publisher (Bot API with automatic MTProto Fallback)
 // ====================================================================
 export async function publishDocument(client, filePath, caption, options = {}) {
-  // 1. Try standard Telegram Bot API first
-  if (CONFIG.TELEGRAM.BOT_TOKEN) {
+  const fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+  const FILE_SIZE_BOT_API_LIMIT = 20 * 1024 * 1024; // 20 MB – skip Bot API for larger files
+
+  // 1. Try standard Telegram Bot API for small files
+  if (CONFIG.TELEGRAM.BOT_TOKEN && fileSize <= FILE_SIZE_BOT_API_LIMIT) {
     try {
       const sendResult = await sendDocument(filePath, caption, options);
       if (sendResult?.ok) {
@@ -1199,25 +1202,33 @@ export async function publishDocument(client, filePath, caption, options = {}) {
     } catch (botErr) {
       console.warn(`   ⚠️ Telegram Bot API error:`, botErr.message);
     }
+  } else if (fileSize > FILE_SIZE_BOT_API_LIMIT) {
+    console.log(`   📦 File is ${(fileSize / 1024 / 1024).toFixed(1)} MB – skipping Bot API, using MTProto directly.`);
   }
 
-  // 2. Seamless Fallback: Post directly via MTProto client session (as channel owner/admin)
+  // 2. Post directly via MTProto client session (primary for large files, fallback for small)
   if (client && client.connected) {
-    console.log(`   🔄 Fallback: Publishing directly via MTProto client session...`);
+    console.log(`   🔄 Publishing via MTProto client session...`);
     try {
       const channel = await client.getEntity(CONFIG.TELEGRAM.TARGET_CHANNEL);
-      const sent = await client.sendFile(channel, {
+      const uploadTimeoutMs = Math.max(180_000, Math.ceil(fileSize / (40 * 1024)) * 1000); // at least 3m, or calculated from size
+      const uploadPromise = client.sendFile(channel, {
         file: filePath,
         caption: caption,
         parseMode: 'html',
-        forceDocument: true
+        forceDocument: true,
+        workers: 4
       });
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`MTProto upload timed out after ${Math.round(uploadTimeoutMs / 1000)}s`)), uploadTimeoutMs)
+      );
+      const sent = await Promise.race([uploadPromise, timeoutPromise]);
       if (sent) {
         console.log(`   ✅ Successfully posted via MTProto! (Message ID: ${sent.id})`);
         return { ok: true, result: { message_id: sent.id } };
       }
     } catch (mtErr) {
-      console.error(`   ❌ MTProto fallback upload failed:`, mtErr.message);
+      console.error(`   ❌ MTProto upload failed:`, mtErr.message);
     }
   }
 
@@ -1293,7 +1304,20 @@ export async function checkTelegramChannels() {
       return isFansubPublisher || isOfficialKokoboko || isOfficialRengoku || isEraiRaws || isLazySano;
     });
 
-    console.log(`   Found ${targetSourceChats.length} targeted source channel(s):`);
+    function getChannelPriority(chat) {
+      const idStr = String(chat.id);
+      const titleLower = (chat.title || '').toLowerCase();
+      if (idStr.includes(CHANNEL_RENGOKU) || titleLower.includes('rengoku')) return 1;
+      if (idStr.includes(CHANNEL_KOKOBOKO) || titleLower.includes('kokoboko')) return 2;
+      if (idStr.includes(CHANNEL_LAZYSANO) || titleLower.includes('lazysano') || titleLower.includes('レイジーさん')) return 3;
+      if (idStr.includes(CHANNEL_ERAI) || titleLower.includes('erai-raws')) return 4;
+      if (idStr.includes(CHANNEL_FANSUB) || titleLower.includes('arabic anime publisher')) return 5;
+      return 10;
+    }
+
+    targetSourceChats.sort((a, b) => getChannelPriority(a) - getChannelPriority(b));
+
+    console.log(`   Found ${targetSourceChats.length} targeted source channel(s) (ordered by priority):`);
     targetSourceChats.forEach(c => console.log(`   - ${c.title} (ID: ${c.id})`));
 
     fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -1468,9 +1492,8 @@ export async function checkTelegramChannels() {
                 const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${originalName}`);
 
                 try {
-                  const buffer = await client.downloadMedia(msg);
-                  if (buffer && Buffer.isBuffer(buffer)) {
-                    fs.writeFileSync(localFilePath, buffer);
+                  await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
+                  if (fs.existsSync(localFilePath) && fs.statSync(localFilePath).size > 0) {
                     let validated = validateFileMagic(localFilePath);
 
                     if (validated) {
@@ -1535,9 +1558,16 @@ export async function checkTelegramChannels() {
                             const repackedZip = path.join(OUT_DIR, `batch_${msg.id}.zip`);
                             packFolderToZip(extractDir, repackedZip);
                             const zipVal = validateFileMagic(repackedZip);
-                            if (zipVal) {
+                            const originalSize = fs.statSync(localFilePath).size;
+                            const repackedSize = zipVal ? fs.statSync(repackedZip).size : Infinity;
+                            // If repacked zip is significantly larger than original, keep original archive
+                            if (zipVal && repackedSize <= originalSize * 1.5) {
                               effectiveDownloadPath = repackedZip;
                               validated = zipVal;
+                            } else if (zipVal) {
+                              console.log(`   📦 Repacked zip (${(repackedSize / 1024 / 1024).toFixed(1)} MB) is much larger than original (${(originalSize / 1024 / 1024).toFixed(1)} MB) – keeping original archive.`);
+                              try { fs.rmSync(repackedZip, { force: true }); } catch { }
+                              // Keep original archive as effectiveDownloadPath (already set to localFilePath)
                             }
                             try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { }
                           }
@@ -1822,10 +1852,8 @@ export async function checkTelegramChannels() {
                 const localFilePath = path.join(OUT_DIR, originalName);
 
                 try {
-                  const buffer = await client.downloadMedia(msg);
-                  if (buffer && Buffer.isBuffer(buffer)) {
-                    fs.writeFileSync(localFilePath, buffer);
-
+                  await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
+                  if (fs.existsSync(localFilePath) && fs.statSync(localFilePath).size > 0) {
                     const validated = validateFileMagic(localFilePath);
                     if (validated) {
                       const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
@@ -1965,10 +1993,8 @@ export async function checkTelegramChannels() {
               const localFilePath = path.join(OUT_DIR, originalName);
 
               try {
-                const buffer = await client.downloadMedia(msg);
-                if (buffer && Buffer.isBuffer(buffer)) {
-                  fs.writeFileSync(localFilePath, buffer);
-
+                await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
+                if (fs.existsSync(localFilePath) && fs.statSync(localFilePath).size > 0) {
                   const validated = validateFileMagic(localFilePath);
                   if (validated) {
                     titleLine = resolveEnglishTitleIfArabic(titleLine, [originalName, localFilePath], [localFilePath]);

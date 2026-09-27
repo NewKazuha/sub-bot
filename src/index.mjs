@@ -38,9 +38,10 @@ app.get('/check-now', async (req, res) => {
 });
 
 const PORT = CONFIG.PORT;
-app.listen(PORT, () => {
+
+function startScheduler() {
   console.log(`\n======================================================`);
-  console.log(`🤖 Anime Sub Telegram Bot started on port ${PORT}`);
+  console.log(`🤖 Anime Sub Telegram Bot loop initialized`);
   console.log(`⏰ Polling interval: Every ${CONFIG.POLL_INTERVAL_MINUTES} minutes`);
   console.log(`======================================================\n`);
 
@@ -49,4 +50,19 @@ app.listen(PORT, () => {
   setInterval(() => {
     safeCheckCycle('interval');
   }, CONFIG.POLL_INTERVAL_MINUTES * 60 * 1000);
+}
+
+const server = app.listen(PORT, () => {
+  console.log(`🌐 Health check server listening on port ${PORT}`);
+  startScheduler();
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.warn(`⚠️ Port ${PORT} is in use. Web health check server disabled, but Telegram bot polling will continue running.`);
+    startScheduler();
+  } else {
+    console.error('Web server error:', err);
+    startScheduler();
+  }
 });

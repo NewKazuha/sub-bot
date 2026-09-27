@@ -27,7 +27,7 @@ try {
 } catch { }
 
 export const CONFIG = {
-  PORT: process.env.PORT || 8080,
+  PORT: parseInt(process.env.PORT || '3080', 10),
   POLL_INTERVAL_MINUTES: parseInt(process.env.POLL_INTERVAL_MINUTES || '5', 10),
   
   TELEGRAM: {
