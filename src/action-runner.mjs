@@ -1,8 +1,8 @@
 import { checkNewReleases } from './feed-monitor.mjs';
 
 // Duration to keep the action worker alive checking continuously
-const RUN_DURATION_MINUTES = parseInt(process.env.RUN_DURATION_MINUTES || '15', 10);
-const CHECK_INTERVAL_SECONDS = parseInt(process.env.CHECK_INTERVAL_SECONDS || '45', 10);
+const RUN_DURATION_MINUTES = parseInt(process.env.RUN_DURATION_MINUTES || '25', 10);
+const CHECK_INTERVAL_SECONDS = parseInt(process.env.CHECK_INTERVAL_SECONDS || '60', 10);
 
 async function runContinuousMonitor() {
   console.log(`\n======================================================`);

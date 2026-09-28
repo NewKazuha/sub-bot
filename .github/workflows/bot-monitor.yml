@@ -16,7 +16,7 @@ permissions:
 jobs:
   check-and-post:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,7 +38,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip
           pip install --no-cache-dir mega.py gdown
 
-      - name: Run a single monitor pass
+      - name: Run continuous monitor loop
         env:
           # Some Arabic fansub sites use certificate chains trusted by the
           # runner's system store but absent from Node's bundled CA set.
@@ -57,9 +57,9 @@ jobs:
           REVIVE_PASS: ${{ secrets.REVIVE_PASS }}
           ANIMESAN_USER: ${{ secrets.ANIMESAN_USER }}
           ANIMESAN_PASS: ${{ secrets.ANIMESAN_PASS }}
-          # The workflow is already scheduled every 15 minutes. A single pass
-          # prevents queued runs from piling up and being cancelled.
-          RUN_DURATION_MINUTES: 0
+          # Keep monitor alive in continuous loop for 25 minutes, checking every 60 seconds
+          RUN_DURATION_MINUTES: 25
+          CHECK_INTERVAL_SECONDS: 60
         run: |
           node src/action-runner.mjs
 
