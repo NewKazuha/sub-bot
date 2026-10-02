@@ -133,7 +133,16 @@ const ANIME_ALIASES = [
   { pattern: /(?:kidou\s*senkan\s*nadesico|nadesico)/i, canon: 'nadesico' },
   { pattern: /(?:hell\s*mode)/i, canon: 'hell_mode' },
   { pattern: /(?:katainaka\s*no\s*ossan)/i, canon: 'katainaka_ossan' },
-  { pattern: /(?:super\s*no\s*ura)/i, canon: 'super_no_ura' }
+  { pattern: /(?:super\s*no\s*ura)/i, canon: 'super_no_ura' },
+  { pattern: /(?:jojo.*steel\s*ball|steel\s*ball.*jojo|steel\s*ball\s*run)/i, canon: 'jojo_steel_ball_run' },
+  { pattern: /(?:tougen\s*anki)/i, canon: 'tougen_anki' },
+  { pattern: /(?:kusuriya\s*no\s*hitorigoto|apothecary\s*diaries)/i, canon: 'kusuriya_no_hitorigoto' },
+  { pattern: /(?:tokyo\s*revengers)/i, canon: 'tokyo_revengers' },
+  { pattern: /(?:uchi\s*no\s*otouto|please\s*excuse\s*my\s*younger\s*brothers)/i, canon: 'uchi_no_otouto' },
+  { pattern: /(?:yani\s*neko)/i, canon: 'yani_neko' },
+  { pattern: /(?:thunder\s*3)/i, canon: 'thunder_3' },
+  { pattern: /(?:quanzhi\s*fashi|versatile\s*mage)/i, canon: 'quanzhi_fashi' },
+  { pattern: /(?:nijus?seiki\s*denki|eureka\s*evrika)/i, canon: 'denki_mokuroku' }
 ];
 
 // ====================================================================
@@ -291,6 +300,18 @@ export function getReleaseKeys(title, isOfficial = false) {
     }
     if (epNum && coreKey) {
       keys.push(`official_ep_${epNum}_${coreKey.slice(0, 20)}`);
+    }
+
+    // Sorted significant word signature to prevent duplicates when title words are flipped
+    // e.g. "Steel Ball Run: JoJo" vs "JoJo: Steel Ball Run"
+    if (coreKey && epNum) {
+      const sortedWords = coreKey
+        .split('_')
+        .filter(w => w && w !== epNum && !/^(?:season|s\d+|2nd|3rd|4th|5th|6th|7th|\d+|part|the|and|no|wa|ga|to|de|ni|mo|na|202\d|end|hen)$/i.test(w));
+      if (sortedWords.length >= 2) {
+        const sortedSig = Array.from(new Set(sortedWords)).sort().join('_');
+        keys.push(`official_sorted_ep_${epNum}_${sortedSig}`);
+      }
     }
   }
 
