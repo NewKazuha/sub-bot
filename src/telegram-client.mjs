@@ -157,6 +157,21 @@ export function savePostedIds(set) {
   }
 }
 
+// Create a reusable Telegram client (caller is responsible for connect/disconnect)
+export function createPersistentClient() {
+  const sessionStr = CONFIG.TELEGRAM.SESSION;
+  if (!sessionStr) {
+    console.warn('No Telegram SESSION found in config.');
+    return null;
+  }
+  return new TelegramClient(
+    new StringSession(sessionStr),
+    CONFIG.TELEGRAM.API_ID,
+    CONFIG.TELEGRAM.API_HASH,
+    { connectionRetries: 5 }
+  );
+}
+
 const ARABIC_EPISODE_WORDS = [
   { p: /الحادية\s*عشر[ةه]?/i, ep: '11' },
   { p: /الثانية\s*عشر[ةه]?/i, ep: '12' },
@@ -1238,7 +1253,7 @@ export async function publishDocument(client, filePath, caption, options = {}) {
 // ====================================================================
 // Main check function
 // ====================================================================
-export async function checkTelegramChannels() {
+export async function checkTelegramChannels(existingClient = null) {
   const sessionStr = CONFIG.TELEGRAM.SESSION;
   if (!sessionStr) {
     console.warn('No Telegram SESSION found in config.');
@@ -1249,10 +1264,11 @@ export async function checkTelegramChannels() {
   let newFound = 0;
   const toolsAvailable = hasRequiredTools();
 
-  console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
   if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found in this environment – Torrent/Cloud extraction will run in GitHub Actions.`);
 
-  const client = new TelegramClient(
+  // Reuse caller-provided client or create a local one (auto-cleaned in finally)
+  const ownClient = !existingClient;
+  const client = existingClient || new TelegramClient(
     new StringSession(sessionStr),
     CONFIG.TELEGRAM.API_ID,
     CONFIG.TELEGRAM.API_HASH,
@@ -1260,7 +1276,12 @@ export async function checkTelegramChannels() {
   );
 
   try {
-    await client.connect();
+    if (!client.connected) {
+      console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
+      await client.connect();
+    } else {
+      console.log(`\n📡 [Telegram MTProto Client] Reusing persistent connection...`);
+    }
 
     // Sync existing target channel history into posted set to eliminate any duplicates
     try {
@@ -2206,7 +2227,9 @@ export async function checkTelegramChannels() {
   } catch (err) {
     console.error('Telegram channel listener error:', err.message);
   } finally {
-    try { await client.disconnect(); } catch { }
+    if (ownClient) {
+      try { await client.disconnect(); } catch { }
+    }
   }
 
   savePostedIds(posted);

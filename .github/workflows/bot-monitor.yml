@@ -12,6 +12,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   check-and-post:
@@ -72,3 +73,18 @@ jobs:
           git commit -m "Update posted releases list [skip ci]" || true
           git pull --rebase origin main || true
           git push origin main || true
+
+      - name: Chain next monitoring run
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # Use PAT if available, otherwise fall back to built-in GITHUB_TOKEN
+          TOKEN="${GH_PAT:-${{ secrets.GITHUB_TOKEN }}}"
+          curl -sf -X POST \
+            -H "Authorization: token $TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot-monitor.yml/dispatches" \
+            -d '{"ref":"main"}' \
+            && echo "✅ Next monitoring run triggered successfully" \
+            || echo "⚠️ Could not trigger next run – relying on cron schedule as fallback"
