@@ -36,7 +36,7 @@ jobs:
         run: |
           npm install --production
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip
+          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip p7zip-full p7zip-rar unrar || sudo apt-get install -y --no-install-recommends p7zip-full
           pip install --no-cache-dir mega.py gdown
 
       - name: Run continuous monitor loop

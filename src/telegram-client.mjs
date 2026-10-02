@@ -643,6 +643,43 @@ export function listArchiveFiles(archivePath) {
     } catch { }
   }
   if (ext === '.7z' || ext === '.rar' || magic?.isArchive) {
+    // 1. Try system full 7z (supports RAR when p7zip-full/p7zip-rar is installed)
+    try {
+      const stdout = execSync(`7z l "${archivePath}"`, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      const lines = stdout.split(/\r?\n/);
+      const files = [];
+      let headerPassed = false;
+      for (const line of lines) {
+        if (line.includes('-------------------')) {
+          headerPassed = !headerPassed;
+          continue;
+        }
+        if (headerPassed) {
+          const match = line.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+([A-Za-z.]+)\s+\d+\s+(?:\d+)?\s+(.+)$/);
+          if (match) {
+            const attr = match[1];
+            const name = match[2].trim();
+            if (!attr.includes('D') && name) files.push(name);
+          }
+        }
+      }
+      if (files.length > 0) return files;
+    } catch { }
+
+    // 2. Try unrar bare listing (unrar lb)
+    try {
+      const stdout = execSync(`unrar lb "${archivePath}"`, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      const files = stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      if (files.length > 0) return files;
+    } catch { }
+
+    // 3. Try bundled 7za
     try {
       const stdout = execSync(`"${SevenZip.path7za}" l "${archivePath}"`, {
         encoding: 'utf8',
@@ -668,6 +705,8 @@ export function listArchiveFiles(archivePath) {
       if (files.length > 0) return files;
     } catch { }
   }
+
+  // 4. Try tar -tf (supports RAR on Windows bsdtar)
   try {
     const stdout = execSync(`tar -tf "${archivePath}"`, {
       encoding: 'utf8',
@@ -694,6 +733,23 @@ export function extractArchive(archivePath, destDir) {
     } catch { }
   }
   if (ext === '.7z' || ext === '.rar' || magic?.isArchive) {
+    // 1. Try system full 7z
+    try {
+      execSync(`7z x "${archivePath}" -o"${destDir}" -y`, {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      return true;
+    } catch { }
+
+    // 2. Try unrar
+    try {
+      execSync(`unrar x -y -inul "${archivePath}" "${destDir}/"`, {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      return true;
+    } catch { }
+
+    // 3. Try bundled 7za
     try {
       execSync(`"${SevenZip.path7za}" x "${archivePath}" -o"${destDir}" -y`, {
         stdio: ['pipe', 'pipe', 'pipe']
@@ -701,6 +757,8 @@ export function extractArchive(archivePath, destDir) {
       return true;
     } catch { }
   }
+
+  // 4. Try tar -xf (supports RAR on Windows bsdtar)
   try {
     execSync(`tar -xf "${archivePath}" -C "${destDir}"`, {
       stdio: ['pipe', 'pipe', 'pipe']
@@ -808,9 +866,33 @@ export async function resolveSubdlDownloadData(infoUrl) {
     }
   } catch {}
 
-  if (!html) {
-    html = fetchSubdlHtmlWithCurl(infoUrl);
+  if (!html || !html.includes('dl.subdl.com')) {
+    const curlHtml = fetchSubdlHtmlWithCurl(infoUrl);
+    if (curlHtml && !curlHtml.includes('Just a moment...') && curlHtml.includes('dl.subdl.com')) {
+      html = curlHtml;
+    }
   }
+
+  // Cloudflare bypass fallback via Jina reader (returns complete HTML without Cloudflare challenge)
+  if (!html || !html.includes('dl.subdl.com') || html.includes('Just a moment...')) {
+    try {
+      const jinaRes = await fetchWithTimeout(`https://r.jina.ai/${infoUrl}`, {
+        headers: {
+          'X-Return-Format': 'html',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      if (jinaRes.ok) {
+        const jinaHtml = await jinaRes.text();
+        if (jinaHtml.includes('dl.subdl.com')) {
+          html = jinaHtml;
+        }
+      }
+    } catch (e) {
+      console.warn('Subdl Jina fallback error:', e.message);
+    }
+  }
+
   if (!html) return null;
 
   const doc = cheerio.load(html);
