@@ -225,14 +225,67 @@ function getLinkTarget($, el, pageUrl) {
 
 export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
   try {
-    const res = await fetchWithTimeout(directoryUrl, {
-      method: 'POST',
-      headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page_token: null, page_index: 0 })
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const files = json?.data?.files || [];
+    const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
+
+    let files = [];
+
+    // 1. Try application/json (Mejaow / modern GoIndex workers)
+    try {
+      const resJson = await fetchWithTimeout(directoryUrl, {
+        method: 'POST',
+        headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_token: null, page_index: 0 })
+      });
+      if (resJson.ok) {
+        const json = await resJson.json().catch(() => null);
+        if (json?.data?.files) files = json.data.files;
+      }
+    } catch {}
+
+    // 2. Try application/x-www-form-urlencoded (Rocks-Team / HashHackers GDI workers)
+    if (!files.length) {
+      try {
+        const formParams = new URLSearchParams();
+        formParams.append('password', '');
+        formParams.append('page_token', '');
+        formParams.append('page_index', '0');
+
+        const resForm = await fetchWithTimeout(directoryUrl, {
+          method: 'POST',
+          headers: {
+            'User-Agent': UA,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: formParams.toString()
+        });
+
+        if (resForm.ok) {
+          const rawText = await resForm.text();
+          let json = null;
+          try {
+            json = JSON.parse(rawText);
+          } catch {
+            // HashHackers GDI obfuscation: reverse string, cut 24 chars prefix & 20 chars suffix, then base64 decode
+            try {
+              const rev = rawText.split('').reverse().join('');
+              const sliced = rev.substr(24).slice(0, -20);
+              const decoded = Buffer.from(sliced, 'base64').toString('utf-8');
+              json = JSON.parse(decoded);
+            } catch {
+              const rev = rawText.split('').reverse().join('');
+              const sliced = rev.substr(24).slice(0, -20);
+              const b64 = atob(sliced);
+              const uri = b64.split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('');
+              json = JSON.parse(decodeURIComponent(uri));
+            }
+          }
+          if (json?.data?.files) files = json.data.files;
+        }
+      } catch {}
+    }
+
+    if (!files.length) return null;
+
     const subFiles = files.filter(f => /\.(ass|srt|zip|rar|7z)$/i.test(f.name || ''));
     if (!subFiles.length) return null;
 
@@ -246,7 +299,6 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
       if (match) chosen = match;
     }
 
-    const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
     return `${base}${encodeURIComponent(chosen.name)}`;
   } catch {
     return null;
@@ -292,12 +344,14 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
   }
 }
 
-export async function scrapePostPage(pageUrl, siteConfig = null) {
+export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null) {
   let cookieHeader = '';
   if (siteConfig && siteConfig.user) {
     const jar = await ensureSiteSession(siteConfig);
     if (jar) cookieHeader = jar.header();
   }
+
+  const effectiveEp = targetEp || (pageUrl.match(/[-_](\d{1,4})(?:\.html)?$/i)?.[1]) || null;
 
   let html = '';
   try {
@@ -362,25 +416,47 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
   // 1. Check for dedicated Subtitle / Font links
   // Patterns used by the fansub sites: "ملف الترجمة والخطوط", "ملف الترجمة",
   // "Softsub", and buttons labelled "هنا" or "التحميل" under these headings.
+  const subExplicitRegex = /(?:ملف\s*(?:الترجمة|الترجمات|الخطوط)|(?:الترجمة|الترجمات)\s*(?:و\s*الخطوط)?|subtitles?)/i;
   const subHeadingRegex = /(?:ملف(?:ات)?\s*(?:الترجمة|الترجمات)(?:\s*و\s*الخطوط)?|(?:الترجمة|الترجمات)\s*و?\s*الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?)/i;
   const actionButtonRegex = /^(?:هنا|اضغط\s*هنا|إضغط\s*هنا|اضغط|إضغط|التحميل|تحميل|تنزيل|download|direct|ddl)$/i;
 
   let directSubLink = null;
 
-  // A. Link text explicitly indicates subtitle file or direct extension
+  // A. Link points directly to subtitle/archive file extension
   for (const l of allLinks) {
-    if (subHeadingRegex.test(l.text) || /\.(ass|srt|zip|rar|7z)$/i.test(l.href) ||
-        /(?:workers\.dev|ddl\.[^/]+)\/0:.*(?:soft|subs?)/i.test(l.href) ||
-        /subs-[^/]+\.workers\.dev/i.test(l.href)) {
+    if (/\.(ass|srt|zip|rar|7z)$/i.test(l.href)) {
       directSubLink = l.href;
       break;
     }
   }
 
-  // B. Contextual match: link inside a container/heading about subtitle
+  // B. Link text explicitly indicates subtitle file (excluding root index /0:/)
   if (!directSubLink) {
     for (const l of allLinks) {
-      if (l.containerHeading && subHeadingRegex.test(l.containerHeading) &&
+      const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
+      if (!isRoot && subExplicitRegex.test(l.text)) {
+        directSubLink = l.href;
+        break;
+      }
+    }
+  }
+
+  // C. General subtitle links or dedicated workers.dev links
+  if (!directSubLink) {
+    for (const l of allLinks) {
+      const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
+      if (!isRoot && (subHeadingRegex.test(l.text) || /subs-[^/]+\.workers\.dev/i.test(l.href))) {
+        directSubLink = l.href;
+        break;
+      }
+    }
+  }
+
+  // D. Contextual match: link inside a container/heading about subtitle
+  if (!directSubLink) {
+    for (const l of allLinks) {
+      const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
+      if (!isRoot && l.containerHeading && subHeadingRegex.test(l.containerHeading) &&
           (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) ||
            l.href.includes('top4top.io') || l.href.includes('mediafire.com') ||
            l.href.includes('urls.mugi-subs.com') || l.href.includes('tinyurl.com') ||
@@ -394,7 +470,8 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
   // Fallback to parentContext
   if (!directSubLink) {
     for (const l of allLinks) {
-      if (subHeadingRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) || l.href.includes('top4top.io') || l.href.includes('mediafire.com'))) {
+      const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
+      if (!isRoot && subHeadingRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) || l.href.includes('top4top.io') || l.href.includes('mediafire.com'))) {
         directSubLink = l.href;
         break;
       }
@@ -441,7 +518,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null) {
   // Pick the actual subtitle/archive from that listing.
   if (directSubLink && /(?:workers\.dev|ddl\.[^/]+\/0:|\/0:|(?:subtitle|subtitles|ملفات(?:%20|\s)*الترجمة))/i.test(directSubLink) &&
       !/\.(?:ass|srt|zip|rar|7z)(?:$|[?#])/i.test(directSubLink)) {
-    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink);
+    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink, effectiveEp);
     if (resolvedFile) directSubLink = resolvedFile;
   }
 

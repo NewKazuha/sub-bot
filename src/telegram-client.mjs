@@ -2172,7 +2172,8 @@ export async function checkTelegramChannels(existingClient = null) {
           for (const { url: postPageUrl, site: matchingSite } of postPageCandidates) {
             console.log(`\n✨ [Fansub Post] "${titleLine}"`);
             console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
-            const pageData = await scrapePostPage(postPageUrl, matchingSite);
+            const targetEp = extractEpisodeNumber(titleLine);
+            const pageData = await scrapePostPage(postPageUrl, matchingSite, targetEp);
 
             if (pageData) {
               const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
@@ -2180,7 +2181,6 @@ export async function checkTelegramChannels(existingClient = null) {
 
               try {
                 let downloadedFilePath = null;
-                const targetEp = extractEpisodeNumber(titleLine);
 
                 // 1. Direct or Top4Top download
                 let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
