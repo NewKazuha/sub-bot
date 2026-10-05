@@ -379,6 +379,9 @@ export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
     .replace(/\.(mkv|mp4|ass|srt|zip|rar|7z)$/i, '')
     .trim();
 
+  // Strip temporary downloader prefixes like "mega_1791171461820_", "drive_12345_", "doc_12345_", "lazy_12345_"
+  base = base.replace(/^(?:mega|drive|lazy|doc|work|temp|sub|down|download)[-_0-9]+[-_]/i, '').trim();
+
   // Strip team tag at the start if present
   let fileTeam = '';
   const teamMatch = base.match(/^\[([^\]]+)\]/);
@@ -2227,7 +2230,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     if (megaBest && megaBest.node) {
                       if (megaBest.type === 'subtitle' || toolsAvailable) {
                         console.log(`   📥 Downloading from Mega (${megaBest.type}): ${megaBest.name}`);
-                        const tempDest = path.join(fansubWorkDir, `mega_${Date.now()}_${megaBest.name}`);
+                        const tempDest = path.join(fansubWorkDir, megaBest.name);
                         await downloadMegaNode(megaBest.node, tempDest);
                         if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
                       }
@@ -2245,7 +2248,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     if (driveBest && driveBest.directUrl) {
                       if (driveBest.type === 'subtitle' || toolsAvailable) {
                         console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
-                        const tempDest = path.join(fansubWorkDir, `drive_${Date.now()}_${driveBest.name}`);
+                        const tempDest = path.join(fansubWorkDir, driveBest.name);
                         await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
                         if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
                       }
@@ -2284,10 +2287,11 @@ export async function checkTelegramChannels(existingClient = null) {
 
                 // Process downloaded file (MKV extract or direct archive)
                 if (downloadedFilePath) {
-                  titleLine = resolveEnglishTitleIfArabic(titleLine, [downloadedFilePath], [downloadedFilePath]);
                   if (validateFileMagic(downloadedFilePath)?.isArchive) {
                     const innerFiles = listArchiveFiles(downloadedFilePath);
-                    titleLine = resolveEnglishTitleIfArabic(titleLine, [downloadedFilePath, ...innerFiles]);
+                    titleLine = resolveEnglishTitleIfArabic(titleLine, [...innerFiles, downloadedFilePath]);
+                  } else {
+                    titleLine = resolveEnglishTitleIfArabic(titleLine, [downloadedFilePath], [downloadedFilePath]);
                   }
 
                   const extracted = extractSubtitleAndFontsFromAnyFile(downloadedFilePath, fansubWorkDir, false, false, titleLine);
