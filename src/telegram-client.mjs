@@ -367,6 +367,24 @@ export function formatCleanTitle(raw) {
     .replace(/\[\+fonts?\]/gi, '')
     .trim();
   cleaned = cleaned.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
+
+  // Convert scene-release dot-separated names (e.g. "PSYREN.S01E01.CR.WEB-DL.Arabic.AR"
+  // or "[CR] PSYREN.S01E01.WEB-DL.Arabic.AR") to space-separated, preventing Telegram
+  // from treating them as clickable URLs (e.g. ".AR" = Argentina TLD).
+  // A dot-chain is 3+ dot-separated tokens with no internal spaces (scene naming).
+  const hasDotChain = /(?:^|\s)([^\s\[]+\.[^\s\[]+\.[^\s\[]+)/.test(cleaned);
+  if (hasDotChain) {
+    // Preserve text inside brackets, convert dots to spaces in dot-chains outside them
+    cleaned = cleaned.replace(/(\[[^\]]*\])|(\S+)/g, (_, bracket, word) => {
+      if (bracket) return bracket;
+      // Only convert if the word itself has 3+ dot-separated parts (scene name pattern)
+      if (word && word.split('.').length >= 3) {
+        return word.replace(/\./g, ' ');
+      }
+      return word;
+    }).replace(/\s+/g, ' ').trim();
+  }
+
   return cleaned;
 }
 
