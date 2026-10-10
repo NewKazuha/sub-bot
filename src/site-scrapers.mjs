@@ -478,7 +478,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     }
   }
 
-  // C. Find specific cloud & direct download providers (HEVC, H264, Softsub)
+  // C. Find specific cloud & direct download providers (HEVC, H264, Softsub, Buzzheavier)
   let top4top = null;
   let mediafire = null;
   let mega = null;
@@ -486,8 +486,13 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   let proton = null;
   let pixeldrain = null;
   let torrent = null;
+  let buzzheavier = null;
   let hevcLink = null;
   let h264Link = null;
+
+  if (pageUrl.toLowerCase().includes('buzzheavier.com')) {
+    buzzheavier = pageUrl;
+  }
 
   for (const l of allLinks) {
     const hrefLower = l.href.toLowerCase();
@@ -503,6 +508,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     if (hrefLower.includes('proton.me') && isSoft && !proton) proton = l.href;
     if (hrefLower.includes('pixeldrain.com') && isSoft && !pixeldrain) pixeldrain = l.href;
     if ((hrefLower.includes('.torrent') || hrefLower.includes('nyaa.si')) && !torrent) torrent = l.href;
+    if (hrefLower.includes('buzzheavier.com') && isSoft && !buzzheavier) buzzheavier = l.href;
 
     if ((textLower.includes('hevc') || textLower.includes('x265')) && isSoft && !hevcLink) hevcLink = l.href;
     if ((textLower.includes('h264') || textLower.includes('h.264') || textLower.includes('x264')) && isSoft && !h264Link) h264Link = l.href;
@@ -533,8 +539,9 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   if (resolvedLower.includes('proton.me') && !proton) proton = directSubLink;
   if (resolvedLower.includes('pixeldrain.com') && !pixeldrain) pixeldrain = directSubLink;
   if ((resolvedLower.includes('.torrent') || resolvedLower.includes('nyaa.si')) && !torrent) torrent = directSubLink;
+  if (resolvedLower.includes('buzzheavier.com') && !buzzheavier) buzzheavier = directSubLink;
 
-  const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || null);
+  const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || buzzheavier || null);
 
   return {
     title,
@@ -549,8 +556,95 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
       proton,
       pixeldrain,
       torrent,
+      buzzheavier,
       hevc: hevcLink,
       h264: h264Link
     }
   };
+}
+
+export async function resolveBuzzheavierDownloadUrl(buzzUrl) {
+  if (!buzzUrl || !buzzUrl.includes('buzzheavier.com')) return null;
+
+  try {
+    const idMatch = buzzUrl.match(/buzzheavier\.com\/([a-zA-Z0-9_-]+)/i);
+    const fileId = idMatch ? idMatch[1] : null;
+    if (!fileId) return null;
+
+    let downloadPath = null;
+    const command = process.platform === 'win32' ? 'curl.exe' : 'curl';
+
+    // 1. Fetch HTML of the buzzheavier page using curl with browser headers
+    let html = '';
+    try {
+      html = execFileSync(command, [
+        '-s', '-L',
+        '--max-time', '30',
+        '--user-agent', UA,
+        '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        '-H', 'Accept-Language: en-US,en;q=0.9',
+        buzzUrl
+      ], { encoding: 'utf8', timeout: 35000 });
+    } catch (e) {
+      console.warn(`Curl fetch error for Buzzheavier page:`, e.message);
+    }
+
+    if (html) {
+      const hxMatch = html.match(/hx-get=["']([^"']*\/download[^"']*)["']/i);
+      if (hxMatch) {
+        downloadPath = hxMatch[1];
+      } else {
+        const copyMatch = html.match(/copyDownloadLink\(['"]([^'"]+)['"]\)/i);
+        if (copyMatch) {
+          downloadPath = copyMatch[1].replace(/\\/g, '');
+        }
+      }
+    }
+
+    if (!downloadPath) {
+      downloadPath = `/${fileId}/download`;
+    }
+
+    const fullDlUrl = downloadPath.startsWith('http')
+      ? downloadPath
+      : `https://buzzheavier.com${downloadPath.startsWith('/') ? '' : '/'}${downloadPath}`;
+
+    // 2. Request the download endpoint with HX-Request: true to obtain the direct CDN URL
+    let headerText = '';
+    try {
+      headerText = execFileSync(command, [
+        '-s', '-I',
+        '--max-time', '30',
+        '--user-agent', UA,
+        '-H', 'HX-Request: true',
+        '-H', `Referer: ${buzzUrl}`,
+        fullDlUrl
+      ], { encoding: 'utf8', timeout: 35000 });
+    } catch (e) {
+      console.warn(`Curl header error for Buzzheavier download endpoint:`, e.message);
+    }
+
+    if (headerText) {
+      const hxRedirectMatch = headerText.match(/^hx-redirect:\s*(.+)$/im);
+      if (hxRedirectMatch) {
+        const redirectUrl = hxRedirectMatch[1].trim();
+        if (redirectUrl && !redirectUrl.endsWith(`/${fileId}`) && !redirectUrl.endsWith(`/${fileId}/`) && redirectUrl !== buzzUrl) {
+          return redirectUrl;
+        }
+      }
+
+      const locationMatch = headerText.match(/^location:\s*(.+)$/im);
+      if (locationMatch) {
+        const locUrl = locationMatch[1].trim();
+        if (locUrl && !locUrl.endsWith(`/${fileId}`) && !locUrl.endsWith(`/${fileId}/`) && locUrl !== buzzUrl) {
+          return locUrl;
+        }
+      }
+    }
+
+    return fullDlUrl;
+  } catch (err) {
+    console.warn(`Could not resolve Buzzheavier link ${buzzUrl}:`, err.message);
+    return null;
+  }
 }

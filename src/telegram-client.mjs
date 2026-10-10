@@ -3,13 +3,13 @@ import { StringSession } from 'telegram/sessions/index.js';
 import * as cheerio from 'cheerio';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import AdmZip from 'adm-zip';
 import SevenZip from '7zip-bin';
 import { CONFIG } from './config.mjs';
-import { scrapePostPage, resolveSubtitleFromDirectory } from './site-scrapers.mjs';
+import { scrapePostPage, resolveSubtitleFromDirectory, resolveBuzzheavierDownloadUrl } from './site-scrapers.mjs';
 import { sendDocument } from './telegram.mjs';
 import {
   findBestFileInMegaFolder,
@@ -410,11 +410,11 @@ export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
 
   // Strip quality tags, codecs, CRCs, resolutions
   base = base
-    .replace(/\[(?:1080p|720p|480p|bd|bdrip|hevc|x26[45]|aac|flac|[0-9a-f]{8})[^\]]*\]/gi, '')
-    .replace(/\((?:1080p|720p|480p|bd|bdrip|hevc|x26[45]|aac|flac|[0-9a-f]{8})[^\)]*\)/gi, '')
+    .replace(/\[[^\]]*(?:1080p|720p|480p|bd|bdrip|web(?:-dl)?|hevc|x26[45]|aac|flac|[0-9a-f]{8})[^\]]*\]/gi, '')
+    .replace(/\([^\)]*(?:1080p|720p|480p|bd|bdrip|web(?:-dl)?|hevc|x26[45]|aac|flac|[0-9a-f]{8})[^\)]*\)/gi, '')
     .replace(/\[\s*\]/g, '')
     .replace(/\(\s*\)/g, '')
-    .replace(/\)+$/g, '')
+    .replace(/[\(\)]+$/g, '')
     .trim();
 
   base = base.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -520,7 +520,8 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
 
 export function extractTeamAndFormatTitle(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const rawTitle = formatCleanTitle(lines[0] || 'Anime Release');
+  const line0 = (lines[0] || '').replace(/https?:\/\/[^\s"'<>]+/gi, '').trim();
+  const rawTitle = formatCleanTitle(line0 || 'Anime Release');
 
   if (/^\[[^\]]+\]/.test(rawTitle)) {
     return rawTitle.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
@@ -2276,7 +2277,40 @@ export async function checkTelegramChannels(existingClient = null) {
                   }
                 }
 
-                // 5. Torrent (Prioritized for speed & reliability in GitHub Actions)
+                // 5. Buzzheavier (Direct video file via HX-Redirect or token on GitHub Actions)
+                if (!downloadedFilePath && pageData.videoLinks?.buzzheavier && toolsAvailable) {
+                  console.log(`   📥 Resolving Buzzheavier: ${pageData.videoLinks.buzzheavier}`);
+                  try {
+                    const directBuzz = await resolveBuzzheavierDownloadUrl(pageData.videoLinks.buzzheavier);
+                    if (directBuzz) {
+                      console.log(`   📥 Downloading from Buzzheavier: ${directBuzz}`);
+                      const tempDest = path.join(fansubWorkDir, `buzz_${Date.now()}.mkv`);
+                      const cmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
+                      try {
+                        execFileSync(cmd, [
+                          '-s', '-L',
+                          '--max-time', '600',
+                          '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+                          '-H', `Referer: ${pageData.videoLinks.buzzheavier}`,
+                          '-o', tempDest,
+                          directBuzz
+                        ], { timeout: 650_000 });
+                        if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
+                          downloadedFilePath = tempDest;
+                        }
+                      } catch (cErr) {
+                        await downloadFileToDisk(directBuzz, tempDest, { Referer: pageData.videoLinks.buzzheavier });
+                        if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
+                          downloadedFilePath = tempDest;
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ⚠️ Buzzheavier download failed:`, e.message);
+                  }
+                }
+
+                // 6. Torrent (Prioritized for speed & reliability in GitHub Actions)
                 if (!downloadedFilePath && pageData.videoLinks?.torrent && toolsAvailable) {
                   console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
                   const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine);
