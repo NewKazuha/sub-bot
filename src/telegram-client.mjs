@@ -820,8 +820,11 @@ export function packFolderToZip(folderPath, destZipPath) {
       const fullPath = path.join(dir, item.name);
       if (item.isDirectory()) {
         addRecursive(fullPath, zipSubDir ? `${zipSubDir}/${item.name}` : item.name);
-      } else if (/\.(ass|srt|ttf|otf|woff2?)$/i.test(item.name)) {
+      } else if (/\.(ass|srt)$/i.test(item.name)) {
         zip.addLocalFile(fullPath, zipSubDir);
+      } else if (/\.(ttf|otf|woff2?|ttc)$/i.test(item.name)) {
+        const targetFontDir = zipSubDir || 'Fonts';
+        zip.addLocalFile(fullPath, targetFontDir);
       }
     }
   }
@@ -1253,7 +1256,7 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
           for (const f of fs.readdirSync(fontsDir)) {
             const fontFile = path.join(fontsDir, f);
             if (fs.statSync(fontFile).isFile()) {
-              zip.addLocalFile(fontFile);
+              zip.addLocalFile(fontFile, 'Fonts');
             }
           }
           zip.writeZip(zipPath);
