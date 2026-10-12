@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createWriteStream } from 'node:fs';
+import AdmZip from 'adm-zip';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -105,6 +106,136 @@ export async function downloadMegaNode(megaNode, destPath) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisode = null) {
+  const files = await listMegaFolder(folderUrl);
+  if (files.length === 0) return null;
+
+  console.log(`   📂 Mega folder: ${files.length} file(s) found`);
+  const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
+
+  const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
+  const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
+  const fontFiles = clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+  const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
+
+  // Helper to pack directory to zip with fonts organized in Fonts/
+  function packToZip(srcDir, zipPath) {
+    const zip = new AdmZip();
+    function addRec(dir, subDir = '') {
+      for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, item.name);
+        if (item.isDirectory()) {
+          addRec(full, subDir ? `${subDir}/${item.name}` : item.name);
+        } else if (/\.(ass|srt)$/i.test(item.name)) {
+          zip.addLocalFile(full, subDir);
+        } else if (/\.(ttf|otf|woff2?|ttc)$/i.test(item.name)) {
+          zip.addLocalFile(full, subDir || 'Fonts');
+        }
+      }
+    }
+    addRec(srcDir);
+    zip.writeZip(zipPath);
+    return zipPath;
+  }
+
+  // 1. Direct subtitle files (.ass/.srt)
+  if (subFiles.length > 0) {
+    let targetSubs = subFiles;
+    if (targetEpisode) {
+      const match = subFiles.filter(f => matchesEpisode(f.name, targetEpisode));
+      if (match.length > 0) targetSubs = match;
+    }
+
+    const isBatch = targetSubs.length > 1;
+    const hasFonts = fontFiles.length > 0;
+
+    // If multiple subtitles or fonts are present, bundle into zip archive
+    if (isBatch || hasFonts) {
+      console.log(`   📦 [Mega Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontFiles.length} font(s)). Downloading and packing to .zip...`);
+      const unpackDir = path.join(destDir, `mega_unpack_${Date.now()}`);
+      fs.mkdirSync(unpackDir, { recursive: true });
+
+      for (const sub of targetSubs) {
+        console.log(`   📥 Downloading Mega sub: ${sub.name}`);
+        await downloadMegaNode(sub.node, path.join(unpackDir, sub.name));
+      }
+
+      if (hasFonts) {
+        const fontsDir = path.join(unpackDir, 'Fonts');
+        fs.mkdirSync(fontsDir, { recursive: true });
+        for (const font of fontFiles) {
+          await downloadMegaNode(font.node, path.join(fontsDir, font.name));
+        }
+      }
+
+      const repackedZip = path.join(destDir, `mega_bundle_${Date.now()}.zip`);
+      packToZip(unpackDir, repackedZip);
+      try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch {}
+
+      return {
+        filePath: repackedZip,
+        isArchive: true,
+        hasFonts,
+        type: 'archive',
+        subNames: targetSubs.map(s => s.name)
+      };
+    }
+
+    // Single subtitle without fonts: download directly as naked subtitle
+    const singleSub = targetSubs[0];
+    console.log(`   📥 Downloading single Mega subtitle: ${singleSub.name}`);
+    const destPath = path.join(destDir, singleSub.name);
+    await downloadMegaNode(singleSub.node, destPath);
+    return {
+      filePath: destPath,
+      isArchive: false,
+      hasFonts: false,
+      type: 'subtitle',
+      subNames: [singleSub.name]
+    };
+  }
+
+  // 2. Archive files (.zip/.rar/.7z)
+  if (arcFiles.length > 0) {
+    let chosen = arcFiles[arcFiles.length - 1];
+    if (targetEpisode) {
+      const match = arcFiles.find(f => matchesEpisode(f.name, targetEpisode));
+      if (match) chosen = match;
+    }
+    console.log(`   📦 Mega: found archive: ${chosen.name}`);
+    const destPath = path.join(destDir, chosen.name);
+    await downloadMegaNode(chosen.node, destPath);
+    return {
+      filePath: destPath,
+      isArchive: true,
+      hasFonts: null,
+      type: 'archive',
+      subNames: [chosen.name]
+    };
+  }
+
+  // 3. Softsub MKV files
+  if (mkvFiles.length > 0) {
+    let chosen = mkvFiles[mkvFiles.length - 1];
+    if (targetEpisode) {
+      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
+      if (match) chosen = match;
+    }
+    console.log(`   🎬 Mega: found MKV: ${chosen.name}`);
+    const destPath = path.join(destDir, chosen.name);
+    await downloadMegaNode(chosen.node, destPath);
+    return {
+      filePath: destPath,
+      isArchive: false,
+      hasFonts: false,
+      type: 'mkv',
+      subNames: [chosen.name]
+    };
+  }
+
+  return null;
 }
 
 export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null) {

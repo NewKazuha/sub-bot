@@ -14,6 +14,7 @@ import { sendDocument } from './telegram.mjs';
 import {
   findBestFileInMegaFolder,
   downloadMegaNode,
+  downloadMegaFolderRelease,
   findBestFileInMediafire,
   findBestFileInDrive,
   resolveMediafireDirectDownload
@@ -393,9 +394,20 @@ export function isOfficialPlatformRelease(title) {
 }
 
 export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
+  // Reject font files, images, text/info files, or anything inside a fonts folder
+  if (/\.(?:ttf|otf|woff2?|ttc|png|jpe?g|bmp|gif|txt|nfo|url|lnk)$/i.test(fileName)) {
+    return null;
+  }
+  if (/(?:^|[\\/])fonts?[\\/]/i.test(fileName)) {
+    return null;
+  }
+
   let base = path.basename(fileName)
     .replace(/\.(mkv|mp4|ass|srt|zip|rar|7z)$/i, '')
     .trim();
+
+  // Strip trailing language tags like .ARA, .Arabic, .AR
+  base = base.replace(/\.(?:ara|arabic|ar)$/i, '').trim();
 
   // Strip temporary downloader prefixes like "mega_1791171461820_", "drive_12345_", "doc_12345_", "lazy_12345_"
   base = base.replace(/^(?:mega|drive|lazy|doc|work|temp|sub|down|download)[-_0-9]+[-_]/i, '').trim();
@@ -421,6 +433,7 @@ export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
   base = base.replace(/\s*(?:ep|e|#)\s*(\d{1,4})/gi, ' - $1');
   base = base.replace(/\s*-\s*(\d{1,4})/g, ' - $1');
   base = base.replace(/([a-zA-Z])\s+(\d{1,4})(?:\s*END)?$/i, '$1 - $2');
+  base = base.replace(/\s+(?:ara|arabic|ar)\s*$/i, '').trim();
   base = base.replace(/\s+/g, ' ').trim();
 
   const hasEnglish = /[a-zA-Z]/.test(base);
@@ -447,9 +460,6 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
 
   const titleNoTeam = rawTitle.replace(/^\[[^\]]+\]\s*/, '').trim();
   const isArabic = /[\u0600-\u06FF\u0750-\u077F]/.test(titleNoTeam);
-  if (!isArabic) {
-    return team ? `[${team}] ${titleNoTeam}` : rawTitle;
-  }
 
   const origEp = extractEpisodeNumber(rawTitle);
 
@@ -462,13 +472,36 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
       if (typeof fn === 'string' && fs.existsSync(fn) && validateFileMagic(fn)?.isArchive) {
         isArc = true;
         const innerFiles = listArchiveFiles(fn);
-        // Prioritize .ass and .srt files inside archive
-        const innerSubs = innerFiles.filter(f => /\.(ass|srt)$/i.test(f));
-        const otherInner = innerFiles.filter(f => !/\.(ass|srt)$/i.test(f));
+        // Prioritize .ass and .srt files inside archive, exclude font files
+        const innerSubs = innerFiles.filter(f => /\.(ass|srt)$/i.test(f) && !/(?:^|[\\/])fonts?[\\/]/i.test(f));
+        const otherInner = innerFiles.filter(f => !/\.(ass|srt)$/i.test(f) && !/\.(ttf|otf|woff2?|ttc|png|jpg|txt)$/i.test(f) && !/(?:^|[\\/])fonts?[\\/]/i.test(f));
         candidateNames.push(...innerSubs, ...otherInner);
       }
     } catch {}
-    if (!isArc) candidateNames.push(fn);
+    if (!isArc) {
+      if (!/\.(ttf|otf|woff2?|ttc|png|jpg|txt)$/i.test(fn) && !/(?:^|[\\/])fonts?[\\/]/i.test(fn)) {
+        candidateNames.push(fn);
+      }
+    }
+  }
+
+  // Detect batch episodes from candidate subtitle files
+  const candidateSubs = candidateNames.filter(f => /\.(ass|srt)$/i.test(f));
+  const epNumbers = new Set();
+  for (const sub of candidateSubs) {
+    const ep = extractEpisodeNumber(path.basename(sub));
+    if (ep) epNumbers.add(parseInt(ep, 10));
+  }
+  const uniqueEps = Array.from(epNumbers).sort((a, b) => a - b);
+  const isMultiEpBatch = uniqueEps.length > 1;
+  const batchRangeStr = isMultiEpBatch ? `[${String(uniqueEps[0]).padStart(2, '0')}~${String(uniqueEps[uniqueEps.length - 1]).padStart(2, '0')}]` : '';
+
+  if (!isArabic) {
+    let baseEnglish = team ? `[${team}] ${titleNoTeam}` : rawTitle;
+    if (isMultiEpBatch && !/(?:\[\s*\d+\s*[~-]\s*\d+\s*\]|\d+\s*[~-]\s*\d+)/.test(baseEnglish)) {
+      baseEnglish = `${baseEnglish} ${batchRangeStr}`;
+    }
+    return baseEnglish;
   }
 
   // Check candidate file names
@@ -476,7 +509,10 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
     if (!fn) continue;
     let resolved = cleanEnglishTitleFromFilename(fn, team);
     if (resolved) {
-      if (origEp) {
+      if (isMultiEpBatch) {
+        resolved = resolved.replace(/\s*-\s*\d{1,4}$/, '').trim();
+        resolved = `${resolved} ${batchRangeStr}`;
+      } else if (origEp) {
         const resolvedEp = extractEpisodeNumber(resolved);
         if (!resolvedEp) {
           resolved = `${resolved} - ${origEp.padStart(2, '0')}`;
@@ -500,7 +536,10 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
           if (!/^(?:untitled|default\s+aegisub|script|extracted)/i.test(t)) {
             let resolved = cleanEnglishTitleFromFilename(t, team);
             if (resolved) {
-              if (origEp) {
+              if (isMultiEpBatch) {
+                resolved = resolved.replace(/\s*-\s*\d{1,4}$/, '').trim();
+                resolved = `${resolved} ${batchRangeStr}`;
+              } else if (origEp) {
                 const resolvedEp = extractEpisodeNumber(resolved);
                 if (!resolvedEp) {
                   resolved = `${resolved} - ${origEp.padStart(2, '0')}`;
@@ -1170,6 +1209,13 @@ function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = fals
           if (subFiles[0] !== renamedPath) {
             safeMoveFile(subFiles[0], renamedPath);
           }
+          const repackedZip = path.join(workDir, 'repacked_release.zip');
+          packFolderToZip(arcUnpackDir, repackedZip);
+          if (fs.existsSync(repackedZip) && fs.statSync(repackedZip).size > 100) {
+            return { filePath: repackedZip, isArchive: true, ext: '.zip', resolvedTitle: customSubName };
+          }
+        } else if (subFiles.length > 1) {
+          // Multi-episode batch archive: repack with packFolderToZip to ensure fonts are in Fonts/
           const repackedZip = path.join(workDir, 'repacked_release.zip');
           packFolderToZip(arcUnpackDir, repackedZip);
           if (fs.existsSync(repackedZip) && fs.statSync(repackedZip).size > 100) {
@@ -2248,14 +2294,9 @@ export async function checkTelegramChannels(existingClient = null) {
                 if (!downloadedFilePath && pageData.videoLinks?.mega) {
                   console.log(`   📥 Resolving Mega: ${pageData.videoLinks.mega}`);
                   try {
-                    const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega, targetEp);
-                    if (megaBest && megaBest.node) {
-                      if (megaBest.type === 'subtitle' || toolsAvailable) {
-                        console.log(`   📥 Downloading from Mega (${megaBest.type}): ${megaBest.name}`);
-                        const tempDest = path.join(fansubWorkDir, megaBest.name);
-                        await downloadMegaNode(megaBest.node, tempDest);
-                        if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
-                      }
+                    const megaRelease = await downloadMegaFolderRelease(pageData.videoLinks.mega, fansubWorkDir, targetEp);
+                    if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
+                      downloadedFilePath = megaRelease.filePath;
                     }
                   } catch (e) {
                     console.warn(`   ⚠️ Mega JS download failed:`, e.message);
