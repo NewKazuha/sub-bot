@@ -209,6 +209,16 @@ export function extractEpisodeNumber(text) {
   if (!text) return '';
   const cleaned = text.replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '');
 
+  // Range matching: "01-12", "01~03", "01 to 12" -> ranges are batches, not single episodes
+  const rangeMatch = cleaned.match(/(\d{1,4})\s*(?:[-&~–]|to|and)\s*(\d{1,4})/i);
+  if (rangeMatch) {
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    if (!isNaN(start) && !isNaN(end) && start < end && end - start <= 100) {
+      return '';
+    }
+  }
+
   for (const item of ARABIC_EPISODE_WORDS) {
     if (item.p.test(cleaned)) return item.ep;
   }
