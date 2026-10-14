@@ -77,7 +77,7 @@ jobs:
           git push origin main || true
 
       - name: Chain next monitoring run
-        if: always()
+        if: success()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
