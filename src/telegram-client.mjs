@@ -1391,7 +1391,7 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
 // ====================================================================
 export async function publishDocument(client, filePath, caption, options = {}) {
   const fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
-  const FILE_SIZE_BOT_API_LIMIT = 20 * 1024 * 1024; // 20 MB – skip Bot API for larger files
+  const FILE_SIZE_BOT_API_LIMIT = 50 * 1024 * 1024; // 50 MB (official Bot API document limit)
 
   // 1. Try standard Telegram Bot API for small files
   if (CONFIG.TELEGRAM.BOT_TOKEN && fileSize <= FILE_SIZE_BOT_API_LIMIT) {

@@ -1,5 +1,7 @@
 import * as cheerio from 'cheerio';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -28,6 +30,27 @@ function fetchHtmlWithCurl(url, cookieHeader = '') {
     timeout: 65_000,
     maxBuffer: 10 * 1024 * 1024
   });
+}
+
+export function fetchHtmlWithImpersonation(url, cookieHeader = '') {
+  try {
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const scriptPath = path.resolve('scripts/cf_fetch.py');
+    if (!fs.existsSync(scriptPath)) return null;
+    const args = [scriptPath, url];
+    if (cookieHeader) args.push('--cookie', cookieHeader);
+    const result = execFileSync(pythonCmd, args, {
+      encoding: 'utf8',
+      timeout: 45_000,
+      maxBuffer: 10 * 1024 * 1024
+    });
+    if (result && result.length > 500) {
+      return result;
+    }
+  } catch (e) {
+    console.warn(`   ⚠️ curl_cffi impersonation failed for ${url}:`, e.message);
+  }
+  return null;
 }
 
 class SessionJar {
@@ -382,23 +405,41 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   const effectiveEp = targetEp || (pageUrl.match(/[-_](\d{1,4})(?:\.html)?$/i)?.[1]) || null;
 
   let html = '';
-  try {
-    const res = await fetchWithTimeout(pageUrl, {
-      headers: { 'User-Agent': UA, 'Cookie': cookieHeader }
-    });
-    html = await res.text();
-  } catch (e) {
-    if (siteConfig && isCertificateValidationError(e)) {
-      try {
-        console.warn(`Node TLS validation failed for ${siteConfig.name}; using the system CA bundle.`);
-        html = fetchHtmlWithCurl(pageUrl, cookieHeader);
-      } catch (curlError) {
-        console.error(`Failed to fetch ${siteConfig.name} page with system CA bundle: ${pageUrl}`, curlError.message);
+  // Revive Subs is behind Cloudflare which blocks datacenter IPs.
+  // Use curl_cffi with Chrome impersonation if available.
+  if (siteConfig?.id === 'revive' || (siteConfig?.base && siteConfig.base.includes('revivesubs'))) {
+    const cfHtml = fetchHtmlWithImpersonation(pageUrl, cookieHeader);
+    if (cfHtml) {
+      console.log(`   🛡️ Successfully bypassed Cloudflare for ${siteConfig.name} via curl_cffi!`);
+      html = cfHtml;
+    }
+  }
+
+  if (!html) {
+    try {
+      const res = await fetchWithTimeout(pageUrl, {
+        headers: { 'User-Agent': UA, 'Cookie': cookieHeader }
+      });
+      html = await res.text();
+      // If Cloudflare challenge returned (challenge page / 403 / 503), try impersonation fallback
+      if (html.includes('Just a moment...') || html.includes('cf-chl-') || res.status === 403 || res.status === 503) {
+        console.log(`   🛡️ Cloudflare challenge detected (${res.status}), attempting curl_cffi fallback...`);
+        const cfHtml = fetchHtmlWithImpersonation(pageUrl, cookieHeader);
+        if (cfHtml) html = cfHtml;
+      }
+    } catch (e) {
+      if (siteConfig && isCertificateValidationError(e)) {
+        try {
+          console.warn(`Node TLS validation failed for ${siteConfig.name}; using the system CA bundle.`);
+          html = fetchHtmlWithCurl(pageUrl, cookieHeader);
+        } catch (curlError) {
+          console.error(`Failed to fetch ${siteConfig.name} page with system CA bundle: ${pageUrl}`, curlError.message);
+          return null;
+        }
+      } else {
+        console.error(`Failed to fetch page: ${pageUrl}`, e.message);
         return null;
       }
-    } else {
-    console.error(`Failed to fetch page: ${pageUrl}`, e.message);
-    return null;
     }
   }
 
