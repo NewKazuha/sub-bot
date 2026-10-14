@@ -272,6 +272,23 @@ export function getCanonicalAnimeKey(title) {
   return null;
 }
 
+export function extractBatchRange(title) {
+  if (!title) return null;
+  // 1. Tilde is unambiguous range (e.g. 001~005, 01~13, 01 ~ 13)
+  let m = title.match(/(\d{1,4})\s*~\s*(\d{1,4})/);
+  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+
+  // 2. Bracketed range (e.g. [01 - 13], [01-13 END])
+  m = title.match(/\[\s*(\d{1,4})\s*[-~]\s*(\d{1,4})\s*(?:END)?\s*\]/i);
+  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+
+  // 3. Trailing range at end of string or before quality tags
+  m = title.match(/(?:^|\s)\b(\d{1,4})\s*-\s*(\d{1,4})\b(?:\s*END)?(?:\s*\[|\s*$)/i);
+  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+
+  return null;
+}
+
 export function getReleaseKeys(title, isOfficial = false) {
   const fullNorm = title
     .toLowerCase()
@@ -293,6 +310,22 @@ export function getReleaseKeys(title, isOfficial = false) {
 
   if (canonName && epNum) {
     keys.push(`canon_${canonName}_ep_${epNum}`);
+  }
+
+  // Batch episode normalization (e.g. 001~005, 01~05, 1~5, 01-13)
+  const batchRange = extractBatchRange(title);
+  if (batchRange) {
+    const [s, e] = batchRange;
+    const batchStripRegex = new RegExp(`(?:_0*${s})?_0*${e}(?:_end)?$`, 'i');
+    const animeNameOnly = (coreKey || '').replace(batchStripRegex, '').replace(/^_+|_+$/g, '');
+    if (animeNameOnly) {
+      keys.push(`${animeNameOnly}_batch_${s}_${e}`);
+      keys.push(`${animeNameOnly}_batch_${String(s).padStart(2, '0')}_${String(e).padStart(2, '0')}`);
+      if (canonName) {
+        keys.push(`canon_${canonName}_batch_${s}_${e}`);
+        keys.push(`canon_${canonName}_batch_${String(s).padStart(2, '0')}_${String(e).padStart(2, '0')}`);
+      }
+    }
   }
 
   // Generate prefix token keys from core anime words to bridge novel titles and short titles
@@ -381,6 +414,17 @@ export function getFansubReleaseKeys(title) {
   const canonName = getCanonicalAnimeKey(title);
   const epNum = extractEpisodeNumber(title);
 
+  // Batch episode normalization (e.g. 001~005, 01~05, 1~5, 01-13)
+  const batchRange = extractBatchRange(title);
+  let batchStart = null;
+  let batchEnd = null;
+  let animeNameOnly = coreKey || '';
+  if (batchRange) {
+    [batchStart, batchEnd] = batchRange;
+    const batchStripRegex = new RegExp(`(?:_0*${batchStart})?_0*${batchEnd}(?:_end)?$`, 'i');
+    animeNameOnly = animeNameOnly.replace(batchStripRegex, '').replace(/^_+|_+$/g, '');
+  }
+
   const keys = [];
   for (const tKey of allTeamKeys) {
     keys.push(`fansub_${tKey}_${fullNorm}`);
@@ -389,6 +433,14 @@ export function getFansubReleaseKeys(title) {
     }
     if (epNum && (canonName || coreKey)) {
       keys.push(`fansub_${tKey}_${canonName || coreKey}_ep_${epNum}`);
+    }
+    if (batchStart !== null && batchEnd !== null && animeNameOnly) {
+      keys.push(`fansub_${tKey}_${animeNameOnly}_batch_${batchStart}_${batchEnd}`);
+      keys.push(`fansub_${tKey}_${animeNameOnly}_batch_${String(batchStart).padStart(2, '0')}_${String(batchEnd).padStart(2, '0')}`);
+      if (canonName) {
+        keys.push(`fansub_${tKey}_${canonName}_batch_${batchStart}_${batchEnd}`);
+        keys.push(`fansub_${tKey}_${canonName}_batch_${String(batchStart).padStart(2, '0')}_${String(batchEnd).padStart(2, '0')}`);
+      }
     }
   }
 
@@ -1538,7 +1590,7 @@ export async function checkTelegramChannels(existingClient = null) {
     // Sync existing target channel history into posted set to eliminate any duplicates
     try {
       const targetChatId = CONFIG.TELEGRAM.TARGET_CHANNEL;
-      const targetMsgs = await client.getMessages(targetChatId, { limit: 100 });
+      const targetMsgs = await client.getMessages(targetChatId, { limit: 300 });
       for (const tm of targetMsgs) {
         const text = tm.message || '';
         const firstLine = text.split('\n')[0].trim();
@@ -1552,6 +1604,7 @@ export async function checkTelegramChannels(existingClient = null) {
           if (fn) {
             getReleaseKeys(fn, true).forEach(k => posted.add(k));
             getReleaseKeys(fn, false).forEach(k => posted.add(k));
+            getFansubReleaseKeys(fn).forEach(k => posted.add(k));
           }
         }
       }
