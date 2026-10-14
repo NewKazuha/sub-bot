@@ -569,30 +569,36 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
       const unpackDir = path.join(destDir, `drive_unpack_${Date.now()}`);
       fs.mkdirSync(unpackDir, { recursive: true });
 
-      for (const sub of targetSubs) {
+      await Promise.all(targetSubs.map(async (sub) => {
         console.log(`   📥 Downloading Drive sub: ${sub.name}`);
         const subDest = path.join(unpackDir, sub.name);
         const subUrl = getDriveDirectUrl(sub.id);
-        const res = await fetchWithTimeout(subUrl);
-        if (res.ok) {
-          const buf = Buffer.from(await res.arrayBuffer());
-          fs.writeFileSync(subDest, buf);
-        }
-      }
+        try {
+          const res = await fetchWithTimeout(subUrl, {}, 30_000);
+          if (res.ok) {
+            const buf = Buffer.from(await res.arrayBuffer());
+            fs.writeFileSync(subDest, buf);
+          }
+        } catch {}
+      }));
 
       if (hasFonts) {
         const fontsDir = path.join(unpackDir, 'Fonts');
         fs.mkdirSync(fontsDir, { recursive: true });
-        for (const font of fontFiles) {
-          const fontDest = path.join(fontsDir, font.name);
-          const fontUrl = getDriveDirectUrl(font.id);
-          try {
-            const res = await fetchWithTimeout(fontUrl);
-            if (res.ok) {
-              const buf = Buffer.from(await res.arrayBuffer());
-              fs.writeFileSync(fontDest, buf);
-            }
-          } catch {}
+        const BATCH_SIZE = 10;
+        for (let i = 0; i < fontFiles.length; i += BATCH_SIZE) {
+          const chunk = fontFiles.slice(i, i + BATCH_SIZE);
+          await Promise.all(chunk.map(async (font) => {
+            const fontDest = path.join(fontsDir, font.name);
+            const fontUrl = getDriveDirectUrl(font.id);
+            try {
+              const res = await fetchWithTimeout(fontUrl, {}, 30_000);
+              if (res.ok) {
+                const buf = Buffer.from(await res.arrayBuffer());
+                fs.writeFileSync(fontDest, buf);
+              }
+            } catch {}
+          }));
         }
       }
 
