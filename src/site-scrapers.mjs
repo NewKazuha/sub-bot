@@ -78,6 +78,19 @@ async function ensureSiteSession(siteConfig) {
     }
   }
 
+  // 0.1 Manual CELESTIAL_COOKIE from environment / GitHub Secrets (bypasses Google reCAPTCHA v3)
+  if (siteConfig.id === 'celestial' || (siteConfig.base && siteConfig.base.includes('celestial-dragons'))) {
+    const rawCookie = process.env.CELESTIAL_COOKIE;
+    if (rawCookie) {
+      console.log(`   🔑 Using manual CELESTIAL_COOKIE for ${siteConfig.name}`);
+      for (const pair of rawCookie.split(';')) {
+        const eq = pair.indexOf('=');
+        if (eq > 0) jar.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+      }
+      return jar;
+    }
+  }
+
   if (!siteConfig.user || !siteConfig.pass) return null;
 
   // 1. Check if site is Laravel / Custom Auth (e.g. Revive Subs)
@@ -361,7 +374,7 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
 
 export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null) {
   let cookieHeader = '';
-  if (siteConfig && (siteConfig.user || process.env.REVIVE_COOKIE)) {
+  if (siteConfig && (siteConfig.user || process.env.REVIVE_COOKIE || process.env.CELESTIAL_COOKIE)) {
     const jar = await ensureSiteSession(siteConfig);
     if (jar) cookieHeader = jar.header();
   }

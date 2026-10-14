@@ -54,6 +54,7 @@ jobs:
           LAZYSANO_PASS: ${{ secrets.LAZYSANO_PASS }}
           CELESTIAL_USER: ${{ secrets.CELESTIAL_USER }}
           CELESTIAL_PASS: ${{ secrets.CELESTIAL_PASS }}
+          CELESTIAL_COOKIE: ${{ secrets.CELESTIAL_COOKIE }}
           REVIVE_USER: ${{ secrets.REVIVE_USER }}
           REVIVE_PASS: ${{ secrets.REVIVE_PASS }}
           REVIVE_COOKIE: ${{ secrets.REVIVE_COOKIE }}

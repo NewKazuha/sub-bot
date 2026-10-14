@@ -131,6 +131,7 @@ export function packToZip(srcDir, zipPath) {
 export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisode = null) {
   const files = await listMegaFolder(folderUrl);
   if (files.length === 0) return null;
+  fs.mkdirSync(destDir, { recursive: true });
 
   console.log(`   📂 Mega folder: ${files.length} file(s) found`);
   const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
@@ -527,6 +528,7 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null) {
 export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpisode = null, fontsUrl = null, rawTitle = '') {
   const files = await listDriveFolder(folderUrl);
   if (files.length === 0) return null;
+  fs.mkdirSync(destDir, { recursive: true });
 
   console.log(`   📂 Google Drive folder: ${files.length} file(s) found`);
   const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
