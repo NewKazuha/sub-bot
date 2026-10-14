@@ -237,6 +237,14 @@ export function getCoreAnimeEpisodeKey(title) {
     .toLowerCase()
     .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
     .replace(/^\[[^\]]+\]\s*/, '')
+    .replace(/\b(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\b/gi, '')
+    .replace(/\[\s*(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\s*\]/gi, '')
+    .replace(/\b(?:end|ending|final|مكتمل)\b/gi, '')
+    .replace(/\bii\b/gi, '2')
+    .replace(/\biii\b/gi, '3')
+    .replace(/\biv\b/gi, '4')
+    .replace(/\bv\b/gi, '5')
+    .replace(/\bvi\b/gi, '6')
     .replace(/Ⅱ/g, '2')
     .replace(/Ⅲ/g, '3')
     .replace(/Ⅳ/g, '4')
@@ -339,6 +347,14 @@ export function getFansubReleaseKeys(title) {
   const fullNorm = title
     .toLowerCase()
     .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
+    .replace(/\b(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\b/gi, '')
+    .replace(/\[\s*(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\s*\]/gi, '')
+    .replace(/\b(?:end|ending|final|مكتمل)\b/gi, '')
+    .replace(/\bii\b/gi, '2')
+    .replace(/\biii\b/gi, '3')
+    .replace(/\biv\b/gi, '4')
+    .replace(/\bv\b/gi, '5')
+    .replace(/\bvi\b/gi, '6')
     .replace(/Ⅱ/g, '2')
     .replace(/Ⅲ/g, '3')
     .replace(/Ⅳ/g, '4')
@@ -346,18 +362,34 @@ export function getFansubReleaseKeys(title) {
     .replace(/Ⅵ/g, '6')
     .replace(/[^\p{L}\p{N}]+/gu, '_')
     .replace(/^_+|_+$/g, '');
+
   const teamMatch = title.match(/^\[([^\]]+)\]/);
-  const teamKey = (teamMatch?.[1] || 'unknown')
+  const rawTeam = teamMatch?.[1] || 'unknown';
+  const teamKey = rawTeam
     .toLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, '_')
     .replace(/^_+|_+$/g, '');
+
+  // Support joint teams like "Revive & Rhythm", "A & B", "A x B", "A + B"
+  const subTeams = rawTeam
+    .split(/\s*(?:&|\+|x|\band\b|\bwith\b|\bو\b)\s*/i)
+    .map(t => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, ''))
+    .filter(Boolean);
+
+  const allTeamKeys = Array.from(new Set([teamKey, ...subTeams].filter(Boolean)));
   const coreKey = getCoreAnimeEpisodeKey(title);
   const canonName = getCanonicalAnimeKey(title);
   const epNum = extractEpisodeNumber(title);
-  const keys = [`fansub_${teamKey}_${fullNorm}`];
 
-  if (epNum && (canonName || coreKey)) {
-    keys.push(`fansub_${teamKey}_${canonName || coreKey}_ep_${epNum}`);
+  const keys = [];
+  for (const tKey of allTeamKeys) {
+    keys.push(`fansub_${tKey}_${fullNorm}`);
+    if (coreKey) {
+      keys.push(`fansub_${tKey}_${coreKey}`);
+    }
+    if (epNum && (canonName || coreKey)) {
+      keys.push(`fansub_${tKey}_${canonName || coreKey}_ep_${epNum}`);
+    }
   }
 
   return Array.from(new Set(keys.filter(Boolean)));
@@ -508,6 +540,39 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
   const uniqueEps = Array.from(epNumbers).sort((a, b) => a - b);
   const isMultiEpBatch = uniqueEps.length > 1;
   const batchRangeStr = isMultiEpBatch ? `[${String(uniqueEps[0]).padStart(2, '0')}~${String(uniqueEps[uniqueEps.length - 1]).padStart(2, '0')}]` : '';
+  // Detect joint teams from candidate file names (e.g. [Revive & Rhythm] inside archive or ASS)
+  for (const fn of candidateNames) {
+    const baseFn = path.basename(fn);
+    const m = baseFn.match(/^\[([^\]]+)\]/);
+    if (m) {
+      const fnTeam = m[1].trim();
+      if (/(?:&|\+|x|\band\b|\bwith\b|\bو\b)/i.test(fnTeam)) {
+        console.log(`   🤝 Detected joint team from file: [${fnTeam}]`);
+        team = fnTeam;
+        break;
+      }
+    }
+  }
+
+  // Also inspect ASS headers for joint team attribution
+  for (const p of assContentPaths) {
+    if (!p || !fs.existsSync(p)) continue;
+    try {
+      const content = fs.readFileSync(p, 'utf8');
+      const lines = content.slice(0, 3000).split('\n');
+      for (const line of lines) {
+        const m = line.match(/^Title:\s*(.+)/i);
+        if (m) {
+          const tMatch = m[1].match(/^\[([^\]]+)\]/);
+          if (tMatch && /(?:&|\+|x|\band\b|\bwith\b|\bو\b)/i.test(tMatch[1])) {
+            console.log(`   🤝 Detected joint team from ASS Title: [${tMatch[1]}]`);
+            team = tMatch[1].trim();
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
 
   if (!isArabic) {
     let baseEnglish = team ? `[${team}] ${titleNoTeam}` : rawTitle;
