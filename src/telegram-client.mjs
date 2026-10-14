@@ -1667,22 +1667,8 @@ export async function checkTelegramChannels(existingClient = null) {
         for (const msg of msgs) {
           const msgKey = `tg_${chat.id}_${msg.id}`;
           const text = msg.message || '';
-          const subdlTitle = (isKokoboko || isRengoku)
-            ? formatCleanTitle(text.split('\n').map(l => l.trim()).find(Boolean) || '')
-            : '';
-          const isFansubSubdl = Boolean(subdlTitle) && /subdl\.com\/s\/info\//i.test(text) && !isOfficialPlatformRelease(subdlTitle);
-          const retryFansubTitle = isFansubPublisher
-            ? extractTeamAndFormatTitle(text)
-            : subdlTitle;
-
           if (posted.has(msgKey)) {
-            // Older releases were recorded with broad cross-source keys. A
-            // source message marked by that old logic must be retried unless
-            // its team-specific release key is present from the target channel.
-            if (!(isFansubPublisher || isFansubSubdl) || isReleaseAlreadyPosted(posted, getFansubReleaseKeys(retryFansubTitle))) {
-              continue;
-            }
-            console.log(`   🔁 Retrying previously skipped fansub message ${msg.id} with team-scoped deduplication.`);
+            continue;
           }
 
           // ==============================================================
