@@ -1662,7 +1662,7 @@ export async function checkTelegramChannels(existingClient = null) {
         // Sources can publish a batch far larger than one scheduled interval.
         // Keep enough history to retry a failed batch instead of losing it once
         // newer messages push it beyond the old 15-message window.
-        const msgs = await client.getMessages(chat.id, { limit: 100 });
+        const msgs = await client.getMessages(chat.id, { limit: 250 });
 
         for (const msg of msgs) {
           const msgKey = `tg_${chat.id}_${msg.id}`;
