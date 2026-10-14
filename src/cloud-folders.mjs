@@ -92,20 +92,42 @@ export async function listMegaFolder(folderUrl) {
 }
 
 export async function downloadMegaNode(megaNode, destPath) {
-  const dlStream = megaNode.download();
-  const fileStream = createWriteStream(destPath);
-  const timeout = setTimeout(() => {
-    const err = new Error(`Mega download timed out after ${MEGA_DOWNLOAD_TIMEOUT_MS / 60_000} minutes`);
-    dlStream.destroy(err);
-    fileStream.destroy(err);
-  }, MEGA_DOWNLOAD_TIMEOUT_MS);
+  return new Promise((resolve, reject) => {
+    const dlStream = megaNode.download();
+    const fileStream = createWriteStream(destPath);
 
-  try {
-    await pipeline(dlStream, fileStream);
-    return destPath;
-  } finally {
-    clearTimeout(timeout);
-  }
+    const timeout = setTimeout(() => {
+      const err = new Error(`Mega download timed out after ${MEGA_DOWNLOAD_TIMEOUT_MS / 60_000} minutes`);
+      dlStream.destroy(err);
+      fileStream.destroy(err);
+      reject(err);
+    }, MEGA_DOWNLOAD_TIMEOUT_MS);
+
+    dlStream.on('data', chunk => {
+      const canContinue = fileStream.write(chunk);
+      if (!canContinue) {
+        dlStream.pause();
+        fileStream.once('drain', () => dlStream.resume());
+      }
+    });
+
+    dlStream.on('end', () => {
+      clearTimeout(timeout);
+      fileStream.end(resolve);
+    });
+
+    dlStream.on('error', err => {
+      clearTimeout(timeout);
+      fileStream.destroy(err);
+      reject(err);
+    });
+
+    fileStream.on('error', err => {
+      clearTimeout(timeout);
+      dlStream.destroy(err);
+      reject(err);
+    });
+  }).then(() => destPath);
 }
 
 // Helper to pack directory to zip with fonts organized in Fonts/

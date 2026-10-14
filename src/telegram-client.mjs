@@ -1196,7 +1196,7 @@ function hasRequiredTools() {
 // Extraction rule:
 // If isOfficial = true (e.g. Erai-Raws), strictly extract .ass ONLY, NO fonts, NO zip.
 // If isOfficial = false (e.g. Fansub), extract fonts and zip into [+Fonts].zip if fonts present.
-function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = false, preferArabic = false, customSubName = '') {
+export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial = false, preferArabic = false, customSubName = '') {
   if (!fs.existsSync(filePath)) return null;
 
   // 1. Direct valid archive or subtitle file
