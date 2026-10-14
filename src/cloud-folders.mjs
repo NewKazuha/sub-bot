@@ -108,6 +108,26 @@ export async function downloadMegaNode(megaNode, destPath) {
   }
 }
 
+// Helper to pack directory to zip with fonts organized in Fonts/
+export function packToZip(srcDir, zipPath) {
+  const zip = new AdmZip();
+  function addRec(dir, subDir = '') {
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, item.name);
+      if (item.isDirectory()) {
+        addRec(full, subDir ? `${subDir}/${item.name}` : item.name);
+      } else if (/\.(ass|srt)$/i.test(item.name)) {
+        zip.addLocalFile(full, subDir);
+      } else if (/\.(ttf|otf|woff2?|ttc)$/i.test(item.name)) {
+        zip.addLocalFile(full, subDir || 'Fonts');
+      }
+    }
+  }
+  addRec(srcDir);
+  zip.writeZip(zipPath);
+  return zipPath;
+}
+
 export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisode = null) {
   const files = await listMegaFolder(folderUrl);
   if (files.length === 0) return null;
@@ -119,26 +139,6 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
   const fontFiles = clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
   const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
-
-  // Helper to pack directory to zip with fonts organized in Fonts/
-  function packToZip(srcDir, zipPath) {
-    const zip = new AdmZip();
-    function addRec(dir, subDir = '') {
-      for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, item.name);
-        if (item.isDirectory()) {
-          addRec(full, subDir ? `${subDir}/${item.name}` : item.name);
-        } else if (/\.(ass|srt)$/i.test(item.name)) {
-          zip.addLocalFile(full, subDir);
-        } else if (/\.(ttf|otf|woff2?|ttc)$/i.test(item.name)) {
-          zip.addLocalFile(full, subDir || 'Fonts');
-        }
-      }
-    }
-    addRec(srcDir);
-    zip.writeZip(zipPath);
-    return zipPath;
-  }
 
   // 1. Direct subtitle files (.ass/.srt)
   if (subFiles.length > 0) {
@@ -388,7 +388,8 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null) {
 // ====================================================================
 
 export function isDriveFolderUrl(url) {
-  return /drive\.google\.com\/(?:drive\/)?folders\//i.test(url);
+  if (!url) return false;
+  return /(?:drive|docs)\.google\.com\/(?:drive\/)?(?:folders\/|folderview\?id=)/i.test(url);
 }
 
 export function extractDriveFileId(url) {
@@ -522,3 +523,135 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null) {
 
   return null;
 }
+
+export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpisode = null, fontsUrl = null, rawTitle = '') {
+  const files = await listDriveFolder(folderUrl);
+  if (files.length === 0) return null;
+
+  console.log(`   📂 Google Drive folder: ${files.length} file(s) found`);
+  const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
+
+  const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
+  const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
+  let fontFiles = clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+
+  // If a separate fonts folder URL is provided
+  if (fontsUrl && isDriveFolderUrl(fontsUrl)) {
+    console.log(`   📂 Fetching fonts from separate Drive folder: ${fontsUrl}`);
+    try {
+      const fItems = await listDriveFolder(fontsUrl);
+      const fontsFound = fItems.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+      if (fontsFound.length > 0) {
+        fontFiles.push(...fontsFound);
+      }
+    } catch {}
+  }
+
+  // 1. Direct subtitle files (.ass/.srt)
+  if (subFiles.length > 0) {
+    let targetSubs = subFiles;
+    
+    // Check if rawTitle specifies a batch range or specific episodes
+    const extractedEps = extractEpisodesFromText(rawTitle || '');
+    if (extractedEps.length > 0) {
+      const match = subFiles.filter(f => extractedEps.some(ep => matchesEpisode(f.name, ep)));
+      if (match.length > 0) targetSubs = match;
+    } else if (targetEpisode) {
+      const match = subFiles.filter(f => matchesEpisode(f.name, targetEpisode));
+      if (match.length > 0) targetSubs = match;
+    }
+
+    const isBatch = targetSubs.length > 1;
+    const hasFonts = fontFiles.length > 0;
+
+    if (isBatch || hasFonts) {
+      console.log(`   📦 [Drive Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontFiles.length} font(s)). Downloading and packing to .zip...`);
+      const unpackDir = path.join(destDir, `drive_unpack_${Date.now()}`);
+      fs.mkdirSync(unpackDir, { recursive: true });
+
+      for (const sub of targetSubs) {
+        console.log(`   📥 Downloading Drive sub: ${sub.name}`);
+        const subDest = path.join(unpackDir, sub.name);
+        const subUrl = getDriveDirectUrl(sub.id);
+        const res = await fetchWithTimeout(subUrl);
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          fs.writeFileSync(subDest, buf);
+        }
+      }
+
+      if (hasFonts) {
+        const fontsDir = path.join(unpackDir, 'Fonts');
+        fs.mkdirSync(fontsDir, { recursive: true });
+        for (const font of fontFiles) {
+          const fontDest = path.join(fontsDir, font.name);
+          const fontUrl = getDriveDirectUrl(font.id);
+          try {
+            const res = await fetchWithTimeout(fontUrl);
+            if (res.ok) {
+              const buf = Buffer.from(await res.arrayBuffer());
+              fs.writeFileSync(fontDest, buf);
+            }
+          } catch {}
+        }
+      }
+
+      const repackedZip = path.join(destDir, `drive_bundle_${Date.now()}.zip`);
+      packToZip(unpackDir, repackedZip);
+      try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch {}
+
+      return {
+        filePath: repackedZip,
+        isArchive: true,
+        hasFonts,
+        type: 'archive',
+        subNames: targetSubs.map(s => s.name)
+      };
+    }
+
+    // Single subtitle without fonts
+    const singleSub = targetSubs[0];
+    console.log(`   📥 Downloading single Drive subtitle: ${singleSub.name}`);
+    const destPath = path.join(destDir, singleSub.name);
+    const subUrl = getDriveDirectUrl(singleSub.id);
+    const res = await fetchWithTimeout(subUrl);
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(destPath, buf);
+      return {
+        filePath: destPath,
+        isArchive: false,
+        hasFonts: false,
+        type: 'subtitle',
+        subNames: [singleSub.name]
+      };
+    }
+  }
+
+  // 2. Archive files (.zip/.rar/.7z)
+  if (arcFiles.length > 0) {
+    let chosen = arcFiles[arcFiles.length - 1];
+    if (targetEpisode) {
+      const match = arcFiles.find(f => matchesEpisode(f.name, targetEpisode));
+      if (match) chosen = match;
+    }
+    console.log(`   📦 Drive: found archive: ${chosen.name}`);
+    const destPath = path.join(destDir, chosen.name);
+    const arcUrl = getDriveDirectUrl(chosen.id);
+    const res = await fetchWithTimeout(arcUrl);
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(destPath, buf);
+      return {
+        filePath: destPath,
+        isArchive: true,
+        hasFonts: null,
+        type: 'archive',
+        subNames: [chosen.name]
+      };
+    }
+  }
+
+  return null;
+}
+

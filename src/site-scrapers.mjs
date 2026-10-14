@@ -56,7 +56,7 @@ const siteSessions = new Map();
 const SESSION_TTL = 2 * 60 * 60 * 1000; // Refresh session cookie every 2 hours
 
 async function ensureSiteSession(siteConfig) {
-  if (!siteConfig || !siteConfig.user || !siteConfig.pass) return null;
+  if (!siteConfig) return null;
   const now = Date.now();
   const cached = siteSessions.get(siteConfig.id);
   if (cached && (now - cached.created < SESSION_TTL)) {
@@ -64,6 +64,21 @@ async function ensureSiteSession(siteConfig) {
   }
   const jar = new SessionJar();
   siteSessions.set(siteConfig.id, { jar, created: now });
+
+  // 0. Manual REVIVE_COOKIE from environment / GitHub Secrets
+  if (siteConfig.id === 'revive' || (siteConfig.base && siteConfig.base.includes('revivesubs'))) {
+    const rawCookie = process.env.REVIVE_COOKIE;
+    if (rawCookie) {
+      console.log(`   🔑 Using manual REVIVE_COOKIE for ${siteConfig.name}`);
+      for (const pair of rawCookie.split(';')) {
+        const eq = pair.indexOf('=');
+        if (eq > 0) jar.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+      }
+      return jar;
+    }
+  }
+
+  if (!siteConfig.user || !siteConfig.pass) return null;
 
   // 1. Check if site is Laravel / Custom Auth (e.g. Revive Subs)
   if (siteConfig.id === 'revive' || (siteConfig.base && siteConfig.base.includes('revivesubs'))) {
@@ -346,7 +361,7 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
 
 export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null) {
   let cookieHeader = '';
-  if (siteConfig && siteConfig.user) {
+  if (siteConfig && (siteConfig.user || process.env.REVIVE_COOKIE)) {
     const jar = await ensureSiteSession(siteConfig);
     if (jar) cookieHeader = jar.header();
   }
@@ -483,6 +498,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   let mediafire = null;
   let mega = null;
   let drive = null;
+  let fontsLink = null;
   let proton = null;
   let pixeldrain = null;
   let torrent = null;
@@ -500,6 +516,12 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     const ctxLower = (l.containerHeading ? `${l.containerHeading} ${l.parentContext}` : l.parentContext).toLowerCase();
 
     const isSoft = textLower.includes('soft') || ctxLower.includes('soft') || !ctxLower.includes('hard');
+    const isFont = (textLower.includes('الخطوط') || textLower === 'fonts' || (ctxLower.includes('الخطوط') && !ctxLower.includes('ترجم'))) &&
+      !textLower.includes('ترجم') && !textLower.includes('sub');
+
+    if (isFont && !fontsLink && !hrefLower.includes('.torrent') && !hrefLower.includes('twitter') && !hrefLower.includes('t.me')) {
+      fontsLink = l.href;
+    }
 
     if (hrefLower.includes('top4top.io') && !top4top) top4top = l.href;
     if (hrefLower.includes('mediafire.com') && isSoft && !mediafire) mediafire = l.href;
@@ -534,7 +556,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   const resolvedLower = (directSubLink || '').toLowerCase();
   if (resolvedLower.includes('top4top.io') && !top4top) top4top = directSubLink;
   if (resolvedLower.includes('mediafire.com') && !mediafire) mediafire = directSubLink;
-  if ((resolvedLower.includes('drive.google.com') || resolvedLower.includes('docs.google.com')) && !drive) drive = directSubLink;
+  if (resolvedLower.includes('drive.google.com') || resolvedLower.includes('docs.google.com')) drive = directSubLink;
   if (resolvedLower.includes('mega.nz') && !mega) mega = directSubLink;
   if (resolvedLower.includes('proton.me') && !proton) proton = directSubLink;
   if (resolvedLower.includes('pixeldrain.com') && !pixeldrain) pixeldrain = directSubLink;
@@ -549,6 +571,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     bestDownloadUrl,
     videoLinks: {
       directSub: directSubLink,
+      fonts: fontsLink,
       top4top,
       mediafire,
       mega,

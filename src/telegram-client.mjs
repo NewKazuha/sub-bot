@@ -15,6 +15,8 @@ import {
   findBestFileInMegaFolder,
   downloadMegaNode,
   downloadMegaFolderRelease,
+  downloadDriveFolderRelease,
+  isDriveFolderUrl,
   findBestFileInMediafire,
   findBestFileInDrive,
   resolveMediafireDirectDownload
@@ -2272,7 +2274,8 @@ export async function checkTelegramChannels(existingClient = null) {
                   if (resolved) directUrl = resolved;
                 }
 
-                if (directUrl) {
+                // Skip folder URLs from direct single-file HTTP download
+                if (directUrl && !isDriveFolderUrl(directUrl) && !directUrl.includes('mega.nz')) {
                   try {
                     console.log(`   📥 Direct download: ${directUrl}`);
                     const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
@@ -2302,10 +2305,14 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 // 3. Mega (Direct file or Folder via pure JS megajs)
-                if (!downloadedFilePath && pageData.videoLinks?.mega) {
-                  console.log(`   📥 Resolving Mega: ${pageData.videoLinks.mega}`);
+                const megaCandidate = (pageData.videoLinks?.directSub && pageData.videoLinks.directSub.includes('mega.nz'))
+                  ? pageData.videoLinks.directSub
+                  : pageData.videoLinks?.mega;
+
+                if (!downloadedFilePath && megaCandidate) {
+                  console.log(`   📥 Resolving Mega: ${megaCandidate}`);
                   try {
-                    const megaRelease = await downloadMegaFolderRelease(pageData.videoLinks.mega, fansubWorkDir, targetEp);
+                    const megaRelease = await downloadMegaFolderRelease(megaCandidate, fansubWorkDir, targetEp);
                     if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
                       downloadedFilePath = megaRelease.filePath;
                     }
@@ -2314,17 +2321,36 @@ export async function checkTelegramChannels(existingClient = null) {
                   }
                 }
 
-                // 4. Google Drive (Direct file or Folder)
-                if (!downloadedFilePath && pageData.videoLinks?.drive) {
-                  console.log(`   📥 Resolving Google Drive: ${pageData.videoLinks.drive}`);
+                // 4. Google Drive (Direct file or Folder release with fonts)
+                const driveCandidate = (pageData.videoLinks?.directSub && isDriveFolderUrl(pageData.videoLinks.directSub))
+                  ? pageData.videoLinks.directSub
+                  : pageData.videoLinks?.drive;
+
+                if (!downloadedFilePath && driveCandidate) {
+                  console.log(`   📥 Resolving Google Drive: ${driveCandidate}`);
                   try {
-                    const driveBest = await findBestFileInDrive(pageData.videoLinks.drive, targetEp);
-                    if (driveBest && driveBest.directUrl) {
-                      if (driveBest.type === 'subtitle' || toolsAvailable) {
-                        console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
-                        const tempDest = path.join(fansubWorkDir, driveBest.name);
-                        await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
-                        if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                    if (isDriveFolderUrl(driveCandidate)) {
+                      const driveRelease = await downloadDriveFolderRelease(
+                        driveCandidate,
+                        fansubWorkDir,
+                        targetEp,
+                        pageData.videoLinks?.fonts,
+                        titleLine
+                      );
+                      if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
+                        downloadedFilePath = driveRelease.filePath;
+                      }
+                    }
+
+                    if (!downloadedFilePath) {
+                      const driveBest = await findBestFileInDrive(driveCandidate, targetEp);
+                      if (driveBest && driveBest.directUrl) {
+                        if (driveBest.type === 'subtitle' || toolsAvailable) {
+                          console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
+                          const tempDest = path.join(fansubWorkDir, driveBest.name);
+                          await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
+                          if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                        }
                       }
                     }
                   } catch (e) {
