@@ -56,6 +56,7 @@ jobs:
           CELESTIAL_PASS: ${{ secrets.CELESTIAL_PASS }}
           REVIVE_USER: ${{ secrets.REVIVE_USER }}
           REVIVE_PASS: ${{ secrets.REVIVE_PASS }}
+          REVIVE_COOKIE: ${{ secrets.REVIVE_COOKIE }}
           ANIMESAN_USER: ${{ secrets.ANIMESAN_USER }}
           ANIMESAN_PASS: ${{ secrets.ANIMESAN_PASS }}
           # Keep monitor alive in continuous loop for 25 minutes, checking every 60 seconds
