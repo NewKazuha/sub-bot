@@ -210,10 +210,11 @@ export function extractEpisodeNumber(text) {
   const cleaned = text.replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '');
 
   // Range matching: "01-12", "01~03", "01 to 12" -> ranges are batches, not single episodes
-  const rangeMatch = cleaned.match(/(\d{1,4})\s*(?:[-&~–]|to|and)\s*(\d{1,4})/i);
-  if (rangeMatch) {
-    const start = parseInt(rangeMatch[1], 10);
-    const end = parseInt(rangeMatch[2], 10);
+  // But skip if preceded by S/Season (e.g. "S01 - 02" = Season 1 Episode 2, NOT a range)
+  const rangeMatch = cleaned.match(/(S(?:eason)?\s*)?(\d{1,4})\s*(?:[-&~–]|to|and)\s*(\d{1,4})/i);
+  if (rangeMatch && !rangeMatch[1]) {
+    const start = parseInt(rangeMatch[2], 10);
+    const end = parseInt(rangeMatch[3], 10);
     if (!isNaN(start) && !isNaN(end) && start < end && end - start <= 100) {
       return '';
     }
