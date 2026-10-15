@@ -145,7 +145,8 @@ const ANIME_ALIASES = [
   { pattern: /(?:yani\s*neko)/i, canon: 'yani_neko' },
   { pattern: /(?:thunder\s*3)/i, canon: 'thunder_3' },
   { pattern: /(?:quanzhi\s*fashi|versatile\s*mage)/i, canon: 'quanzhi_fashi' },
-  { pattern: /(?:nijus?seiki\s*denki|eureka\s*evrika)/i, canon: 'denki_mokuroku' }
+  { pattern: /(?:nijus?seiki\s*denki|eureka\s*evrika)/i, canon: 'denki_mokuroku' },
+  { pattern: /(?:juuou\s*(?:bushin|mujin)\s*dandivine|beast\s*king.*dandivine|dandivine)/i, canon: 'juuou_dandivine' }
 ];
 
 // ====================================================================
