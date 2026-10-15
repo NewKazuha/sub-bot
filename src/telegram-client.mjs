@@ -146,7 +146,10 @@ const ANIME_ALIASES = [
   { pattern: /(?:thunder\s*3)/i, canon: 'thunder_3' },
   { pattern: /(?:quanzhi\s*fashi|versatile\s*mage)/i, canon: 'quanzhi_fashi' },
   { pattern: /(?:nijus?seiki\s*denki|eureka\s*evrika)/i, canon: 'denki_mokuroku' },
-  { pattern: /(?:juuou\s*(?:bushin|mujin)\s*dandivine|beast\s*king.*dandivine|dandivine)/i, canon: 'juuou_dandivine' }
+  { pattern: /(?:juuou\s*(?:bushin|mujin)\s*dandivine|beast\s*king.*dandivine|dandivine)/i, canon: 'juuou_dandivine' },
+  { pattern: /(?:hyouken\s*no\s*majutsushi)/i, canon: 'hyouken_majutsushi' },
+  { pattern: /(?:tsuihou.*(?:juukishi|juu\s*kishi))/i, canon: 'tsuihou_juukishi' },
+  { pattern: /(?:kuro\s*neko\s*to\s*majo|kuroneko\s*to\s*majo)/i, canon: 'kuroneko_majo' }
 ];
 
 // ====================================================================
@@ -369,6 +372,15 @@ export function getReleaseKeys(title, isOfficial = false) {
         keys.push(`official_sorted_ep_${epNum}_${sortedSig}`);
       }
     }
+
+    // Condensed alphanumeric key (spaces and underscores removed) to catch spacing differences
+    // e.g. "juu_kishi" vs "juukishi", "kuro_neko" vs "kuroneko"
+    if (coreKey && epNum) {
+      const condensed = coreKey.replace(/[^a-z0-9]/gi, '').replace(new RegExp(`${epNum}$`), '');
+      if (condensed.length >= 6) {
+        keys.push(`official_condensed_ep_${epNum}_${condensed}`);
+      }
+    }
   }
 
   return Array.from(new Set(keys.filter(Boolean)));
@@ -466,6 +478,11 @@ export function formatCleanTitle(raw) {
     .replace(/\[\+fonts?\]/gi, '')
     .trim();
   cleaned = cleaned.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
+
+  // Normalize romanization and spacing inconsistencies so official titles are always uniform
+  cleaned = cleaned.replace(/\bjuuou\s+mujin\s+dandivine\b/gi, 'Juuou Bushin Dandivine');
+  cleaned = cleaned.replace(/\bjuu\s+kishi\b/gi, 'Juukishi');
+  cleaned = cleaned.replace(/\bkuro\s+neko\s+to\s+majo\b/gi, 'Kuroneko to Majo');
 
   // Convert scene-release dot-separated names (e.g. "PSYREN.S01E01.CR.WEB-DL.Arabic.AR"
   // or "[CR] PSYREN.S01E01.WEB-DL.Arabic.AR") to space-separated, preventing Telegram
