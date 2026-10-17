@@ -149,7 +149,8 @@ const ANIME_ALIASES = [
   { pattern: /(?:juuou\s*(?:bushin|mujin)\s*dandivine|beast\s*king.*dandivine|dandivine)/i, canon: 'juuou_dandivine' },
   { pattern: /(?:hyouken\s*no\s*majutsushi)/i, canon: 'hyouken_majutsushi' },
   { pattern: /(?:tsuihou.*(?:juukishi|juu\s*kishi))/i, canon: 'tsuihou_juukishi' },
-  { pattern: /(?:kuro\s*neko\s*to\s*majo|kuroneko\s*to\s*majo)/i, canon: 'kuroneko_majo' }
+  { pattern: /(?:kuro\s*neko\s*to\s*majo|kuroneko\s*to\s*majo)/i, canon: 'kuroneko_majo' },
+  { pattern: /(?:shuiro\s*no\s*kamen|vermilion\s*mask)/i, canon: 'shuiro_no_kamen' }
 ];
 
 // ====================================================================
@@ -484,6 +485,7 @@ export function formatCleanTitle(raw) {
   cleaned = cleaned.replace(/\bjuu\s+kishi\b/gi, 'Juukishi');
   cleaned = cleaned.replace(/\bkuro\s+neko\s+to\s+majo\b/gi, 'Kuroneko to Majo');
   cleaned = cleaned.replace(/\bkusuriya\s+no\s+hitorigoto\s*\((?:2025|2026)\)/gi, 'Kusuriya no Hitorigoto 3rd Season');
+  cleaned = cleaned.replace(/\b(?:the\s+)?vermilion\s+mask\b/gi, 'Shuiro no Kamen');
 
   // Convert scene-release dot-separated names (e.g. "PSYREN.S01E01.CR.WEB-DL.Arabic.AR"
   // or "[CR] PSYREN.S01E01.WEB-DL.Arabic.AR") to space-separated, preventing Telegram
