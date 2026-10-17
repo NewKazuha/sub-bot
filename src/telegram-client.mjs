@@ -139,7 +139,7 @@ const ANIME_ALIASES = [
   { pattern: /(?:super\s*no\s*ura)/i, canon: 'super_no_ura' },
   { pattern: /(?:jojo.*steel\s*ball|steel\s*ball.*jojo|steel\s*ball\s*run)/i, canon: 'jojo_steel_ball_run' },
   { pattern: /(?:tougen\s*anki)/i, canon: 'tougen_anki' },
-  { pattern: /(?:kusuriya\s*no\s*hitorigoto|apothecary\s*diaries)/i, canon: 'kusuriya_no_hitorigoto' },
+  { pattern: /(?:kusuriya\s*no\s*hitorigoto|apothecary\s*diaries|صيدلانية)/i, canon: 'kusuriya_no_hitorigoto' },
   { pattern: /(?:tokyo\s*revengers)/i, canon: 'tokyo_revengers' },
   { pattern: /(?:uchi\s*no\s*otouto|please\s*excuse\s*my\s*younger\s*brothers)/i, canon: 'uchi_no_otouto' },
   { pattern: /(?:yani\s*neko)/i, canon: 'yani_neko' },
@@ -483,6 +483,7 @@ export function formatCleanTitle(raw) {
   cleaned = cleaned.replace(/\bjuuou\s+mujin\s+dandivine\b/gi, 'Juuou Bushin Dandivine');
   cleaned = cleaned.replace(/\bjuu\s+kishi\b/gi, 'Juukishi');
   cleaned = cleaned.replace(/\bkuro\s+neko\s+to\s+majo\b/gi, 'Kuroneko to Majo');
+  cleaned = cleaned.replace(/\bkusuriya\s+no\s+hitorigoto\s*\((?:2025|2026)\)/gi, 'Kusuriya no Hitorigoto 3rd Season');
 
   // Convert scene-release dot-separated names (e.g. "PSYREN.S01E01.CR.WEB-DL.Arabic.AR"
   // or "[CR] PSYREN.S01E01.WEB-DL.Arabic.AR") to space-separated, preventing Telegram
