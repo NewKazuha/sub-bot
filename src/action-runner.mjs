@@ -1,5 +1,6 @@
 import { checkNewReleases } from './feed-monitor.mjs';
 import { createPersistentClient } from './telegram-client.mjs';
+import { CONFIG } from './config.mjs';
 
 // Duration to keep the action worker alive checking continuously
 const RUN_DURATION_MINUTES = parseInt(process.env.RUN_DURATION_MINUTES || '25', 10);
@@ -11,6 +12,17 @@ async function runContinuousMonitor() {
   console.log(`⏱️ Window Duration: ${RUN_DURATION_MINUTES} minutes`);
   console.log(`⏰ Polling Interval: Every ${CHECK_INTERVAL_SECONDS} seconds`);
   console.log(`======================================================\n`);
+
+  // Pre-flight: verify credentials (read from CONFIG after env/.env/session-file fallback).
+  const session = CONFIG.TELEGRAM.SESSION;
+  if (!session) {
+    console.error('❌ TELEGRAM_SESSION is missing (checked env and SESSION_STRING.txt). Aborting.');
+    process.exit(1);
+  }
+  if (!CONFIG.TELEGRAM.API_ID || !CONFIG.TELEGRAM.API_HASH) {
+    console.error('❌ TELEGRAM_API_ID and TELEGRAM_API_HASH are required together with TELEGRAM_SESSION. Aborting.');
+    process.exit(1);
+  }
 
   // Create a single persistent Telegram client for the entire monitoring window.
   // This avoids the expensive connect/disconnect overhead on every cycle.

@@ -1,8 +1,18 @@
 import express from 'express';
+import crypto from 'node:crypto';
 import { CONFIG } from './config.mjs';
 import { checkNewReleases } from './feed-monitor.mjs';
 
 const app = express();
+
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function timingSafeStringEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 
 app.get('/', (req, res) => {
   res.send('<h1>Anime Sub Telegram Bot is Running 24/7! 🚀</h1><p>Automated Subtitle Extractor & Channel Publisher</p>');
@@ -29,7 +39,13 @@ async function safeCheckCycle(source = 'timer') {
   }
 }
 
-app.get('/check-now', async (req, res) => {
+app.get('/check-now', (req, res) => {
+  if (!ADMIN_KEY) {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+  if (!timingSafeStringEqual(req.query.key, ADMIN_KEY)) {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
   if (isChecking) {
     return res.json({ message: 'A check cycle is already currently running.' });
   }
@@ -44,6 +60,15 @@ function startScheduler() {
   console.log(`🤖 Anime Sub Telegram Bot loop initialized`);
   console.log(`⏰ Polling interval: Every ${CONFIG.POLL_INTERVAL_MINUTES} minutes`);
   console.log(`======================================================\n`);
+
+  if (!CONFIG.TELEGRAM.SESSION) {
+    console.warn('⚠️ TELEGRAM_SESSION is missing (checked env and SESSION_STRING.txt). Telegram publishing will fail until it is set.');
+  } else if (!CONFIG.TELEGRAM.API_ID || !CONFIG.TELEGRAM.API_HASH) {
+    console.warn('⚠️ TELEGRAM_API_ID / TELEGRAM_API_HASH are missing. Telegram publishing will fail until both are set.');
+  }
+  if (!ADMIN_KEY) {
+    console.log('ℹ️ ADMIN_KEY is not set – the /check-now endpoint is disabled.');
+  }
 
   safeCheckCycle('initial');
 

@@ -2,7 +2,7 @@ FROM node:22-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     mkvtoolnix aria2 megatools ffmpeg zip python3 python3-pip ca-certificates \
-    && pip3 install --no-cache-dir --break-system-packages mega.py gdown \
+    && pip3 install --no-cache-dir --break-system-packages curl_cffi \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

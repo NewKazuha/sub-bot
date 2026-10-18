@@ -11,27 +11,6 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-export async function sendMessage(text, { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
-  if (!CONFIG.TELEGRAM.BOT_TOKEN) return { ok: false, description: 'No TELEGRAM_BOT_TOKEN configured' };
-  try {
-    const bodyObj = {
-      chat_id: chatId,
-      text: parseMode === 'HTML' ? escapeHtml(text) : text
-    };
-    if (parseMode) bodyObj.parse_mode = parseMode;
-
-    const res = await fetch(`${getApiBase()}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(bodyObj)
-    });
-    return await res.json();
-  } catch (e) {
-    console.error('Telegram sendMessage error:', e.message);
-    return null;
-  }
-}
-
 export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML', retries = 3 } = {}) {
   if (!CONFIG.TELEGRAM.BOT_TOKEN) return { ok: false, description: 'No TELEGRAM_BOT_TOKEN configured' };
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -71,26 +50,4 @@ export async function sendDocument(filePath, caption = '', { chatId = CONFIG.TEL
     }
   }
   return null;
-}
-
-export async function sendPhoto(photoUrl, caption = '', { chatId = CONFIG.TELEGRAM.TARGET_CHANNEL, parseMode = 'HTML' } = {}) {
-  if (!CONFIG.TELEGRAM.BOT_TOKEN) return { ok: false, description: 'No TELEGRAM_BOT_TOKEN configured' };
-  try {
-    const bodyObj = {
-      chat_id: chatId,
-      photo: photoUrl,
-      caption: parseMode === 'HTML' ? escapeHtml(caption) : caption
-    };
-    if (parseMode) bodyObj.parse_mode = parseMode;
-
-    const res = await fetch(`${getApiBase()}/sendPhoto`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(bodyObj)
-    });
-    return await res.json();
-  } catch (e) {
-    console.error('Telegram sendPhoto error:', e.message);
-    return null;
-  }
 }

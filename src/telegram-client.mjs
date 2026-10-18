@@ -21,6 +21,7 @@ import {
   findBestFileInDrive,
   resolveMediafireDirectDownload
 } from './cloud-folders.mjs';
+import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
 
 const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
@@ -237,6 +238,16 @@ export function extractEpisodeNumber(text) {
   return '';
 }
 
+// NOTE: `_batch_` keys intentionally use a 2-variant scheme (raw + pad2) while
+// `_ep_` keys use 3 variants (raw / noPad / pad2) — do not "fix" this asymmetry.
+function getEpKeyVariants(ep) {
+  if (!ep) return [];
+  const raw = String(ep);
+  const noPad = raw.replace(/^0+/, '') || '0';
+  const pad2 = noPad.padStart(2, '0');
+  return Array.from(new Set([raw, noPad, pad2]));
+}
+
 export function getCoreAnimeEpisodeKey(title) {
   return title
     .toLowerCase()
@@ -314,7 +325,9 @@ export function getReleaseKeys(title, isOfficial = false) {
   if (coreKey) keys.push(coreKey);
 
   if (canonName && epNum) {
-    keys.push(`canon_${canonName}_ep_${epNum}`);
+    for (const ev of getEpKeyVariants(epNum)) {
+      keys.push(`canon_${canonName}_ep_${ev}`);
+    }
   }
 
   // Batch episode normalization (e.g. 001~005, 01~05, 1~5, 01-13)
@@ -340,26 +353,32 @@ export function getReleaseKeys(title, isOfficial = false) {
       const prefix2 = words.slice(0, 2).join('_');
       const prefix3 = words.slice(0, 3).join('_');
       const prefix4 = words.slice(0, 4).join('_');
-      keys.push(`token_ep_${epNum}_${prefix2}`);
-      keys.push(`token_ep_${epNum}_${prefix3}`);
-      keys.push(`token_ep_${epNum}_${prefix4}`);
-      if (isOfficial) {
-        keys.push(`official_ep_${epNum}_${prefix2}`);
-        keys.push(`official_ep_${epNum}_${prefix3}`);
-        keys.push(`official_ep_${epNum}_${prefix4}`);
+      for (const ev of getEpKeyVariants(epNum)) {
+        keys.push(`token_ep_${ev}_${prefix2}`);
+        keys.push(`token_ep_${ev}_${prefix3}`);
+        keys.push(`token_ep_${ev}_${prefix4}`);
+        if (isOfficial) {
+          keys.push(`official_ep_${ev}_${prefix2}`);
+          keys.push(`official_ep_${ev}_${prefix3}`);
+          keys.push(`official_ep_${ev}_${prefix4}`);
+        }
       }
     }
   }
 
   if (isOfficial) {
     if (canonName && epNum) {
-      keys.push(`official_${canonName}_ep_${epNum}`);
+      for (const ev of getEpKeyVariants(epNum)) {
+        keys.push(`official_${canonName}_ep_${ev}`);
+      }
     }
     if (coreKey) {
       keys.push(`official_${coreKey}`);
     }
     if (epNum && coreKey) {
-      keys.push(`official_ep_${epNum}_${coreKey.slice(0, 20)}`);
+      for (const ev of getEpKeyVariants(epNum)) {
+        keys.push(`official_ep_${ev}_${coreKey.slice(0, 20)}`);
+      }
     }
 
     // Sorted significant word signature to prevent duplicates when title words are flipped
@@ -370,7 +389,9 @@ export function getReleaseKeys(title, isOfficial = false) {
         .filter(w => w && w !== epNum && !/^(?:season|s\d+|2nd|3rd|4th|5th|6th|7th|\d+|part|the|and|no|wa|ga|to|de|ni|mo|na|202\d|end|hen)$/i.test(w));
       if (sortedWords.length >= 2) {
         const sortedSig = Array.from(new Set(sortedWords)).sort().join('_');
-        keys.push(`official_sorted_ep_${epNum}_${sortedSig}`);
+        for (const ev of getEpKeyVariants(epNum)) {
+          keys.push(`official_sorted_ep_${ev}_${sortedSig}`);
+        }
       }
     }
 
@@ -379,7 +400,9 @@ export function getReleaseKeys(title, isOfficial = false) {
     if (coreKey && epNum) {
       const condensed = coreKey.replace(/[^a-z0-9]/gi, '').replace(new RegExp(`${epNum}$`), '');
       if (condensed.length >= 6) {
-        keys.push(`official_condensed_ep_${epNum}_${condensed}`);
+        for (const ev of getEpKeyVariants(epNum)) {
+          keys.push(`official_condensed_ep_${ev}_${condensed}`);
+        }
       }
     }
   }
@@ -446,7 +469,9 @@ export function getFansubReleaseKeys(title) {
       keys.push(`fansub_${tKey}_${coreKey}`);
     }
     if (epNum && (canonName || coreKey)) {
-      keys.push(`fansub_${tKey}_${canonName || coreKey}_ep_${epNum}`);
+      for (const ev of getEpKeyVariants(epNum)) {
+        keys.push(`fansub_${tKey}_${canonName || coreKey}_ep_${ev}`);
+      }
     }
     if (batchStart !== null && batchEnd !== null && animeNameOnly) {
       keys.push(`fansub_${tKey}_${animeNameOnly}_batch_${batchStart}_${batchEnd}`);
@@ -878,13 +903,14 @@ export function listArchiveFiles(archivePath) {
   if (ext === '.7z' || ext === '.rar' || magic?.isArchive) {
     // 1. Try system full 7z (supports RAR when p7zip-full/p7zip-rar is installed)
     try {
-      const stdout = execSync(`7z l "${archivePath}"`, {
+      const stdout = execFileSync('7z', ['l', archivePath], {
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe']
       });
       const lines = stdout.split(/\r?\n/);
       const files = [];
       let headerPassed = false;
+      let parseFailed = false;
       for (const line of lines) {
         if (line.includes('-------------------')) {
           headerPassed = !headerPassed;
@@ -896,15 +922,23 @@ export function listArchiveFiles(archivePath) {
             const attr = match[1];
             const name = match[2].trim();
             if (!attr.includes('D') && name) files.push(name);
+          } else if (line.trim()) {
+            parseFailed = true;
           }
         }
       }
-      if (files.length > 0) return files;
+      // Fail-closed: a row that cannot be parsed means this attempt's listing
+      // is only partial – never trust it for the zip-slip guard. Drop it and
+      // fall through to the next listing tool; if no tool yields a complete,
+      // fully-parsed listing this function still returns [] overall.
+      if (parseFailed) {
+        console.warn('   ⚠️ 7z listing contained unparseable rows – refusing partial listing (fail-closed).');
+      } else if (files.length > 0) return files;
     } catch { }
 
     // 2. Try unrar bare listing (unrar lb)
     try {
-      const stdout = execSync(`unrar lb "${archivePath}"`, {
+      const stdout = execFileSync('unrar', ['lb', archivePath], {
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe']
       });
@@ -914,13 +948,14 @@ export function listArchiveFiles(archivePath) {
 
     // 3. Try bundled 7za
     try {
-      const stdout = execSync(`"${SevenZip.path7za}" l "${archivePath}"`, {
+      const stdout = execFileSync(SevenZip.path7za, ['l', archivePath], {
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe']
       });
       const lines = stdout.split(/\r?\n/);
       const files = [];
       let headerPassed = false;
+      let parseFailed = false;
       for (const line of lines) {
         if (line.includes('-------------------')) {
           headerPassed = !headerPassed;
@@ -932,16 +967,20 @@ export function listArchiveFiles(archivePath) {
             const attr = match[1];
             const name = match[2].trim();
             if (!attr.includes('D') && name) files.push(name);
+          } else if (line.trim()) {
+            parseFailed = true;
           }
         }
       }
-      if (files.length > 0) return files;
+      if (parseFailed) {
+        console.warn('   ⚠️ 7za listing contained unparseable rows – refusing partial listing (fail-closed).');
+      } else if (files.length > 0) return files;
     } catch { }
   }
 
   // 4. Try tar -tf (supports RAR on Windows bsdtar)
   try {
-    const stdout = execSync(`tar -tf "${archivePath}"`, {
+    const stdout = execFileSync('tar', ['-tf', archivePath], {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe']
     });
@@ -954,49 +993,143 @@ export function listArchiveFiles(archivePath) {
   }
 }
 
+// Post-extraction containment check (zip-slip catch-all): after a successful
+// extraction, no entry may resolve outside the destination directory.
+// On any escape, best-effort discard the whole extraction and report failure.
+function verifyExtractedTree(destDir) {
+  const discard = (why) => {
+    console.warn(`   ⚠️ Discarding extraction in ${path.basename(destDir)}: ${why}`);
+    try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { }
+    return false;
+  };
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(destDir);
+  } catch (e) {
+    return discard(`verification error: ${e.message}`);
+  }
+  const stack = [realRoot];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      return discard(`verification error: ${e.message}`);
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      let real;
+      try {
+        real = fs.realpathSync(full);
+      } catch (e) {
+        return discard(`unresolvable entry ${full}: ${e.message}`);
+      }
+      if (real !== realRoot && !real.startsWith(realRoot + path.sep)) {
+        return discard(`entry escapes destination: ${full} -> ${real}`);
+      }
+      // Verify the link target above, but never descend through symlinks.
+      if (ent.isSymbolicLink()) continue;
+      if (ent.isDirectory()) stack.push(full);
+    }
+  }
+  return true;
+}
+
 export function extractArchive(archivePath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
   const magic = validateFileMagic(archivePath);
   const ext = (magic?.ext || path.extname(archivePath)).toLowerCase();
+  // Fail-closed guard against path traversal (zip-slip) in untrusted archives – applies to ALL extraction paths.
+  try {
+    const entries = listArchiveFiles(archivePath);
+    const isUnsafe = (e) => {
+      const s = String(e);
+      return s.split(/[\\/]/).some(c => /^\.\.[ .]*$/.test(c)) || s.startsWith('/') || s.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(s);
+    };
+    if (entries.length === 0) {
+      console.warn(`   ⚠️ Refusing to extract ${path.basename(archivePath)}: empty/failed listing (fail-closed).`);
+      return false;
+    }
+    if (entries.some(isUnsafe)) {
+      console.warn(`   ⚠️ Refusing to extract ${path.basename(archivePath)}: unsafe path entries detected.`);
+      return false;
+    }
+    // Refuse archives containing symbolic links (symlink-based zip-slip).
+    // Tri-state probes: 'unsafe' (symlink found), 'checked' (probe ran and
+    // could read the format, no symlinks), 'unavailable' (tool missing or
+    // could not read the format). Refuse on 'unsafe', and also when every
+    // probe is 'unavailable' – if nothing could verify symlink safety we must
+    // not extract (fail-closed).
+    const refuse = (why) => {
+      console.warn(`   ⚠️ Refusing to extract ${path.basename(archivePath)}: ${why}`);
+      return false;
+    };
+    const symlinkProbes = [];
+    if (ext === '.zip') {
+      // AdmZip reads exactly the archives the zip extraction branch below
+      // will read, so a successful read counts as 'checked'.
+      try {
+        const zip = new AdmZip(archivePath);
+        const unixMode = (e) => (Number(e.attr) >>> 16) & 0xF000; // S_IFLNK = 0xA000
+        symlinkProbes.push(zip.getEntries().some(e => unixMode(e) === 0xA000) ? 'unsafe' : 'checked');
+      } catch { symlinkProbes.push('unavailable'); }
+    }
+    try {
+      const tv = execFileSync('tar', ['-tvf', archivePath], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 });
+      symlinkProbes.push(tv.split(/\r?\n/).some(l => l.startsWith('l')) ? 'unsafe' : 'checked');
+    } catch { symlinkProbes.push('unavailable'); }
+    for (const tool of ['7z', SevenZip.path7za]) {
+      try {
+        const slt = execFileSync(tool, ['l', '-slt', archivePath], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 });
+        symlinkProbes.push(/^Symbolic Link = /m.test(slt) ? 'unsafe' : 'checked');
+      } catch { symlinkProbes.push('unavailable'); }
+    }
+    if (symlinkProbes.includes('unsafe')) return refuse('archive contains symbolic links.');
+    if (!symlinkProbes.includes('checked')) return refuse('cannot verify symlink safety (fail-closed).');
+  } catch (e) {
+    console.warn(`   ⚠️ Refusing to extract ${path.basename(archivePath)}: listing error (fail-closed): ${e.message}`);
+    return false;
+  }
   if (ext === '.zip') {
     try {
       const zip = new AdmZip(archivePath);
       zip.extractAllTo(destDir, true);
-      return true;
+      return verifyExtractedTree(destDir);
     } catch { }
   }
   if (ext === '.7z' || ext === '.rar' || magic?.isArchive) {
     // 1. Try system full 7z
     try {
-      execSync(`7z x "${archivePath}" -o"${destDir}" -y`, {
+      execFileSync('7z', ['x', archivePath, `-o${destDir}`, '-y'], {
         stdio: ['pipe', 'pipe', 'pipe']
       });
-      return true;
+      return verifyExtractedTree(destDir);
     } catch { }
 
     // 2. Try unrar
     try {
-      execSync(`unrar x -y -inul "${archivePath}" "${destDir}/"`, {
+      execFileSync('unrar', ['x', '-y', '-inul', archivePath, `${destDir}/`], {
         stdio: ['pipe', 'pipe', 'pipe']
       });
-      return true;
+      return verifyExtractedTree(destDir);
     } catch { }
 
     // 3. Try bundled 7za
     try {
-      execSync(`"${SevenZip.path7za}" x "${archivePath}" -o"${destDir}" -y`, {
+      execFileSync(SevenZip.path7za, ['x', archivePath, `-o${destDir}`, '-y'], {
         stdio: ['pipe', 'pipe', 'pipe']
       });
-      return true;
+      return verifyExtractedTree(destDir);
     } catch { }
   }
 
   // 4. Try tar -xf (supports RAR on Windows bsdtar)
   try {
-    execSync(`tar -xf "${archivePath}" -C "${destDir}"`, {
+    execFileSync('tar', ['-xf', archivePath, '-C', destDir], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
-    return true;
+    return verifyExtractedTree(destDir);
   } catch (e) {
     return false;
   }
@@ -1076,8 +1209,13 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
 function fetchSubdlHtmlWithCurl(url) {
   try {
     const command = process.platform === 'win32' ? 'curl.exe' : 'curl';
-    const args = `"${command}" -s -L --compressed -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.9" "${url}"`;
-    return execSync(args, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 30000 });
+    return execFileSync(command, [
+      '-s', '-L', '--compressed',
+      '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      '-H', 'Accept-Language: en-US,en;q=0.9',
+      url
+    ], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 30000 });
   } catch (e) {
     console.warn('SUBDL curl fallback error:', e.message);
     return null;
@@ -1158,17 +1296,6 @@ export async function resolveSubdlDownloadData(infoUrl) {
     individualLinks,
     allLinks
   };
-}
-
-export async function resolveSubdlDownloadUrl(infoUrl) {
-  try {
-    const data = await resolveSubdlDownloadData(infoUrl);
-    if (!data) return null;
-    return data.batchZipLink || data.individualLinks[0] || data.allLinks[0] || null;
-  } catch (e) {
-    console.warn('SUBDL resolve error:', e.message);
-    return null;
-  }
 }
 
 function extractKeywordsFromTitleOrFile(str) {
@@ -1382,7 +1509,7 @@ export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial
   const ext = path.extname(filePath).toLowerCase();
   if (ext === '.mkv' || ext === '.mp4' || ext === '.m4v') {
     try {
-      const trackInfo = execSync(`mkvmerge --identify --identification-format json "${filePath}"`, {
+      const trackInfo = execFileSync('mkvmerge', ['--identify', '--identification-format', 'json', filePath], {
         encoding: 'utf8',
         timeout: 30000
       });
@@ -1420,7 +1547,7 @@ export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial
       if (!subBaseName || subBaseName === 'extracted_sub') subBaseName = 'subtitle';
       const extractedSubPath = path.join(workDir, `${subBaseName}${subExt}`);
 
-      execSync(`mkvextract tracks "${filePath}" ${trackId}:"${extractedSubPath}"`, {
+      execFileSync('mkvextract', ['tracks', filePath, `${trackId}:${extractedSubPath}`], {
         stdio: 'pipe',
         timeout: 60000
       });
@@ -1443,9 +1570,9 @@ export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial
         const fontsDir = path.join(workDir, 'fonts');
         fs.mkdirSync(fontsDir, { recursive: true });
 
-        const extractArgs = attachments.map(a => `${a.id}:"${path.join(fontsDir, a.file_name)}"`).join(' ');
+        const extractArgs = attachments.map(a => `${a.id}:${path.join(fontsDir, safeRemoteBaseName(a.file_name, `font_${a.id}`))}`);
         try {
-          execSync(`mkvextract attachments "${filePath}" ${extractArgs}`, { stdio: 'pipe', timeout: 60000 });
+          execFileSync('mkvextract', ['attachments', filePath, ...extractArgs], { stdio: 'pipe', timeout: 60000 });
           const zipPath = path.join(workDir, 'release_fonts.zip');
 
           const zip = new AdmZip();
@@ -1485,10 +1612,13 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
   fs.mkdirSync(downloadDir, { recursive: true });
   try {
     console.log(`   📥 Downloading MKV via aria2c...`);
-    execSync(
-      `aria2c --seed-time=0 --max-upload-limit=1K --file-allocation=none ` +
-      `--max-concurrent-downloads=5 --split=5 --max-connection-per-server=5 ` +
-      `--continue=true --dir="${downloadDir}" "${torrentPath}"`,
+    execFileSync(
+      'aria2c',
+      [
+        '--seed-time=0', '--max-upload-limit=1K', '--file-allocation=none',
+        '--max-concurrent-downloads=5', '--split=5', '--max-connection-per-server=5',
+        '--continue=true', `--dir=${downloadDir}`, torrentPath
+      ],
       { stdio: 'pipe', timeout: 10 * 60 * 1000 }
     );
   } catch (e) {
@@ -1822,7 +1952,11 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 console.log(`\n✨ [Subdl Direct File] "${cleanTitle}" (${originalName})`);
-                const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${originalName}`);
+                const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${safeRemoteBaseName(originalName)}`);
+                if (!isInsideDir(localFilePath, OUT_DIR)) {
+                  console.warn(`   ⚠️ Skipping "${cleanTitle}": unsafe document file name "${originalName}".`);
+                  continue;
+                }
 
                 try {
                   await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
@@ -2182,7 +2316,11 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 console.log(`\n✨ [LazySano Direct File] "${titleLine}" (${originalName})`);
-                const localFilePath = path.join(OUT_DIR, originalName);
+                const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}`));
+                if (!isInsideDir(localFilePath, OUT_DIR)) {
+                  console.warn(`   ⚠️ Skipping LazySano direct file: unsafe document file name "${originalName}".`);
+                  continue;
+                }
 
                 try {
                   await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
@@ -2245,8 +2383,9 @@ export async function checkTelegramChannels(existingClient = null) {
                     const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega);
                     if (megaBest?.node && megaBest.type === 'subtitle') {
                       try {
-                        const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}_${megaBest.name}`);
-                        await downloadMegaNode(megaBest.node, tempDest);
+                        const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}_${safeRemoteBaseName(megaBest.name)}`);
+                        if (!isInsideDir(tempDest, OUT_DIR)) throw new Error(`unsafe mega file name: ${megaBest.name}`);
+                        await downloadMegaNode(megaBest.node, tempDest, OUT_DIR);
                         const validated = validateFileMagic(tempDest);
                         if (validated) {
                           const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
@@ -2323,7 +2462,11 @@ export async function checkTelegramChannels(existingClient = null) {
 
             if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
               console.log(`\n✨ [Fansub Attachment] "${titleLine}" (${originalName})`);
-              const localFilePath = path.join(OUT_DIR, originalName);
+              const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}.ass`));
+              if (!isInsideDir(localFilePath, OUT_DIR)) {
+                console.warn(`   ⚠️ Skipping fansub attachment: unsafe document file name "${originalName}".`);
+                continue;
+              }
 
               try {
                 await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
@@ -2419,7 +2562,8 @@ export async function checkTelegramChannels(existingClient = null) {
                     if (mfBest && mfBest.directUrl) {
                       if (mfBest.type === 'subtitle' || toolsAvailable) {
                         console.log(`   📥 Downloading from Mediafire (${mfBest.type}): ${mfBest.name}`);
-                        const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}_${mfBest.name}`);
+                        const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}_${safeRemoteBaseName(mfBest.name)}`);
+                        if (!isInsideDir(tempDest, fansubWorkDir)) throw new Error(`unsafe mediafire file name: ${mfBest.name}`);
                         await downloadFileToDisk(mfBest.directUrl, tempDest, { Referer: postPageUrl });
                         if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
                       }
@@ -2472,7 +2616,8 @@ export async function checkTelegramChannels(existingClient = null) {
                       if (driveBest && driveBest.directUrl) {
                         if (driveBest.type === 'subtitle' || toolsAvailable) {
                           console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
-                          const tempDest = path.join(fansubWorkDir, driveBest.name);
+                          const tempDest = path.join(fansubWorkDir, safeRemoteBaseName(driveBest.name, `drive_${Date.now()}`));
+                          if (!isInsideDir(tempDest, fansubWorkDir)) throw new Error(`unsafe drive file name: ${driveBest.name}`);
                           await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
                           if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
                         }

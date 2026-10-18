@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createWriteStream } from 'node:fs';
 import AdmZip from 'adm-zip';
+import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -91,7 +92,13 @@ export async function listMegaFolder(folderUrl) {
   }
 }
 
-export async function downloadMegaNode(megaNode, destPath) {
+export async function downloadMegaNode(megaNode, destPath, destDir) {
+  // Belt-and-braces: callers sanitize the remote-derived name before joining,
+  // but the download sink itself refuses to write outside the destination
+  // directory so a future caller cannot skip that check.
+  if (!destDir || !isInsideDir(destPath, destDir)) {
+    throw new Error('unsafe cloud file name: ' + destPath);
+  }
   return new Promise((resolve, reject) => {
     const dlStream = megaNode.download();
     const fileStream = createWriteStream(destPath);
@@ -135,9 +142,13 @@ export function packToZip(srcDir, zipPath) {
   const zip = new AdmZip();
   function addRec(dir, subDir = '') {
     for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, item.name);
+      // Entry names ultimately derive from remote listings – sanitize again
+      // on this walk so nothing can escape the source directory.
+      const safeName = safeRemoteBaseName(item.name, 'entry');
+      const full = path.join(dir, safeName);
+      if (!isInsideDir(full, srcDir)) throw new Error('unsafe cloud file name: ' + item.name);
       if (item.isDirectory()) {
-        addRec(full, subDir ? `${subDir}/${item.name}` : item.name);
+        addRec(full, subDir ? `${subDir}/${safeName}` : safeName);
       } else if (/\.(ass|srt)$/i.test(item.name)) {
         zip.addLocalFile(full, subDir);
       } else if (/\.(ttf|otf|woff2?|ttc)$/i.test(item.name)) {
@@ -182,14 +193,18 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
 
       for (const sub of targetSubs) {
         console.log(`   📥 Downloading Mega sub: ${sub.name}`);
-        await downloadMegaNode(sub.node, path.join(unpackDir, sub.name));
+        const subPath = path.join(unpackDir, safeRemoteBaseName(sub.name, `mega_sub_${Date.now()}`));
+        if (!isInsideDir(subPath, unpackDir)) throw new Error('unsafe cloud file name: ' + sub.name);
+        await downloadMegaNode(sub.node, subPath, unpackDir);
       }
 
       if (hasFonts) {
         const fontsDir = path.join(unpackDir, 'Fonts');
         fs.mkdirSync(fontsDir, { recursive: true });
         for (const font of fontFiles) {
-          await downloadMegaNode(font.node, path.join(fontsDir, font.name));
+          const fontPath = path.join(fontsDir, safeRemoteBaseName(font.name, `font_${Date.now()}`));
+          if (!isInsideDir(fontPath, fontsDir)) throw new Error('unsafe cloud file name: ' + font.name);
+          await downloadMegaNode(font.node, fontPath, fontsDir);
         }
       }
 
@@ -209,8 +224,9 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
     // Single subtitle without fonts: download directly as naked subtitle
     const singleSub = targetSubs[0];
     console.log(`   📥 Downloading single Mega subtitle: ${singleSub.name}`);
-    const destPath = path.join(destDir, singleSub.name);
-    await downloadMegaNode(singleSub.node, destPath);
+    const destPath = path.join(destDir, safeRemoteBaseName(singleSub.name, `mega_sub_${Date.now()}`));
+    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + singleSub.name);
+    await downloadMegaNode(singleSub.node, destPath, destDir);
     return {
       filePath: destPath,
       isArchive: false,
@@ -228,8 +244,9 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
       if (match) chosen = match;
     }
     console.log(`   📦 Mega: found archive: ${chosen.name}`);
-    const destPath = path.join(destDir, chosen.name);
-    await downloadMegaNode(chosen.node, destPath);
+    const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, `mega_arc_${Date.now()}`));
+    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
+    await downloadMegaNode(chosen.node, destPath, destDir);
     return {
       filePath: destPath,
       isArchive: true,
@@ -247,8 +264,9 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
       if (match) chosen = match;
     }
     console.log(`   🎬 Mega: found MKV: ${chosen.name}`);
-    const destPath = path.join(destDir, chosen.name);
-    await downloadMegaNode(chosen.node, destPath);
+    const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, `mega_mkv_${Date.now()}`));
+    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
+    await downloadMegaNode(chosen.node, destPath, destDir);
     return {
       filePath: destPath,
       isArchive: false,
@@ -595,7 +613,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
 
       await Promise.all(targetSubs.map(async (sub) => {
         console.log(`   📥 Downloading Drive sub: ${sub.name}`);
-        const subDest = path.join(unpackDir, sub.name);
+        const subDest = path.join(unpackDir, safeRemoteBaseName(sub.name, `drive_sub_${Date.now()}`));
+        if (!isInsideDir(subDest, unpackDir)) throw new Error('unsafe cloud file name: ' + sub.name);
         const subUrl = getDriveDirectUrl(sub.id);
         try {
           const res = await fetchWithTimeout(subUrl, {}, 30_000);
@@ -613,7 +632,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
         for (let i = 0; i < fontFiles.length; i += BATCH_SIZE) {
           const chunk = fontFiles.slice(i, i + BATCH_SIZE);
           await Promise.all(chunk.map(async (font) => {
-            const fontDest = path.join(fontsDir, font.name);
+            const fontDest = path.join(fontsDir, safeRemoteBaseName(font.name, `drive_font_${Date.now()}`));
+            if (!isInsideDir(fontDest, fontsDir)) throw new Error('unsafe cloud file name: ' + font.name);
             const fontUrl = getDriveDirectUrl(font.id);
             try {
               const res = await fetchWithTimeout(fontUrl, {}, 30_000);
@@ -642,7 +662,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
     // Single subtitle without fonts
     const singleSub = targetSubs[0];
     console.log(`   📥 Downloading single Drive subtitle: ${singleSub.name}`);
-    const destPath = path.join(destDir, singleSub.name);
+    const destPath = path.join(destDir, safeRemoteBaseName(singleSub.name, `drive_sub_${Date.now()}`));
+    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + singleSub.name);
     const subUrl = getDriveDirectUrl(singleSub.id);
     const res = await fetchWithTimeout(subUrl);
     if (res.ok) {
@@ -666,7 +687,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
       if (match) chosen = match;
     }
     console.log(`   📦 Drive: found archive: ${chosen.name}`);
-    const destPath = path.join(destDir, chosen.name);
+    const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, `drive_arc_${Date.now()}`));
+    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
     const arcUrl = getDriveDirectUrl(chosen.id);
     const res = await fetchWithTimeout(arcUrl);
     if (res.ok) {
