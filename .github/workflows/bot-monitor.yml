@@ -72,7 +72,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/posted.json || true
+          git add data/posted.json data/title-map.json || true
           if git diff --cached --quiet; then
             echo "ℹ️ No state changes to commit."
           else

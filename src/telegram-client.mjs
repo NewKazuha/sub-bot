@@ -22,6 +22,14 @@ import {
   resolveMediafireDirectDownload
 } from './cloud-folders.mjs';
 import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
+import {
+  resolveCanonicalTitle,
+  resolveCanonicalTitlesBatch,
+  getCachedCanonical,
+  resetCycleBudget,
+  normalizeTeamName,
+  buildSyntheticTitle
+} from './title-identity.mjs';
 
 const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
@@ -305,8 +313,11 @@ export function extractBatchRange(title) {
   return null;
 }
 
-export function getReleaseKeys(title, isOfficial = false) {
-  const fullNorm = title
+// Shared title->key normalization chain used by BOTH the base `fullNorm`
+// keys and the explicit canonical family's canonSlug (single implementation,
+// no drift). Extracted verbatim from getReleaseKeys' original fullNorm block.
+function fullNormalizeKey(title) {
+  return title
     .toLowerCase()
     .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
     .replace(/Ⅱ/g, '2')
@@ -316,6 +327,21 @@ export function getReleaseKeys(title, isOfficial = false) {
     .replace(/Ⅵ/g, '6')
     .replace(/[^\p{L}\p{N}]+/gu, '_')
     .replace(/^_+|_+$/g, '');
+}
+
+// Source token for the explicit canonical family: normalize the leading
+// platform bracket of the ORIGINAL title, mapping through SOURCE_FULL_NAME
+// when a known abbreviation exists, else the lowercased raw token.
+function resolveSourceToken(title) {
+  const m = String(title).match(/^\[\s*([^\]]+)\]/);
+  if (!m) return 'unknown';
+  const token = m[1].trim();
+  const mapped = SOURCE_FULL_NAME[token.toLowerCase()] || token;
+  return mapped.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '') || 'unknown';
+}
+
+export function getReleaseKeys(title, isOfficial = false, resolved = null) {
+  const fullNorm = fullNormalizeKey(title);
 
   const coreKey = getCoreAnimeEpisodeKey(title);
   const canonName = getCanonicalAnimeKey(title);
@@ -407,13 +433,52 @@ export function getReleaseKeys(title, isOfficial = false) {
     }
   }
 
-  return Array.from(new Set(keys.filter(Boolean)));
+  const baseKeys = Array.from(new Set(keys.filter(Boolean)));
+
+  // ---- ADDITIVE identity layer (resolved canonical titles) ----------------
+  // Base output above is IDENTICAL to the pre-layer behavior for the same
+  // input when resolved == null. AniList failure never reaches here with a
+  // broken object: callers pass null on failure (fail-open). Any unexpected
+  // error inside this branch falls back to base keys.
+  if (!resolved || typeof resolved !== 'object') return baseKeys;
+  try {
+    const dictStrings = Array.from(new Set(
+      [resolved.romaji, resolved.english].filter(s => typeof s === 'string' && s.trim())
+    ));
+    if (dictStrings.length === 0) return baseKeys;
+
+    const additions = [];
+
+    // (a) EXPLICIT canonical family: <canonSlug>_ep_<ev>_<source>
+    const canonSlug = fullNormalizeKey(resolved.romaji || resolved.english);
+    if (canonSlug && epNum) {
+      const source = resolveSourceToken(title);
+      for (const ev of getEpKeyVariants(epNum)) {
+        additions.push(`${canonSlug}_ep_${ev}_${source}`);
+      }
+    }
+
+    // (b) SYNTHETIC RE-RUNS: re-generate the full key set as if the release
+    // had arrived under each dictionary title string (romaji/english),
+    // preserving everything else in the original title verbatim.
+    // Recursion guard: resolved=null prevents re-entering this branch.
+    for (const dictName of dictStrings) {
+      const syntheticTitle = buildSyntheticTitle(title, dictName);
+      if (!syntheticTitle || syntheticTitle === title) continue;
+      additions.push(...getReleaseKeys(syntheticTitle, isOfficial, null));
+    }
+
+    return Array.from(new Set([...baseKeys, ...additions].filter(Boolean)));
+  } catch (identityErr) {
+    // Fail-open: identity layer trouble must never shrink or block key generation.
+    return baseKeys;
+  }
 }
 
 // Fansub releases are deliberately deduplicated within the same team only.
 // An official release (or another fansub team's release) must not suppress a
 // team's own subtitle merely because the anime title and episode match.
-export function getFansubReleaseKeys(title) {
+export function getFansubReleaseKeys(title, resolved = null) {
   const fullNorm = title
     .toLowerCase()
     .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
@@ -446,7 +511,13 @@ export function getFansubReleaseKeys(title) {
     .map(t => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, ''))
     .filter(Boolean);
 
-  const allTeamKeys = Array.from(new Set([teamKey, ...subTeams].filter(Boolean)));
+  // ADDITIVE team-name normalization: emit BOTH raw AND normalized team key
+  // families (aliases + year-suffix strip, e.g. "bam" -> "bam25",
+  // "bam (2025)" -> "bam25"). Joint teams are already split above — the union
+  // covers them, with each sub-team aliased individually.
+  const rawTeamKeys = Array.from(new Set([teamKey, ...subTeams].filter(Boolean)));
+  const normalizedTeamKeys = rawTeamKeys.map(t => normalizeTeamName(t)).filter(Boolean);
+  const allTeamKeys = Array.from(new Set([...rawTeamKeys, ...normalizedTeamKeys]));
   const coreKey = getCoreAnimeEpisodeKey(title);
   const canonName = getCanonicalAnimeKey(title);
   const epNum = extractEpisodeNumber(title);
@@ -483,7 +554,43 @@ export function getFansubReleaseKeys(title) {
     }
   }
 
-  return Array.from(new Set(keys.filter(Boolean)));
+  const baseKeys = Array.from(new Set(keys.filter(Boolean)));
+
+  // ---- ADDITIVE identity layer (resolved canonical titles) ----------------
+  // Fansub dedup stays team-scoped: the explicit canonical family is emitted
+  // PER team key currently in allTeamKeys (raw + normalized), preserving the
+  // "same team only" semantics. Fail-open on any unexpected error.
+  if (!resolved || typeof resolved !== 'object') return baseKeys;
+  try {
+    const dictStrings = Array.from(new Set(
+      [resolved.romaji, resolved.english].filter(s => typeof s === 'string' && s.trim())
+    ));
+    if (dictStrings.length === 0) return baseKeys;
+
+    const additions = [];
+
+    // (a) EXPLICIT canonical family, scoped per team key.
+    const canonSlug = fullNormalizeKey(resolved.romaji || resolved.english);
+    if (canonSlug && epNum) {
+      for (const tKey of allTeamKeys) {
+        for (const ev of getEpKeyVariants(epNum)) {
+          additions.push(`fansub_${tKey}_${canonSlug}_ep_${ev}`);
+        }
+      }
+    }
+
+    // (b) SYNTHETIC RE-RUNS: same dictionary-title substitution as the
+    // official path (recursion guard: resolved=null).
+    for (const dictName of dictStrings) {
+      const syntheticTitle = buildSyntheticTitle(title, dictName);
+      if (!syntheticTitle || syntheticTitle === title) continue;
+      additions.push(...getFansubReleaseKeys(syntheticTitle, null));
+    }
+
+    return Array.from(new Set([...baseKeys, ...additions].filter(Boolean)));
+  } catch (identityErr) {
+    return baseKeys;
+  }
 }
 
 export function isReleaseAlreadyPosted(posted, keys) {
@@ -1716,6 +1823,7 @@ export async function checkTelegramChannels(existingClient = null) {
   }
 
   const posted = loadPostedIds();
+  resetCycleBudget(); // fresh AniList query budget for this check cycle
   let newFound = 0;
   const toolsAvailable = hasRequiredTools();
 
@@ -1742,20 +1850,37 @@ export async function checkTelegramChannels(existingClient = null) {
     try {
       const targetChatId = CONFIG.TELEGRAM.TARGET_CHANNEL;
       const targetMsgs = await client.getMessages(targetChatId, { limit: 300 });
+      // Identity layer: prefetch canonical titles for all unique strings in the
+      // sync window (deduped, budget-capped, fail-open). Cold-cache note: this
+      // pre-pass may consume the whole per-cycle AniList budget; the candidate
+      // sites below then fail open to text keys for this cycle (safe).
+      const syncTitles = [];
+      for (const tm of targetMsgs) {
+        const text = tm.message || '';
+        const firstLine = text.split('\n')[0].trim();
+        if (firstLine) syncTitles.push(firstLine);
+        if (tm.media?.document?.attributes) {
+          const fn = tm.media.document.attributes.find(a => a.fileName)?.fileName;
+          if (fn) syncTitles.push(fn);
+        }
+      }
+      await resolveCanonicalTitlesBatch(syncTitles);
       for (const tm of targetMsgs) {
         const text = tm.message || '';
         const firstLine = text.split('\n')[0].trim();
         if (firstLine) {
-          getReleaseKeys(firstLine, true).forEach(k => posted.add(k));
-          getReleaseKeys(firstLine, false).forEach(k => posted.add(k));
-          getFansubReleaseKeys(firstLine).forEach(k => posted.add(k));
+          const rc = getCachedCanonical(firstLine);
+          getReleaseKeys(firstLine, true, rc).forEach(k => posted.add(k));
+          getReleaseKeys(firstLine, false, rc).forEach(k => posted.add(k));
+          getFansubReleaseKeys(firstLine, rc).forEach(k => posted.add(k));
         }
         if (tm.media?.document?.attributes) {
           const fn = tm.media.document.attributes.find(a => a.fileName)?.fileName;
           if (fn) {
-            getReleaseKeys(fn, true).forEach(k => posted.add(k));
-            getReleaseKeys(fn, false).forEach(k => posted.add(k));
-            getFansubReleaseKeys(fn).forEach(k => posted.add(k));
+            const rc = getCachedCanonical(fn);
+            getReleaseKeys(fn, true, rc).forEach(k => posted.add(k));
+            getReleaseKeys(fn, false, rc).forEach(k => posted.add(k));
+            getFansubReleaseKeys(fn, rc).forEach(k => posted.add(k));
           }
         }
       }
@@ -1835,7 +1960,8 @@ export async function checkTelegramChannels(existingClient = null) {
             }
 
             const formattedTitle = `[${eraiData.sourceName}] ${eraiData.title}`;
-            const releaseKeys = getReleaseKeys(formattedTitle, true);
+            const eraiResolved = await resolveCanonicalTitle(formattedTitle);
+            const releaseKeys = getReleaseKeys(formattedTitle, true, eraiResolved);
 
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
               console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted as official release. Skipping.`);
@@ -1941,9 +2067,10 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 const isOfficialSubdl = isOfficialPlatformRelease(cleanTitle);
+                const cleanTitleResolved = await resolveCanonicalTitle(cleanTitle);
                 const releaseKeys = isOfficialSubdl
-                  ? getReleaseKeys(cleanTitle, true)
-                  : getFansubReleaseKeys(cleanTitle);
+                  ? getReleaseKeys(cleanTitle, true, cleanTitleResolved)
+                  : getFansubReleaseKeys(cleanTitle, cleanTitleResolved);
 
                 if (isReleaseAlreadyPosted(posted, releaseKeys)) {
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -2081,9 +2208,10 @@ export async function checkTelegramChannels(existingClient = null) {
             // (e.g. Crunchyroll/Amazon) is an official release; team-labelled
             // messages must be deduplicated within that team, not globally.
             const isOfficialSubdl = isOfficialPlatformRelease(rawTitle);
+            const rawTitleResolved = await resolveCanonicalTitle(rawTitle);
             const releaseKeys = isOfficialSubdl
-              ? getReleaseKeys(rawTitle, true)
-              : getFansubReleaseKeys(rawTitle);
+              ? getReleaseKeys(rawTitle, true, rawTitleResolved)
+              : getFansubReleaseKeys(rawTitle, rawTitleResolved);
 
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
               markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -2308,7 +2436,8 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 const titleLine = formatCleanTitle(docBaseName);
-                const releaseKeys = getFansubReleaseKeys(titleLine);
+                const titleLineResolved = await resolveCanonicalTitle(titleLine);
+                const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
 
                 if (isReleaseAlreadyPosted(posted, releaseKeys)) {
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
@@ -2359,7 +2488,8 @@ export async function checkTelegramChannels(existingClient = null) {
             }
 
             if (titleLine) {
-              const releaseKeys = getFansubReleaseKeys(titleLine);
+              const titleLineResolved = await resolveCanonicalTitle(titleLine);
+              const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
               if (isReleaseAlreadyPosted(posted, releaseKeys)) {
                 markReleaseAsPosted(posted, msgKey, releaseKeys);
                 continue;
@@ -2447,7 +2577,8 @@ export async function checkTelegramChannels(existingClient = null) {
           }
 
           let titleLine = extractTeamAndFormatTitle(text);
-          let releaseKeys = getFansubReleaseKeys(titleLine);
+          const titleLineResolved = await resolveCanonicalTitle(titleLine);
+          let releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
 
           if (isReleaseAlreadyPosted(posted, releaseKeys)) {
             markReleaseAsPosted(posted, msgKey, releaseKeys);
