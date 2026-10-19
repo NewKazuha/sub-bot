@@ -26,8 +26,11 @@ export const MAX_CONSECUTIVE_FAILURES = 3; // transport failures -> breaker open
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 // NOTE: deliberately no `native` field (see guard corrections C4).
+// Enrichment (episode-numbering fix): `episodes` powers the sequel-overflow
+// gate; `relations` exposes the SEQUEL edge so cumulative episode counts
+// (e.g. "2nd Season - 13" on a 12-episode season) can be cross-linked.
 const ANILIST_QUERY =
-  'query ($search: String) { Page(perPage: 5) { media(search: $search, type: ANIME) { id title { romaji english } synonyms } } }';
+  'query ($search: String) { Page(perPage: 5) { media(search: $search, type: ANIME) { id title { romaji english } synonyms episodes relations { edges { relationType node { id episodes title { romaji english } } } } } } }';
 
 // Fansub team alias map (exact-match on the normalized token; year suffix is
 // stripped BEFORE alias lookup so "[bam (2025)]" -> bam -> bam25).
@@ -230,6 +233,42 @@ function tryConsumeBudget() {
 }
 
 // --------------------------------------------------------------------
+// buildCanonicalResult — CONDITIONAL enrichment of a positive cache entry
+// (binding contract, episode-numbering fix):
+//   - base output is ALWAYS exactly { romaji, english };
+//   - `episodes`   — only when a positive integer (null/0/absent = unknown);
+//   - `relations`  — the edges array, only when present/non-empty;
+//   - `sequel`     — first SEQUEL edge as { id, episodes, romaji, english };
+//   - NEVER null placeholders: old-shaped entries (no episodes/relations)
+//     must keep returning EXACTLY { romaji, english } (strict deepEqual).
+// --------------------------------------------------------------------
+function buildCanonicalResult(entry) {
+  if (!entry || entry.negative) return null;
+  const out = {
+    romaji: entry.romaji ?? null,
+    english: entry.english ?? null,
+  };
+  if (Number.isInteger(entry.episodes) && entry.episodes > 0) {
+    out.episodes = entry.episodes;
+  }
+  if (Array.isArray(entry.relations) && entry.relations.length > 0) {
+    out.relations = entry.relations;
+  }
+  const edges = Array.isArray(entry.relations) ? entry.relations : [];
+  const sequelEdge = edges.find(e => e && e.relationType === 'SEQUEL' && e.node);
+  const sequelSrc = sequelEdge ? sequelEdge.node : (entry.sequel && entry.sequel.id != null ? entry.sequel : null);
+  if (sequelSrc && sequelSrc.id != null) {
+    out.sequel = {
+      id: sequelSrc.id,
+      episodes: Number.isInteger(sequelSrc.episodes) ? sequelSrc.episodes : null,
+      romaji: sequelSrc.romaji ?? sequelSrc.title?.romaji ?? null,
+      english: sequelSrc.english ?? sequelSrc.title?.english ?? null,
+    };
+  }
+  return out;
+}
+
+// --------------------------------------------------------------------
 // resolveCanonicalTitle — never throws. Cache hit / negative hit /
 // budget exhaustion return without fetching.
 // --------------------------------------------------------------------
@@ -241,7 +280,7 @@ export async function resolveCanonicalTitle(rawTitle) {
     const map = loadTitleMap();
     const entry = map[q];
     if (entry && !entry.negative) {
-      return { romaji: entry.romaji ?? null, english: entry.english ?? null };
+      return buildCanonicalResult(entry);
     }
     if (entry && entry.negative) {
       // FIX-5 [future-ts clamp]: clamp the stored ts to "now"; a ts that was
@@ -308,7 +347,7 @@ export async function resolveCanonicalTitle(rawTitle) {
       if (passesTrustGuard(tokenize(q), candidate)) {
         const romaji = candidate?.title?.romaji || null;
         const english = candidate?.title?.english || null;
-        map[q] = {
+        const entryOut = {
           id: candidate?.id ?? null,
           romaji,
           english,
@@ -316,8 +355,26 @@ export async function resolveCanonicalTitle(rawTitle) {
           negative: false,
           ts: Date.now(),
         };
+        // Episode-numbering enrichment: persist ONLY what the API actually
+        // returned (absent field => old-shaped entry => { romaji, english }).
+        if (candidate?.episodes !== undefined) entryOut.episodes = candidate.episodes; // number|null as returned
+        const edges = Array.isArray(candidate?.relations?.edges) ? candidate.relations.edges : null;
+        // Cap stored edges (F9) to bound cache growth; the SEQUEL derived
+        // below still scans the full response before capping.
+        if (edges) entryOut.relations = edges.slice(0, 20);
+        const sequelEdge = edges ? edges.find(e => e && e.relationType === 'SEQUEL' && e.node && e.node.id != null) : null;
+        if (sequelEdge) {
+          entryOut.sequel = {
+            id: sequelEdge.node.id,
+            episodes: Number.isInteger(sequelEdge.node.episodes) ? sequelEdge.node.episodes : null,
+            romaji: sequelEdge.node.title?.romaji ?? null,
+            english: sequelEdge.node.title?.english ?? null,
+          };
+        }
+        map[q] = entryOut;
         saveTitleMap();
-        return { romaji, english };
+        // Same conditional shape as the cache-hit path (single builder).
+        return buildCanonicalResult(entryOut);
       }
     }
 
@@ -339,7 +396,9 @@ export function getCachedCanonical(rawTitle) {
     if (q.length < 2) return null;
     const entry = loadTitleMap()[q];
     if (!entry || entry.negative) return null;
-    return { romaji: entry.romaji ?? null, english: entry.english ?? null };
+    // Same enriched conditional shape as resolveCanonicalTitle — this feeds
+    // the sync pre-pass in telegram-client (getCachedCanonical call sites).
+    return buildCanonicalResult(entry);
   } catch {
     return null;
   }

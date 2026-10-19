@@ -246,6 +246,128 @@ export function extractEpisodeNumber(text) {
   return '';
 }
 
+// Secondary/alternative episode marker inside brackets — the fast-path
+// counterpart of extractEpisodeNumber: "[P2 - 01]", "[Part 2 - 01]",
+// "[Cour 2 - 03]" -> the SECOND number (the per-part episode), unpadded.
+// Standalone "[Part 2]" / "[Season 2]" / "[P2]" do NOT match (no dash+ep).
+export function extractSecondaryEpisodeNumber(title) {
+  if (!title) return '';
+  const m = String(title).match(/\[\s*(?:part|cour|[ps])\s*(\d{1,2})\s*[-~]\s*(\d{1,4})\s*\]/i);
+  if (!m) return '';
+  return String(m[2]).replace(/^0+/, '') || '0';
+}
+
+// Replace the FIRST episode token with the pad2 dash form " - 01". Internal:
+// used only by the fast-path / sequel synthesis below. Returns null when no
+// episode token. Token locating mirrors buildSyntheticTitle exactly (F7):
+//   - operate on the region AFTER the leading platform bracket (a number
+//     inside the platform bracket is never an episode token),
+//   - require idx > 0 (a real name region must exist),
+//   - reject batch-shaped regions (\d{1,4}\s*[-~]\s*\d{1,4} after stripping
+//     bracket contents) as ambiguous — EXCEPT period markers ("Part 2 - 13"),
+//     which the same part/cour/season/[ps] prefix exclusion used by
+//     extractBatchRange treats as period + episode, not a batch. (A literal
+//     batch guard would reject the defect's own sequel title "...Part 2 - 13".)
+// The EP_PATTERNS lookaheads keep numbers inside "[...]" (e.g. "[P2 - 01]")
+// unmatchable, so bracket-internal numbers are never rewritten.
+function replacePrimaryEpisode(title, ep) {
+  try {
+    const s = String(title ?? '');
+    const noPad = String(ep ?? '').replace(/^0+/, '') || '0';
+    const pad2 = noPad.padStart(2, '0');
+    if (!s) return null;
+    const platformMatch = s.match(/^\[[^\]]*\]\s*/);
+    const platform = platformMatch ? platformMatch[0] : '';
+    const rest = s.slice(platform.length);
+    const batchProbe = rest.replace(/\[[^\]]*\]/g, ' ');
+    for (const bm of batchProbe.matchAll(/\d{1,4}\s*[-~]\s*\d{1,4}/g)) {
+      if (!/\b(?:part|cour|season|[ps])\s*$/i.test(batchProbe.slice(0, bm.index))) return null;
+    }
+    const EP_PATTERNS = [
+      /\s+-\s*\d{1,4}(?:\s*v\d+)?(?=\s|$|\[|\()/,
+      /\s+ep(?:isode)?\.?\s*\d{1,4}(?:\s*v\d+)?(?=\s|$|\[|\()/i,
+      /\s+e\.?\s*\d{1,4}(?:\s*v\d+)?(?=\s|$|\[|\()/i,
+      /#\s*\d{1,4}(?:\s*v\d+)?(?=\s|$|\[|\()/,
+      /\s+S\d{1,2}E\d{1,3}(?:\s*v\d+)?(?=\s|$|\[|\()/i,
+    ];
+    let idx = -1;
+    let hit = null;
+    for (const re of EP_PATTERNS) {
+      const m = rest.match(re);
+      if (m && (idx === -1 || m.index < idx)) {
+        idx = m.index;
+        hit = m;
+      }
+    }
+    if (idx <= 0 || !hit) return null;
+    return platform + rest.slice(0, idx) + ` - ${pad2}` + rest.slice(idx + hit[0].length);
+  } catch {
+    return null;
+  }
+}
+
+// Remove secondary bracket markers "[P2 - 01]" / "[Part 2 - 01]" /
+// "[Cour 2 - 03]" (internal; sequel synthesis only).
+function stripSecondaryBracket(title) {
+  return String(title ?? '').replace(/\s*\[\s*(?:part|cour|[ps])\s*\d{1,2}\s*[-~]\s*\d{1,4}\s*\]/gi, '');
+}
+
+// ---- identity extra-title synthesis (SHARED by both key functions) --------
+// Produces the extra titles whose OWN key families the resolved layer unions
+// in, using ONE implementation (F2): (c) fast-path secondary episode and
+// (d) sequel overflow. Each caller then re-runs ITS OWN recursive key function
+// with resolved=null on each returned title (recursion guard unchanged).
+// Only reachable with a non-null resolved object (callers guard), so the
+// resolved=null path emits no fast-path/sequel keys.
+function collectIdentityExtraTitles(title, epNum, resolved) {
+  const out = [];
+  try {
+    // (c) FAST-PATH: a bracketed secondary episode ([P2 - 01], [Part 2 - 01],
+    // [Cour 2 - 03]) also emits the full key set of the same title under the
+    // per-part episode. The secondary bracket is stripped too (F1): keeping it
+    // would leave a stale `_p2_01` suffix in the fast-path fullNorm/coreKey.
+    const secondary = extractSecondaryEpisodeNumber(title);
+    if (secondary && epNum && Number(secondary) !== Number(epNum)) {
+      const altTitle = stripSecondaryBracket(replacePrimaryEpisode(title, secondary));
+      if (altTitle && altTitle !== title) out.push(altTitle);
+    }
+
+    // (d) SEQUEL OVERFLOW: a cumulative episode count beyond the resolved
+    // season's total means this is the sequel cour posted under the old
+    // season name — emit the keys of the sequel title with the recomputed
+    // 1-indexed difference (e.g. 13 - 12 = 1). Original keys stay (cumulative
+    // posting). Fail-open: any error in here means no extra titles.
+    if (
+      Number.isInteger(resolved.episodes) && resolved.episodes > 0 &&
+      Number(epNum) > resolved.episodes &&
+      (Number(epNum) - resolved.episodes) <= 100 &&
+      resolved.sequel && resolved.sequel.id != null
+    ) {
+      const diff = Number(epNum) - resolved.episodes;
+      // F5 fail-CLOSED guard: when the sequel's own total is KNOWN and the
+      // difference exceeds it, this release cannot be that sequel — skip.
+      // (Wrong suppression is worse than a duplicate; unknown total -> allow.)
+      const sequelTotal = resolved.sequel.episodes;
+      const beyondKnownSequelTotal = Number.isInteger(sequelTotal) && sequelTotal > 0 && diff > sequelTotal;
+      if (!beyondKnownSequelTotal) {
+        const sequelName = resolved.sequel.romaji || resolved.sequel.english;
+        let sequelTitle = sequelName ? buildSyntheticTitle(title, sequelName) : null;
+        if (sequelTitle) {
+          const replaced = replacePrimaryEpisode(sequelTitle, String(diff));
+          if (replaced) {
+            const finalSequelTitle = stripSecondaryBracket(replaced);
+            if (finalSequelTitle && finalSequelTitle !== title) out.push(finalSequelTitle);
+          }
+        }
+      }
+    }
+  } catch {
+    // Fail-open: synthesis trouble must never shrink key generation —
+    // base keys are emitted regardless of what happens here.
+  }
+  return out;
+}
+
 // NOTE: `_batch_` keys intentionally use a 2-variant scheme (raw + pad2) while
 // `_ep_` keys use 3 variants (raw / noPad / pad2) — do not "fix" this asymmetry.
 function getEpKeyVariants(ep) {
@@ -298,17 +420,38 @@ export function getCanonicalAnimeKey(title) {
 
 export function extractBatchRange(title) {
   if (!title) return null;
+  const s = String(title);
+  // A match right after "Part 2 -" / "Season 3 -" / "Cour 2 -" is a PERIOD
+  // marker (part number + episode), NOT a batch range — never key on it.
+  const isPeriodPrefix = (idx) => /\b(?:part|cour|season|[ps])\s*$/i.test(s.slice(0, idx));
+  // start < end on ALL rules (descending "13-01" was previously ungated);
+  // an invalid/excluded candidate CONTINUES the scan for a later range.
+  const valid = (a, b, idx) => {
+    const start = parseInt(a, 10);
+    const end = parseInt(b, 10);
+    if (isNaN(start) || isNaN(end)) return null;
+    if (!(start < end)) return null;
+    if (isPeriodPrefix(idx)) return null;
+    return [start, end];
+  };
+
   // 1. Tilde is unambiguous range (e.g. 001~005, 01~13, 01 ~ 13)
-  let m = title.match(/(\d{1,4})\s*~\s*(\d{1,4})/);
-  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+  for (const m of s.matchAll(/(\d{1,4})\s*~\s*(\d{1,4})/g)) {
+    const r = valid(m[1], m[2], m.index);
+    if (r) return r;
+  }
 
   // 2. Bracketed range (e.g. [01 - 13], [01-13 END])
-  m = title.match(/\[\s*(\d{1,4})\s*[-~]\s*(\d{1,4})\s*(?:END)?\s*\]/i);
-  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+  for (const m of s.matchAll(/\[\s*(\d{1,4})\s*[-~]\s*(\d{1,4})\s*(?:END)?\s*\]/gi)) {
+    const r = valid(m[1], m[2], m.index);
+    if (r) return r;
+  }
 
   // 3. Trailing range at end of string or before quality tags
-  m = title.match(/(?:^|\s)\b(\d{1,4})\s*-\s*(\d{1,4})\b(?:\s*END)?(?:\s*\[|\s*$)/i);
-  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+  for (const m of s.matchAll(/(?:^|\s)\b(\d{1,4})\s*-\s*(\d{1,4})\b(?:\s*END)?(?:\s*\[|\s*$)/gi)) {
+    const r = valid(m[1], m[2], m.index);
+    if (r) return r;
+  }
 
   return null;
 }
@@ -436,10 +579,13 @@ export function getReleaseKeys(title, isOfficial = false, resolved = null) {
   const baseKeys = Array.from(new Set(keys.filter(Boolean)));
 
   // ---- ADDITIVE identity layer (resolved canonical titles) ----------------
-  // Base output above is IDENTICAL to the pre-layer behavior for the same
-  // input when resolved == null. AniList failure never reaches here with a
-  // broken object: callers pass null on failure (fail-open). Any unexpected
-  // error inside this branch falls back to base keys.
+  // Base key FAMILIES above are unchanged from the pre-layer behavior for the
+  // same input when resolved == null (scope: families, not every key —
+  // extractBatchRange's start<end / period-prefix gating intentionally applies
+  // on ALL paths per acceptance ب, so bogus batch keys are absent everywhere).
+  // AniList failure never reaches here with a broken object: callers pass null
+  // on failure (fail-open). Any unexpected error inside this branch falls back
+  // to base keys.
   if (!resolved || typeof resolved !== 'object') return baseKeys;
   try {
     const dictStrings = Array.from(new Set(
@@ -466,6 +612,13 @@ export function getReleaseKeys(title, isOfficial = false, resolved = null) {
       const syntheticTitle = buildSyntheticTitle(title, dictName);
       if (!syntheticTitle || syntheticTitle === title) continue;
       additions.push(...getReleaseKeys(syntheticTitle, isOfficial, null));
+    }
+
+    // (c)+(d) FAST-PATH + SEQUEL OVERFLOW: shared synthesis (single
+    // implementation for both key functions); each extra title is re-run
+    // through THIS function with resolved=null (recursion guard).
+    for (const extraTitle of collectIdentityExtraTitles(title, epNum, resolved)) {
+      additions.push(...getReleaseKeys(extraTitle, isOfficial, null));
     }
 
     return Array.from(new Set([...baseKeys, ...additions].filter(Boolean)));
@@ -585,6 +738,14 @@ export function getFansubReleaseKeys(title, resolved = null) {
       const syntheticTitle = buildSyntheticTitle(title, dictName);
       if (!syntheticTitle || syntheticTitle === title) continue;
       additions.push(...getFansubReleaseKeys(syntheticTitle, null));
+    }
+
+    // (c)+(d) FAST-PATH + SEQUEL OVERFLOW: shared synthesis (single
+    // implementation for both key functions); each extra title is re-run
+    // through THIS function with resolved=null (recursion guard; team-scoped
+    // fansub keys preserved by the caller).
+    for (const extraTitle of collectIdentityExtraTitles(title, epNum, resolved)) {
+      additions.push(...getFansubReleaseKeys(extraTitle, null));
     }
 
     return Array.from(new Set([...baseKeys, ...additions].filter(Boolean)));
