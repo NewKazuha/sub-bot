@@ -11,3 +11,4 @@ temp_*
 .env.*
 !.env.example
 *.log
+.reports/
