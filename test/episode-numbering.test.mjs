@@ -465,4 +465,32 @@ test('ReDEJA Horemajo vs Doumo Suki na Hito ni Horegusuri deduplication', () => 
   assert.ok(common.includes('fansub_redeja_doumo_suki_na_hito_ni_horegusuri_wo_irai_sareta_majo_desu_ep_02'));
 });
 
+test('suzume soko Gensou Suikoden vs Suikoden The Anime deduplication', () => {
+  const title1 = '[suzume soko] Gensou Suikoden - 01 [+Fonts]';
+  const title2 = '[suzume soko] Suikoden The Anime E01 [+Fonts]';
+
+  // Resolved canonical shape matching AniList entry 187316
+  const resolved = {
+    romaji: 'Gensou Suikoden',
+    english: null,
+    episodes: 23,
+  };
+
+  const keys1 = tc.getFansubReleaseKeys(title1, resolved);
+  const keys2 = tc.getFansubReleaseKeys(title2, resolved);
+
+  // Both directions must detect each other as duplicates
+  const keys1Blocks2 = keys2.some((k) => keys1.includes(k));
+  const keys2Blocks1 = keys1.some((k) => keys2.includes(k));
+
+  assert.equal(keys1Blocks2, true, 'Gensou Suikoden must block Suikoden The Anime');
+  assert.equal(keys2Blocks1, true, 'Suikoden The Anime must block Gensou Suikoden');
+
+  const common = keys1.filter((k) => keys2.includes(k));
+  assert.ok(common.length >= 2, `Expected at least 2 common keys, got ${common.length}`);
+  assert.ok(common.includes('fansub_suzume_soko_gensou_suikoden_ep_1'));
+  assert.ok(common.includes('fansub_suzume_soko_gensou_suikoden_ep_01'));
+});
+
+
 
