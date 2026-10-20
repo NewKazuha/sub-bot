@@ -130,7 +130,10 @@ export function normalizeQuery(rawTitle) {
   // 4. strip (parentheses)
   s = s.replace(/\([^)]*\)/g, ' ');
   // 5. strip quality/codec tokens
-  s = s.replace(/\b(1080p|720p|480p|2160p|4k|bd|bdrip|web-?dl|hevc|h264|x264|x265|aac|flac)\b/gi, ' ');
+  s = s.replace(/\b(1080p|720p|480p|2160p|4k|bd|bdrip|web-?dl|webrip|hevc|h264|x264|x265|aac|flac)\b/gi, ' ');
+  // 5b. strip platform & language release tags
+  s = s.replace(/\b(cr|hidive)\b/gi, ' ');
+  s = s.replace(/\b(?:arabic|ara)(?:\s+ar)?\b/gi, ' ');
   // 6. strip SxxEyy
   s = s.replace(/\bS\d{1,2}E\d{1,3}\b/gi, ' ');
   // 7. strip "ep 04" / "episode 4" / "e04" forms

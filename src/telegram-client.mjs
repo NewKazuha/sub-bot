@@ -236,12 +236,23 @@ export function extractEpisodeNumber(text) {
     }
   }
 
+  // Parse SxxEyy / Sxx EPyy / Sxx Episode yy (e.g. S01E15, S1 E07, S01EP15)
+  const se = cleaned.match(/\bS(\d{1,2})\s*E(?:P|pisode)?\s*(\d{1,4})\b/i);
+  if (se) {
+    const n = parseInt(se[2], 10);
+    if (!isNaN(n) && n > 0) return String(n);
+  }
+
   for (const item of ARABIC_EPISODE_WORDS) {
     if (item.p.test(cleaned)) return item.ep;
   }
 
-  // Match patterns like: " - 46", " E46", " EP46", " Episode 46", " #46", " [46]", " 46", "~ 46"
-  const m = cleaned.match(/(?:-\s*|ep(?:isode)?\s*|e\s*|#\s*|\s+|~)(\d{1,4})(?:\s*v\d+)?(?:\s*\[|\s*\(|\s*\.|\s*$)/i);
+  // 1. Explicit dash or episode prefixes: " - 46", " - 02", " ep 04", " episode 12", " e04", " #46"
+  const mExplicit = cleaned.match(/(?:\s+-\s*|\bep(?:isode)?\s*|\be\s*|#\s*)(\d{1,4})(?:\s*v\d+)?\b/i);
+  if (mExplicit) return mExplicit[1].replace(/^0+/, '') || '0';
+
+  // 2. Loose patterns like bare numbers: " 46", "~ 46" require a trailing bracket, paren, dot, or end-of-string
+  const m = cleaned.match(/(?:\s+|~)(\d{1,4})(?:\s*v\d+)?(?:\s*\[|\s*\(|\s*\.|\s*$)/i);
   if (m) return m[1].replace(/^0+/, '') || '0';
   return '';
 }
@@ -801,7 +812,8 @@ export function formatCleanTitle(raw) {
 }
 
 export function isOfficialPlatformRelease(title) {
-  return /^\[\s*(?:cr(?:unchyroll)?|nf|netflix|dsnp|disney\+?|amzn|amazon(?:\s+prime)?|prime|hidive|shahid|bilibili|b-global|adn|abema|erai[-_\s]*raws)\s*\]/i.test(title);
+  return /^\[\s*(?:cr(?:unchyroll)?|nf|netflix|dsnp|disney\+?|amzn|amazon(?:\s+prime)?|prime|hidive|shahid|bilibili|b-global|adn|abema|erai[-_\s]*raws)\s*\]/i.test(title)
+    || /\b(?:CR|NF|Netflix|DSNP|Disney\+?|AMZN|Amazon|Prime|HIDIVE)\s*(?:\.|\s+)?(?:WEB-?DL|WEBRip)\b/i.test(title);
 }
 
 export function cleanEnglishTitleFromFilename(fileName, teamName = '') {

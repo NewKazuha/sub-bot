@@ -360,3 +360,51 @@ test('Erai batch title extraction detects multi-episode batches (e.g. 01 ~ 10)',
   const single = tc.extractBatchRange('[Netflix] Cyberpunk: Edgerunners 2 - 01');
   assert.equal(single, null);
 });
+
+test('extractEpisodeNumber: parses SxxEyy formats correctly', () => {
+  assert.equal(tc.extractEpisodeNumber('Chitose Is In The Ramune Bottle S01E15 CR WEB-DL Arabic AR'), '15');
+  assert.equal(tc.extractEpisodeNumber('Show S1 E07 1080p'), '7');
+  assert.equal(tc.extractEpisodeNumber('Anime S02EP04 720p'), '4');
+  assert.equal(tc.extractEpisodeNumber('Series S01Episode12 [WEB-DL]'), '12');
+});
+
+test('Chitose live defect: S01E15 and Part 2 - 02 overlap via sequel overflow', async () => {
+  const titleA = '[Crunchyroll] Chitose-kun wa Ramune Bin no Naka Part 2 - 02';
+  const titleB = 'Chitose Is In The Ramune Bottle S01E15 CR WEB-DL Arabic AR';
+
+  assert.equal(tc.extractEpisodeNumber(titleA), '2');
+  assert.equal(tc.extractEpisodeNumber(titleB), '15');
+
+  // Verify normalizeQuery cleanly strips CR and Arabic AR
+  const normB = normalizeQuery(titleB);
+  assert.equal(normB, 'Chitose Is In The Ramune Bottle');
+
+  // Resolved shape matching AniList entry 180082 (Part 1, 13 episodes, sequel -> Part 2)
+  const resolvedChitose = {
+    romaji: 'Chitose-kun wa Ramune Bin no Naka',
+    english: 'Chitose Is in the Ramune Bottle',
+    episodes: 13,
+    sequel: {
+      id: 198727,
+      episodes: 11,
+      romaji: 'Chitose-kun wa Ramune Bin no Naka Part 2',
+      english: 'Chitose Is in the Ramune Bottle 2nd Cour',
+    },
+  };
+
+  // Fansub mode overlap (at least 6 token keys match)
+  const keysA = tc.getReleaseKeys(titleA, true, resolvedChitose);
+  const keysB = tc.getReleaseKeys(titleB, false, resolvedChitose);
+  const overlapFansub = keysA.filter((k) => keysB.includes(k));
+  assert.ok(overlapFansub.length >= 6, 'S01E15 must intersect with Part 2 - 02 via 15 - 13 = 2 overflow');
+  assert.ok(overlapFansub.includes('token_ep_2_chitose_kun'), 'token_ep_2_chitose_kun must match');
+  assert.ok(overlapFansub.includes('token_ep_02_chitose_kun'), 'token_ep_02_chitose_kun must match');
+
+  // Official mode overlap (isOfficialPlatformRelease returns true for CR WEB-DL)
+  assert.equal(tc.isOfficialPlatformRelease(titleB), true, 'CR WEB-DL must be recognized as official');
+  const keysBOfficial = tc.getReleaseKeys(titleB, true, resolvedChitose);
+  const overlapOfficial = keysA.filter((k) => keysBOfficial.includes(k));
+  assert.ok(overlapOfficial.length >= 14, 'Official CR WEB-DL must intersect with Part 2 - 02 with 14 keys');
+  assert.ok(overlapOfficial.includes('official_ep_2_chitose_kun'), 'official_ep_2_chitose_kun must match');
+});
+
