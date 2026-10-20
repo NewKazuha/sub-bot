@@ -12,3 +12,4 @@ temp_*
 !.env.example
 *.log
 .reports/
+opencode.json

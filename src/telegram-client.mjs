@@ -1424,7 +1424,7 @@ export function packFolderToZip(folderPath, destZipPath) {
   return destZipPath;
 }
 
-export async function downloadFileToDisk(url, destPath, headers = {}) {
+export async function downloadFileToDisk(url, destPath, headers = {}, options = {}) {
   const signal = AbortSignal.timeout(10 * 60 * 1000);
   const requestOptions = {
     signal,
@@ -1433,7 +1433,17 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
       ...headers
     }
   };
+  const expectedHost = options.expectedHost ? String(options.expectedHost).toLowerCase() : null;
+  const assertHost = res => {
+    if (!expectedHost) return;
+    const actualHost = new URL(res.url).hostname.toLowerCase();
+    if (actualHost !== expectedHost) {
+      throw new Error(`Download redirected to unexpected host "${actualHost}" (expected "${expectedHost}")`);
+    }
+  };
+
   let res = await fetch(url, requestOptions);
+  assertHost(res);
 
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 
@@ -1458,6 +1468,7 @@ export async function downloadFileToDisk(url, destPath, headers = {}) {
       confirmedUrl.search = params.toString();
       console.log('   ↪️ Confirming public Google Drive download.');
       res = await fetch(confirmedUrl, requestOptions);
+      assertHost(res);
       if (!res.ok) throw new Error(`Google Drive confirmation returned HTTP ${res.status}`);
     }
   }
@@ -2659,7 +2670,9 @@ export async function checkTelegramChannels(existingClient = null) {
               const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
               const postPageUrl = urlMatches.find(u => !u.includes('t.me') && !u.includes('twitter'));
               if (postPageUrl) {
-                const pageData = await scrapePostPage(postPageUrl);
+                const pageData = await scrapePostPage(postPageUrl, null, extractEpisodeNumber(titleLine) || null, titleLine);
+                if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
+                else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
                 if (pageData) {
                   let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
                   if (pageData.videoLinks?.top4top) {
@@ -2700,7 +2713,8 @@ export async function checkTelegramChannels(existingClient = null) {
                   if (directUrl) {
                     try {
                       const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}`);
-                      await downloadFileToDisk(directUrl, tempDest);
+                      const dlOptions = pageData?.source === 'mugi-worker' ? { expectedHost: new URL(directUrl).hostname } : {};
+                      await downloadFileToDisk(directUrl, tempDest, {}, dlOptions);
                       const validated = validateFileMagic(tempDest);
                       if (validated) {
                         const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
@@ -2814,7 +2828,10 @@ export async function checkTelegramChannels(existingClient = null) {
             console.log(`\n✨ [Fansub Post] "${titleLine}"`);
             console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
             const targetEp = extractEpisodeNumber(titleLine);
-            const pageData = await scrapePostPage(postPageUrl, matchingSite, targetEp);
+            const pageData = await scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine);
+
+            if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
+            else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
 
             if (pageData) {
               const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
@@ -2839,7 +2856,8 @@ export async function checkTelegramChannels(existingClient = null) {
                   try {
                     console.log(`   📥 Direct download: ${directUrl}`);
                     const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
-                    await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl });
+                    const dlOptions = pageData?.source === 'mugi-worker' ? { expectedHost: new URL(directUrl).hostname } : {};
+                    await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl }, dlOptions);
                     if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
                   } catch (e) {
                     console.warn(`   ⚠️ Direct download failed:`, e.message);

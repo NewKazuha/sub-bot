@@ -2,9 +2,304 @@ import * as cheerio from 'cheerio';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { matchesEpisode } from './cloud-folders.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
+
+// Mugi-Subs publishes its subtitle folders through a public Cloudflare Worker
+// (a GoIndex-style browser over a shared Drive). The main site (mugi-subs.com)
+// is Cloudflare-403 for datacenter IPs, so we resolve releases via the worker
+// API instead of scraping the blocked page.
+const MUGI_WORKER_BASE = 'https://subs.mugisubs.workers.dev';
+const MUGI_WORKER_TIMEOUT_MS = 15_000;
+// Root listing TTL is 120 s so it survives a full 60 s poll cycle (the previous
+// 60 s TTL expired mid-cycle and re-fetched the root on every poll).
+const MUGI_ROOT_TTL_MS = 120_000;
+const MUGI_MAX_PAGES = 5;
+const MUGI_MAX_CANDIDATES = 8;
+const MUGI_MAX_JSON_BYTES = 2_000_000;
+const MUGI_MAX_NAME_LENGTH = 1_024;
+const MUGI_BREAKER_THRESHOLD = 3;
+
+let mugiFetchImpl = (...args) => globalThis.fetch(...args);
+let mugiRootCache = null;
+// Circuit breaker: after MUGI_BREAKER_THRESHOLD consecutive worker request
+// failures, stop hammering the worker for the rest of the process lifetime.
+let mugiConsecutiveFailures = 0;
+let mugiBreakerWarned = false;
+
+// Test hooks. Not used by production code paths.
+export function __setFetchImpl(fn) {
+  mugiFetchImpl = fn;
+}
+
+export function __resetMugiWorkerState() {
+  mugiRootCache = null;
+  mugiConsecutiveFailures = 0;
+  mugiBreakerWarned = false;
+  mugiFetchImpl = (...args) => globalThis.fetch(...args);
+}
+
+// True only for mugi-subs.com and its subdomains. Uses the parsed hostname so
+// lookalikes (notmugi-subs.com, mugi-subs.com.evil.com) never match.
+export function isMugiHost(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'mugi-subs.com' || host.endsWith('.mugi-subs.com');
+  } catch {
+    return false;
+  }
+}
+
+// Normalize a release title or folder name into comparable tokens. Bracket
+// contents are removed entirely so a fansub tag like "[Mugi-Subs]" does not
+// leak "mugi"/"subs" tokens that would otherwise match every Mugi folder.
+export function mugiNormalizeTokens(input, targetEp = '') {
+  let s = String(input ?? '');
+  s = s.replace(/https?:\/\/[^\s]+/gi, ' ');
+  s = s.replace(/\[[^\]]*\]/g, ' ');
+  s = s.replace(/\([^)]*\)/g, ' ');
+  s = s.replace(/\bep(?:isode)?\s*\.?\s*\d{1,4}(?:v\d+)?\b/gi, ' ');
+  s = s.toLowerCase();
+  s = s.replace(/[^\p{L}\p{N}]+/gu, ' ');
+  const tokens = s.split(/\s+/).filter(Boolean);
+
+  const epNorm = String(targetEp).replace(/^0+/, '') || (String(targetEp) === '0' ? '0' : '');
+  const fileTokenRegex = /^(?:1080p|720p|480p|2160p|4k|bd|bdrip|web-?dl|web|hevc|h264|x264|x265|aac|flac|mkv|mp4|ass|srt)$/;
+  const seasonTokenRegex = /^(?:season|part|cour)\d*$/;
+
+  return tokens.filter(t => {
+    if (/(?:19|20)\d{2}/.test(t)) return false;
+    if (epNorm && t === epNorm) return false;
+    if (t === 'episode' || t === 'ep' || t === 'e') return false;
+    if (fileTokenRegex.test(t)) return false;
+    if (seasonTokenRegex.test(t)) return false;
+    if (t.length === 1) return false;
+    return true;
+  });
+}
+
+async function mugiPostJson(urlPath, body, timeoutMs = MUGI_WORKER_TIMEOUT_MS) {
+  try {
+    const res = await mugiFetchImpl(`${MUGI_WORKER_BASE}${urlPath}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': UA },
+      body: JSON.stringify(body),
+      // Never follow a redirect: a 3xx throws and is caught below. The worker
+      // API is a fixed origin; a redirect could steer us to another host.
+      redirect: 'error',
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res || !res.ok) {
+      console.warn(`   ⚠️ Mugi worker request failed (${res ? res.status : 'no response'}) for ${urlPath}`);
+      mugiConsecutiveFailures++;
+      return null;
+    }
+    const declaredLength = Number(res.headers?.get?.('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > MUGI_MAX_JSON_BYTES) {
+      console.warn(`   ⚠️ Mugi worker response for ${urlPath} declared ${declaredLength} bytes; refusing to read`);
+      mugiConsecutiveFailures++;
+      return null;
+    }
+    const text = await res.text();
+    if (text.length > MUGI_MAX_JSON_BYTES) {
+      console.warn(`   ⚠️ Mugi worker response for ${urlPath} exceeded ${MUGI_MAX_JSON_BYTES} bytes; refusing to parse`);
+      mugiConsecutiveFailures++;
+      return null;
+    }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      console.warn(`   ⚠️ Mugi worker response for ${urlPath} was not valid JSON: ${e.message}`);
+      mugiConsecutiveFailures++;
+      return null;
+    }
+    mugiConsecutiveFailures = 0;
+    return json;
+  } catch (e) {
+    console.warn(`   ⚠️ Mugi worker request error for ${urlPath}: ${e.message}`);
+    mugiConsecutiveFailures++;
+    return null;
+  }
+}
+
+function mugiEntriesFromJson(json) {
+  const files = json?.data?.files ?? json?.files;
+  return Array.isArray(files) ? files : [];
+}
+
+// Walk a worker folder listing, following nextPageToken up to MUGI_MAX_PAGES.
+// Returns the accumulated entries, or null when a page could not be fetched.
+async function fetchMugiListing(urlPath, deadline) {
+  const entries = [];
+  const seenNames = new Set();
+  let pageToken = null;
+  let pageIndex = 0;
+
+  for (let page = 0; page < MUGI_MAX_PAGES; page++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      console.warn(`   ⚠️ Mugi worker deadline exceeded while listing ${urlPath}`);
+      return null;
+    }
+    const body = page === 0
+      ? { password: '' }
+      : { password: '', page_token: pageToken, page_index: pageIndex };
+    const json = await mugiPostJson(urlPath, body, Math.min(MUGI_WORKER_TIMEOUT_MS, Math.max(1, remaining)));
+    if (!json) return null;
+
+    let added = 0;
+    for (const entry of mugiEntriesFromJson(json)) {
+      // Skip nameless entries and de-duplicate by name so a repeated folder
+      // entry is only counted (and later requested) once.
+      if (!entry || typeof entry.name !== 'string' || entry.name.length === 0) continue;
+      if (seenNames.has(entry.name)) continue;
+      seenNames.add(entry.name);
+      entries.push(entry);
+      added++;
+    }
+    if (page > 0 && added === 0) {
+      console.warn(`   ⚠️ Mugi worker page ${page + 1} of ${urlPath} returned no new names; stopping pagination`);
+      break;
+    }
+    if (!json.nextPageToken) return entries;
+    pageToken = json.nextPageToken;
+    pageIndex = (json.curPageIndex ?? 0) + 1;
+  }
+
+  console.warn(`   ⚠️ Mugi worker listing ${urlPath} reached the ${MUGI_MAX_PAGES}-page cap; stopping pagination`);
+  return entries;
+}
+
+async function getMugiRootNames(deadline) {
+  const now = Date.now();
+  if (mugiRootCache && (now - mugiRootCache.ts) < MUGI_ROOT_TTL_MS) {
+    return mugiRootCache.names;
+  }
+  const entries = await fetchMugiListing('/0:/', deadline);
+  if (!entries) return null;
+
+  const names = entries
+    .filter(f => !(f && f.mimeType && f.mimeType !== 'application/vnd.google-apps.folder'))
+    .map(f => f?.name)
+    .filter(n => typeof n === 'string' && n.length > 0);
+
+  if (names.length === 0) {
+    console.warn('   ⚠️ Mugi worker root listing returned no folder names');
+    return null;
+  }
+  mugiRootCache = { ts: now, names };
+  return names;
+}
+
+function isUnsafeMugiName(name) {
+  if (typeof name !== 'string' || name.length === 0) return true;
+  if (name.length > MUGI_MAX_NAME_LENGTH) return true;
+  return name.includes('/') || name.includes('\\') || name.includes('..');
+}
+
+function pickMugiSubtitleFile(files) {
+  const byExt = ext => files.find(f => new RegExp(`\\.${ext}$`, 'i').test(f.name));
+  // Mugi's 42 MB .ass embeds fonts, so .ass is the right single-file choice.
+  return byExt('ass') || byExt('srt') || files.find(f => /\.(?:zip|rar|7z)$/i.test(f.name)) || files[0] || null;
+}
+
+// Resolve a release to a single worker download URL. Never throws: any failure
+// logs a specific reason and returns null so the caller can fall through.
+export async function resolveMugiSubtitleFromWorker(releaseTitle, targetEp = null) {
+  try {
+    if (mugiConsecutiveFailures >= MUGI_BREAKER_THRESHOLD) {
+      if (!mugiBreakerWarned) {
+        mugiBreakerWarned = true;
+        console.warn(`   ⚠️ Mugi worker circuit breaker open after ${mugiConsecutiveFailures} consecutive failures; skipping worker resolution`);
+      }
+      return null;
+    }
+
+    const deadline = Date.now() + 60_000;
+    const targetEpStr = targetEp == null ? '' : String(targetEp);
+
+    const releaseTokens = mugiNormalizeTokens(releaseTitle, targetEpStr);
+    if (releaseTokens.length === 0) {
+      console.warn(`   ⚠️ Mugi worker: title "${releaseTitle}" produced no searchable tokens`);
+      return null;
+    }
+
+    const rootNames = await getMugiRootNames(deadline);
+    if (!rootNames) return null;
+
+    const candidates = rootNames
+      .map(name => ({ name, tokens: mugiNormalizeTokens(name, '') }))
+      .filter(c => releaseTokens.every(t => c.tokens.includes(t)))
+      .sort((a, b) => {
+        const diff = (a.tokens.length - releaseTokens.length) - (b.tokens.length - releaseTokens.length);
+        return diff !== 0 ? diff : a.name.localeCompare(b.name);
+      })
+      .slice(0, MUGI_MAX_CANDIDATES);
+
+    if (candidates.length === 0) {
+      console.warn(`   ⚠️ Mugi worker: no folder matched "${releaseTitle}" (${releaseTokens.join(' ')})`);
+      return null;
+    }
+
+    const targetEpNorm = targetEpStr.replace(/^0+/, '') || (targetEpStr === '0' ? '0' : '');
+
+    for (const candidate of candidates) {
+      if (Date.now() > deadline) {
+        console.warn(`   ⚠️ Mugi worker deadline exceeded before candidate "${candidate.name}"`);
+        return null;
+      }
+      if (isUnsafeMugiName(candidate.name)) {
+        console.warn(`   ⚠️ Mugi worker: skipping unsafe folder name "${candidate.name}"`);
+        continue;
+      }
+
+      const entries = await fetchMugiListing(`/0:/${encodeURIComponent(candidate.name)}/`, deadline);
+      if (!entries) continue;
+
+      const files = entries
+        .filter(f => f && typeof f.name === 'string' && /\.(ass|srt|zip|rar|7z)$/i.test(f.name))
+        .filter(f => {
+          if (isUnsafeMugiName(f.name)) {
+            console.warn(`   ⚠️ Mugi worker: skipping unsafe file name "${f.name}"`);
+            return false;
+          }
+          return true;
+        });
+
+      let matched;
+      if (targetEpNorm) {
+        matched = files.filter(f => matchesEpisode(f.name, targetEpNorm));
+        if (matched.length === 0) continue;
+      } else {
+        if (files.length === 0) continue;
+        if (files.length > 1) {
+          console.warn(`   ⚠️ Mugi worker: multiple subtitle files in "${candidate.name}" with no target episode; ambiguous`);
+          return null;
+        }
+        matched = files;
+      }
+
+      const chosen = pickMugiSubtitleFile(matched);
+      if (!chosen) continue;
+
+      const url = `${MUGI_WORKER_BASE}/0:/${encodeURIComponent(candidate.name)}/${encodeURIComponent(chosen.name)}`;
+      if (!url.startsWith(`${MUGI_WORKER_BASE}/0:/`)) {
+        console.warn(`   ⚠️ Mugi worker: refusing to build unexpected URL for "${chosen.name}"`);
+        continue;
+      }
+      return { url, fileName: chosen.name, folderName: candidate.name };
+    }
+
+    console.warn(`   ⚠️ Mugi worker: no matching subtitle file in Mugi worker for "${releaseTitle}" ep ${targetEpStr}`);
+    return null;
+  } catch (e) {
+    console.warn(`   ⚠️ Mugi worker fallback failed for "${releaseTitle}": ${e.message}`);
+    return null;
+  }
+}
 
 function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
   return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
@@ -46,6 +341,9 @@ export function fetchHtmlWithImpersonation(url, cookieHeader = '') {
     });
     if (result && result.length > 500) {
       return result;
+    }
+    if (result != null && result.length <= 500) {
+      console.warn(`   ⚠️ curl_cffi returned ${result.length} chars for ${url} — likely blocked`);
     }
   } catch (e) {
     console.warn(`   ⚠️ curl_cffi impersonation failed for ${url}:`, e.message);
@@ -395,7 +693,58 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
   }
 }
 
-export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null) {
+export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null, releaseTitle = null) {
+  // Mugi-Subs is Cloudflare-403 for datacenter IPs, so scrapePostPage must not
+  // fetch the article. Resolve the subtitle through the public worker API and
+  // never fall through to the blocked page.
+  if (isMugiHost(pageUrl)) {
+    let effectiveTitle = releaseTitle;
+    if (!effectiveTitle) {
+      const segments = pageUrl.split(/[?#]/)[0].split('/').filter(Boolean);
+      const rawSegment = segments[segments.length - 1] || '';
+      const spaced = rawSegment.replace(/[-_]/g, ' ');
+      try {
+        effectiveTitle = decodeURIComponent(spaced);
+      } catch {
+        effectiveTitle = spaced;
+      }
+    }
+
+    // Fallback for callers (e.g. LazySano) that do not pass a target episode:
+    // derive it from the page URL slug before resolving.
+    let effectiveEp = targetEp;
+    if (effectiveEp == null) {
+      effectiveEp = pageUrl.match(/[-_](\d{1,4})(?:\.html)?\/?(?:[?#]|$)/)?.[1] ?? null;
+    }
+
+    const resolved = await resolveMugiSubtitleFromWorker(effectiveTitle, effectiveEp);
+    if (resolved) {
+      return {
+        title: effectiveTitle,
+        pageUrl,
+        bestDownloadUrl: resolved.url,
+        source: 'mugi-worker',
+        videoLinks: {
+          directSub: resolved.url,
+          fonts: null,
+          top4top: null,
+          mediafire: null,
+          mega: null,
+          drive: null,
+          proton: null,
+          pixeldrain: null,
+          torrent: null,
+          buzzheavier: null,
+          hevc: null,
+          h264: null
+        }
+      };
+    }
+
+    console.warn(`   ⚠️ Mugi worker fallback found no subtitle for ${pageUrl}`);
+    return null;
+  }
+
   let cookieHeader = '';
   if (siteConfig && (siteConfig.user || process.env.REVIVE_COOKIE || process.env.CELESTIAL_COOKIE)) {
     const jar = await ensureSiteSession(siteConfig);
