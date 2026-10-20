@@ -2014,7 +2014,7 @@ export async function publishDocument(client, filePath, caption, options = {}) {
   return { ok: false, description: 'All publication methods failed' };
 }
 
-export async function dispatchBatchExtractor(torrentUrl, releaseTitle, chatId) {
+export async function dispatchBatchExtractor(torrentUrl, releaseTitle, chatId, langs = 'ara') {
   const ghPat = process.env.GH_PAT;
   if (!ghPat) {
     console.warn('   ⚠️ GH_PAT not configured; cannot dispatch to sub-extractor.');
@@ -2033,7 +2033,8 @@ export async function dispatchBatchExtractor(torrentUrl, releaseTitle, chatId) {
         inputs: {
           url: torrentUrl,
           name: releaseTitle,
-          chat_id: String(chatId)
+          chat_id: String(chatId),
+          langs: String(langs || 'ara')
         }
       }),
       signal: AbortSignal.timeout(15000)
