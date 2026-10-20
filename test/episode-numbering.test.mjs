@@ -438,3 +438,31 @@ test('scene tag cleaning does not corrupt title words like Prime or Ara', () => 
   );
 });
 
+test('ReDEJA Horemajo vs Doumo Suki na Hito ni Horegusuri deduplication', () => {
+  const title1 = '[ReDEJA] Horemajo - 02 [+Fonts]';
+  const title2 = '[ReDEJA] Doumo, Suki na Hito ni Horegusuri wo Irai sareta Majo desu- 02 [+Fonts]';
+
+  // Resolved canonical shape matching AniList entry for this anime
+  const resolved = {
+    romaji: 'Doumo, Suki na Hito ni Horegusuri wo Irai Sareta Majo desu.',
+    english: 'Hello, I am a Witch and my Crush Wants me to Make a Love Potion!',
+    episodes: 12,
+  };
+
+  const keys1 = tc.getFansubReleaseKeys(title1, resolved);
+  const keys2 = tc.getFansubReleaseKeys(title2, resolved);
+
+  // Both directions must detect each other as duplicates
+  const keys1Blocks2 = keys2.some((k) => keys1.includes(k));
+  const keys2Blocks1 = keys1.some((k) => keys2.includes(k));
+
+  assert.equal(keys1Blocks2, true, 'Horemajo - 02 must block Doumo Suki na Hito... - 02');
+  assert.equal(keys2Blocks1, true, 'Doumo Suki na Hito... - 02 must block Horemajo - 02');
+
+  const common = keys1.filter((k) => keys2.includes(k));
+  assert.ok(common.length >= 6, `Expected at least 6 common keys, got ${common.length}`);
+  assert.ok(common.includes('fansub_redeja_doumo_suki_na_hito_ni_horegusuri_wo_irai_sareta_majo_desu_ep_2'));
+  assert.ok(common.includes('fansub_redeja_doumo_suki_na_hito_ni_horegusuri_wo_irai_sareta_majo_desu_ep_02'));
+});
+
+
