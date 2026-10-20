@@ -397,8 +397,8 @@ export function getCoreAnimeEpisodeKey(title) {
     .replace(/\b(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\b/gi, '')
     .replace(/\[\s*(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\s*\]/gi, '')
     .replace(/\b(?:end|ending|final|مكتمل)\b/gi, '')
-    .replace(/\b(?:cr|hidive|nf|netflix|dsnp|amzn|prime)\b/gi, '')
-    .replace(/\b(?:arabic|ara)(?:\s+ar)?\b/gi, '')
+    // Strip trailing scene tags ONLY after episode numbers at the tail
+    .replace(/(\b(?:s\d{1,2}e\d{1,4}|\d{1,4})\b)(?:\s+[\(\[]?(?:cr|hidive|nf|netflix|dsnp|amzn|arabic|ara\s+ar|ar|web-?dl|web-?rip|multi-?subs?)[\)\]]?)+\s*$/i, '$1')
     .replace(/\bii\b/gi, '2')
     .replace(/\biii\b/gi, '3')
     .replace(/\biv\b/gi, '4')

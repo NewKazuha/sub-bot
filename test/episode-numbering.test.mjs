@@ -410,3 +410,31 @@ test('Chitose live defect: S01E15 and Part 2 - 02 overlap via sequel overflow', 
   assert.ok(overlapOfficial.includes('official_ep_2_chitose_kun'), 'official_ep_2_chitose_kun must match');
 });
 
+test('scene tag cleaning does not corrupt title words like Prime or Ara', () => {
+  // getCoreAnimeEpisodeKey anchoring regression
+  assert.notEqual(
+    tc.getCoreAnimeEpisodeKey('Transformers: Prime - 05'),
+    tc.getCoreAnimeEpisodeKey('Transformers - 05'),
+    'Transformers: Prime must NOT collide with Transformers'
+  );
+  assert.equal(
+    tc.getCoreAnimeEpisodeKey('Transformers: Prime - 05'),
+    'transformers_prime_05',
+    'Prime must be preserved as part of the title'
+  );
+  assert.equal(
+    tc.getCoreAnimeEpisodeKey('Ara - 03'),
+    'ara_03',
+    'Ara must be preserved as title, not stripped'
+  );
+
+  // normalizeQuery anchoring regression
+  assert.equal(normalizeQuery('Ara - 03'), 'Ara', 'normalizeQuery must preserve Ara');
+  assert.equal(normalizeQuery('Transformers: Prime - 05'), 'Transformers Prime', 'normalizeQuery must preserve Prime');
+  assert.notEqual(
+    normalizeQuery('Transformers: Prime - 05'),
+    normalizeQuery('Transformers - 05'),
+    'normalizeQuery must distinguish Transformers: Prime from Transformers'
+  );
+});
+

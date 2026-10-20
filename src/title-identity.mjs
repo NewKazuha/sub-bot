@@ -129,11 +129,10 @@ export function normalizeQuery(rawTitle) {
   s = s.replace(/\[[^\]]*\]/g, ' ');
   // 4. strip (parentheses)
   s = s.replace(/\([^)]*\)/g, ' ');
+  // Strip trailing scene/platform/language tags ONLY after episode or quality tokens
+  s = s.replace(/(\b(?:s\d{1,2}e\d{1,4}|\d{1,4}|web-?dl|webrip|1080p|720p|bdrip|hevc)\b)(?:\s+[\(\[]?(?:cr|hidive|nf|netflix|dsnp|amzn|web-?dl|web-?rip|1080p|720p|480p|arabic|ara\s+ar|ar|multi-?subs?)[\)\]]?)+\s*$/i, '$1');
   // 5. strip quality/codec tokens
   s = s.replace(/\b(1080p|720p|480p|2160p|4k|bd|bdrip|web-?dl|webrip|hevc|h264|x264|x265|aac|flac)\b/gi, ' ');
-  // 5b. strip platform & language release tags
-  s = s.replace(/\b(cr|hidive)\b/gi, ' ');
-  s = s.replace(/\b(?:arabic|ara)(?:\s+ar)?\b/gi, ' ');
   // 6. strip SxxEyy
   s = s.replace(/\bS\d{1,2}E\d{1,3}\b/gi, ' ');
   // 7. strip "ep 04" / "episode 4" / "e04" forms
