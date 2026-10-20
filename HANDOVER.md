@@ -140,7 +140,7 @@ npm test
 
 ### أ. ماذا تفعل إذا ظهر تكرار لحلقة في القناة؟
 1. **الخطوة الأولى (فورية):** احذف الرسالة المكررة يدوياً من قناة تيليجرام.
-2. **الخطوة الثانية (تشخيص سبب عدم التقاطع):** نفذ هذا الأمر السريع في الطرفية بمطابقة العنوانين:
+2. **الخطوة الثانية (تشخيص سبب عدم التقاطع):** نفذ هذا الأمر السريع في الطرفية بمطابقة العنوانين (يتعرف تلقائياً على الرسمي والفانسب):
    ```bash
    node -e "
    Promise.all([import('./src/telegram-client.mjs'), import('./src/title-identity.mjs')]).then(async ([tc, ti]) => {
@@ -148,10 +148,14 @@ npm test
      const t2 = 'العنوان الثاني هنا';
      const r1 = await ti.resolveCanonicalTitle(t1);
      const r2 = await ti.resolveCanonicalTitle(t2);
-     const k1 = tc.getFansubReleaseKeys(t1, r1);
-     const k2 = tc.getFansubReleaseKeys(t2, r2);
+     const getKeys = (t, r) => tc.isOfficialPlatformRelease(t)
+       ? tc.getReleaseKeys(t, true, r)
+       : tc.getFansubReleaseKeys(t, r);
+     const k1 = getKeys(t1, r1);
+     const k2 = getKeys(t2, r2);
      console.log('مفاتيح 1:', k1.length, 'مفاتيح 2:', k2.length);
-     console.log('المشترك:', k1.filter(k => k2.includes(k)));
+     const common = k1.filter(k => k2.includes(k));
+     console.log('المشترك (' + common.length + '):', common);
    });
    "
    ```
@@ -162,9 +166,13 @@ npm test
 ### ب. ماذا تفعل إذا لم يُنشر أنمي متوقع؟
 1. توجه إلى تبويب **Actions** في GitHub واختر سير العمل **Bot Monitor**.
 2. افتح آخر تشغيل وافحص سجلات الخطوة `Run action runner`.
-3. ابحث عن اسم الأنمي أو كلمة `[SKIP]` أو `[ERROR]`:
-   - إذا ظهر `already posted`: فالمفتاح مسجل مسبقاً في `data/posted.json` (احذف المفتاح من الملف إن أردت إعادة النشر قسراً).
-   - إذا ظهر خطأ في التحميل: تحقق من صلاحية الرابط أو توكن البوت أو كوكي `REVIVE_COOKIE`.
+3. ابحث عن اسم الأنمي أو مؤشرات السجل الحقيقية للبوت:
+   ```bash
+   # البحث السريع في سجلات التشغيل
+   grep -E "⏭️|⚠️|❌|already posted|Skipping|failed"
+   ```
+   - إذا ظهر `⏭️ ... already posted` أو `Skipping`: فالمفتاح مسجل مسبقاً في `data/posted.json` (احذف المفتاح من الملف إن أردت إعادة النشر قسراً).
+   - إذا ظهر `❌ ... failed`: تحقق من رسالة الخطأ (مثل فشل التنزيل عبر `aria2c`، أو مشكلة جلسة `REVIVE_COOKIE`).
 
 ### ج. الملفات المحظور لمسها أو مسحها (The Untouchables):
 * ⛔ **`data/posted.json`**: يحتوي على الذاكرة التاريخية لمنع تكرار أي حلقة من آلاف الحلقات المنشورة منذ تأسيس القناة. **إياك أن تحذفه أو تفرغه**، لأن حذفه سيعيد نشر مئات الحلقات القديمة وحزم البلوراي (BD)!
