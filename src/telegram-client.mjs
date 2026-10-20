@@ -2014,6 +2014,44 @@ export async function publishDocument(client, filePath, caption, options = {}) {
   return { ok: false, description: 'All publication methods failed' };
 }
 
+export async function dispatchBatchExtractor(torrentUrl, releaseTitle, chatId) {
+  const ghPat = process.env.GH_PAT;
+  if (!ghPat) {
+    console.warn('   ⚠️ GH_PAT not configured; cannot dispatch to sub-extractor.');
+    return false;
+  }
+  try {
+    const res = await fetch('https://api.github.com/repos/NewKazuha/sub-extractor/actions/workflows/extract.yml/dispatches', {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${ghPat}`,
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'sub-bot'
+      },
+      body: JSON.stringify({
+        ref: 'main',
+        inputs: {
+          url: torrentUrl,
+          name: releaseTitle,
+          chat_id: String(chatId)
+        }
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (res.status === 204) {
+      console.log(`   ✅ Successfully triggered sub-extractor for "${releaseTitle}"!`);
+      return true;
+    } else {
+      const errText = await res.text();
+      console.warn(`   ⚠️ sub-extractor dispatch failed (HTTP ${res.status}): ${errText}`);
+      return false;
+    }
+  } catch (e) {
+    console.warn(`   ⚠️ sub-extractor dispatch network error:`, e.message);
+    return false;
+  }
+}
+
 // ====================================================================
 // Main check function
 // ====================================================================
@@ -2171,12 +2209,17 @@ export async function checkTelegramChannels(existingClient = null) {
               continue;
             }
 
-            // Batch Guard: reject multi-episode packages (e.g. 01 ~ 10, 01-12)
-            // Erai torrents for batches contain multiple 1080p MKVs (~15-20+ GB)
-            // which time out aria2c and would erroneously publish only episode 1 as an .ass file.
+            // Batch Guard: detect multi-episode packages (e.g. 01 ~ 10, 01-12)
+            // Instead of local download which freezes runner, dispatch to sub-extractor workflow
             const batchRange = extractBatchRange(eraiData.title);
             if (batchRange && batchRange[1] > batchRange[0]) {
-              console.log(`   ⏭️ [Erai-Raws] Skipping multi-episode batch "${formattedTitle}" (episodes ${batchRange[0]}~${batchRange[1]}).`);
+              console.log(`   📦 [Erai-Raws] Detected multi-episode batch "${formattedTitle}" (episodes ${batchRange[0]}~${batchRange[1]}).`);
+              if (process.env.GH_PAT && eraiData.torrentUrl) {
+                console.log(`   🚀 Dispatching batch extraction to sub-extractor workflow...`);
+                await dispatchBatchExtractor(eraiData.torrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
+              } else {
+                console.log(`   ⏭️ Skipping batch extraction (GH_PAT not set or no torrent URL).`);
+              }
               markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
             }

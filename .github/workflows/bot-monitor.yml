@@ -49,6 +49,7 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHANNEL: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           RHYTHM_USER: ${{ secrets.RHYTHM_USER }}
           RHYTHM_PASS: ${{ secrets.RHYTHM_PASS }}
           LAZYSANO_USER: ${{ secrets.LAZYSANO_USER }}
