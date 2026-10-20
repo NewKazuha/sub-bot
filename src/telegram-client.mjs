@@ -2216,11 +2216,15 @@ export async function checkTelegramChannels(existingClient = null) {
               console.log(`   📦 [Erai-Raws] Detected multi-episode batch "${formattedTitle}" (episodes ${batchRange[0]}~${batchRange[1]}).`);
               if (process.env.GH_PAT && eraiData.torrentUrl) {
                 console.log(`   🚀 Dispatching batch extraction to sub-extractor workflow...`);
-                await dispatchBatchExtractor(eraiData.torrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
+                const dispatched = await dispatchBatchExtractor(eraiData.torrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
+                if (dispatched) {
+                  markReleaseAsPosted(posted, msgKey, releaseKeys);
+                } else {
+                  console.warn(`   ⚠️ Dispatch failed — will retry next cycle.`);
+                }
               } else {
                 console.log(`   ⏭️ Skipping batch extraction (GH_PAT not set or no torrent URL).`);
               }
-              markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
             }
 
