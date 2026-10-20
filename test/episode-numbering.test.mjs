@@ -404,7 +404,9 @@ test('Chitose live defect: S01E15 and Part 2 - 02 overlap via sequel overflow', 
   assert.equal(tc.isOfficialPlatformRelease(titleB), true, 'CR WEB-DL must be recognized as official');
   const keysBOfficial = tc.getReleaseKeys(titleB, true, resolvedChitose);
   const overlapOfficial = keysA.filter((k) => keysBOfficial.includes(k));
-  assert.ok(overlapOfficial.length >= 14, 'Official CR WEB-DL must intersect with Part 2 - 02 with 14 keys');
+  assert.ok(overlapOfficial.length >= 14, 'Official CR WEB-DL must intersect with Part 2 - 02 with >= 14 keys');
+  assert.ok(overlapOfficial.includes('chitose_kun_wa_ramune_bin_no_naka_part_2_02'), 'exact core title key must match');
+  assert.ok(overlapOfficial.includes('official_chitose_kun_wa_ramune_bin_no_naka_part_2_02'), 'exact official full title key must match');
   assert.ok(overlapOfficial.includes('official_ep_2_chitose_kun'), 'official_ep_2_chitose_kun must match');
 });
 
