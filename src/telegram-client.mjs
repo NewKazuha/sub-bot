@@ -3,7 +3,7 @@ import { StringSession } from 'telegram/sessions/index.js';
 import * as cheerio from 'cheerio';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync, execFileSync, spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import AdmZip from 'adm-zip';
@@ -1882,6 +1882,37 @@ export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial
   return null;
 }
 
+function downloadTorrentWithAria2c(args, timeoutMs = 8 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('aria2c', args, { stdio: 'pipe' });
+    let timer = null;
+    let killed = false;
+
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        killed = true;
+        proc.kill('SIGTERM');
+        setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch { }
+        }, 5000).unref?.();
+        reject(new Error(`aria2c timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+    }
+
+    proc.on('error', err => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+
+    proc.on('close', code => {
+      if (timer) clearTimeout(timer);
+      if (killed) return;
+      if (code === 0) resolve();
+      else reject(new Error(`aria2c exited with code ${code}`));
+    });
+  });
+}
+
 async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOfficial = false, preferArabic = true, customSubName = '') {
   const torrentPath = path.join(workDir, 'release.torrent');
   await downloadFileToDisk(torrentUrl, torrentPath);
@@ -1891,14 +1922,13 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
   fs.mkdirSync(downloadDir, { recursive: true });
   try {
     console.log(`   📥 Downloading MKV via aria2c...`);
-    execFileSync(
-      'aria2c',
+    await downloadTorrentWithAria2c(
       [
         '--seed-time=0', '--max-upload-limit=1K', '--file-allocation=none',
         '--max-concurrent-downloads=5', '--split=5', '--max-connection-per-server=5',
         '--continue=true', `--dir=${downloadDir}`, torrentPath
       ],
-      { stdio: 'pipe', timeout: 10 * 60 * 1000 }
+      8 * 60 * 1000
     );
   } catch (e) {
     console.error(`   ❌ aria2c download failed:`, e.message?.slice(0, 200));
@@ -2137,6 +2167,16 @@ export async function checkTelegramChannels(existingClient = null) {
 
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
               console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted as official release. Skipping.`);
+              markReleaseAsPosted(posted, msgKey, releaseKeys);
+              continue;
+            }
+
+            // Batch Guard: reject multi-episode packages (e.g. 01 ~ 10, 01-12)
+            // Erai torrents for batches contain multiple 1080p MKVs (~15-20+ GB)
+            // which time out aria2c and would erroneously publish only episode 1 as an .ass file.
+            const batchRange = extractBatchRange(eraiData.title);
+            if (batchRange && batchRange[1] > batchRange[0]) {
+              console.log(`   ⏭️ [Erai-Raws] Skipping multi-episode batch "${formattedTitle}" (episodes ${batchRange[0]}~${batchRange[1]}).`);
               markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
             }

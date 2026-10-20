@@ -351,3 +351,12 @@ test('resolved=null on defect title B yields the pre-fix-shaped base keys (no fa
   assert.ok(!nullKeys.includes(B_PER_PART_FULL_NORM), 'no stripped fast-path keys on resolved=null');
   assert.deepEqual(tc.getFansubReleaseKeys(B, null), tc.getFansubReleaseKeys(B));
 });
+
+test('Erai batch title extraction detects multi-episode batches (e.g. 01 ~ 10)', () => {
+  const batch = tc.extractBatchRange('[Netflix] Cyberpunk: Edgerunners 2 - 01 ~ 10');
+  assert.deepEqual(batch, [1, 10]);
+  assert.ok(batch[1] > batch[0]);
+
+  const single = tc.extractBatchRange('[Netflix] Cyberpunk: Edgerunners 2 - 01');
+  assert.equal(single, null);
+});
