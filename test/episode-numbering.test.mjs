@@ -492,5 +492,29 @@ test('suzume soko Gensou Suikoden vs Suikoden The Anime deduplication', () => {
   assert.ok(common.includes('fansub_suzume_soko_gensou_suikoden_ep_01'));
 });
 
+// ---------------------------------------------------------------------------
+// Live defect 2026-10-21: a bare season marker ("S01") must not survive into
+// the AniList query or the core key. Without the fix, "Suikoden The Anime
+// S01 - 03" normalized to "Suikoden The Anime S01", which matched nothing,
+// was cached as a negative, and the episode got published twice.
+// ---------------------------------------------------------------------------
+test('bare season marker does not block resolution (Suikoden S01 - 03)', async () => {
+  const A = '[Suzume Soko] Suikoden The Anime S01 - 03 [+Fonts]';
+  const B = '[suzume soko] Gensou Suikoden - 03 [+Fonts]';
+
+  assert.equal(normalizeQuery(A), 'Suikoden The Anime');
+  assert.equal(normalizeQuery(B), 'Gensou Suikoden');
+
+  // the season token must not land inside the core key either
+  assert.equal(tc.getCoreAnimeEpisodeKey(A), 'suikoden_the_anime_03');
+
+  // with the canonical entry available, both spellings must intersect
+  const resolved = { id: 187316, romaji: 'Gensou Suikoden', english: null, synonyms: ['Suikoden: The Anime'] };
+  const kA = tc.getFansubReleaseKeys(A, resolved);
+  const kB = tc.getFansubReleaseKeys(B, resolved);
+  const shared = kA.filter((k) => kB.includes(k));
+  assert.ok(shared.length > 0, 'expected the two spellings to share at least one key');
+});
+
 
 

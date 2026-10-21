@@ -135,6 +135,12 @@ export function normalizeQuery(rawTitle) {
   s = s.replace(/\b(1080p|720p|480p|2160p|4k|bd|bdrip|web-?dl|webrip|hevc|h264|x264|x265|aac|flac)\b/gi, ' ');
   // 6. strip SxxEyy
   s = s.replace(/\bS\d{1,2}E\d{1,3}\b/gi, ' ');
+  // 6b. strip a bare season marker ("S01", "S2") that sits right before the
+  // episode or at the very end. Without this, "Suikoden The Anime S01 - 03"
+  // normalizes to "Suikoden The Anime S01" — a query that matches nothing and
+  // gets cached as a negative, which is what produced the Suikoden duplicate
+  // on 2026-10-21 (and poisoned ~24 real titles in the cache).
+  s = s.replace(/\bS\d{1,2}\b(?=\s*(?:[-~–]\s*\d|\s*$))/gi, ' ');
   // 7. strip "ep 04" / "episode 4" / "e04" forms
   s = s.replace(/\b(ep(isode)?|e)\s*\.?\s*\d{1,4}(v\d+)?\b/gi, ' ');
   // 8. strip trailing episode forms " - 04"

@@ -424,6 +424,10 @@ export function getCoreAnimeEpisodeKey(title) {
     .toLowerCase()
     .replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '')
     .replace(/^\[[^\]]+\]\s*/, '')
+    // bare season marker before the episode ("... s01 - 03") — mirrors
+    // normalizeQuery rule 6b; without it the token lands inside the core key
+    // and the same episode produces two different keys.
+    .replace(/\bs\d{1,2}\b(?=\s*(?:[-~–]\s*\d|\s*$))/gi, ' ')
     .replace(/\b(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\b/gi, '')
     .replace(/\[\s*(?:1080p|720p|480p|2160p|4k|bd|web-?dl|bdrip|hevc|h264|x264|x265|aac)\s*\]/gi, '')
     .replace(/\b(?:end|ending|final|مكتمل)\b/gi, '')
