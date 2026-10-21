@@ -32,7 +32,7 @@ export const CONFIG = {
   
   TELEGRAM: {
     BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
-    TARGET_CHANNEL: process.env.TELEGRAM_TARGET_CHANNEL || '-1004296201769',
+    TARGET_CHANNEL: process.env.TELEGRAM_TARGET_CHANNEL || '',
     API_ID: parseInt(process.env.TELEGRAM_API_ID || '0', 10),
     API_HASH: process.env.TELEGRAM_API_HASH || '',
     SESSION: process.env.TELEGRAM_SESSION || sessionFileFallback || ''

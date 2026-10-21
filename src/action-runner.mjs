@@ -23,6 +23,10 @@ async function runContinuousMonitor() {
     console.error('❌ TELEGRAM_API_ID and TELEGRAM_API_HASH are required together with TELEGRAM_SESSION. Aborting.');
     process.exit(1);
   }
+  if (!CONFIG.TELEGRAM.TARGET_CHANNEL) {
+    console.error('❌ TELEGRAM_TARGET_CHANNEL is missing. Aborting.');
+    process.exit(1);
+  }
 
   // Create a single persistent Telegram client for the entire monitoring window.
   // This avoids the expensive connect/disconnect overhead on every cycle.

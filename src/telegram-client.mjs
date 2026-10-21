@@ -166,18 +166,45 @@ const ANIME_ALIASES = [
 // Utility helpers (posted IDs, normalization, naming, deduplication)
 // ====================================================================
 export function loadPostedIds() {
+  const parsePosted = (raw) => {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('posted.json is not a JSON array');
+    return new Set(parsed);
+  };
+
+  // A missing file is a legitimate first run — return an empty set (no throw).
+  if (!fs.existsSync(POSTED_FILE)) {
+    return new Set();
+  }
+
   try {
-    if (fs.existsSync(POSTED_FILE)) {
-      return new Set(JSON.parse(fs.readFileSync(POSTED_FILE, 'utf8')));
+    return parsePosted(fs.readFileSync(POSTED_FILE, 'utf8'));
+  } catch (fileErr) {
+    console.error(`⚠️ posted.json unreadable/corrupt (${fileErr.message}). Attempting git recovery...`);
+    for (const ref of ['HEAD', 'HEAD~1']) {
+      try {
+        const raw = execSync(`git show ${ref}:data/posted.json`, {
+          encoding: 'utf8',
+          maxBuffer: 64 * 1024 * 1024, // posted.json is already ~1 MB; the default 1 MB throws ENOBUFS
+          stdio: ['ignore', 'pipe', 'ignore']
+        });
+        const recovered = parsePosted(raw);
+        console.error(`⚠️ Recovered ${recovered.size} posted keys from git ${ref}.`);
+        return recovered;
+      } catch (gitErr) {
+        console.error(`   ↳ recovery from git ${ref} failed: ${String(gitErr.message).split('\n')[0]}`);
+      }
     }
-  } catch { }
-  return new Set();
+    throw new Error('posted.json is corrupt and git recovery failed (HEAD, HEAD~1). Aborting this run to prevent mass re-posting.');
+  }
 }
 
 export function savePostedIds(set) {
   try {
     fs.mkdirSync(path.dirname(POSTED_FILE), { recursive: true });
-    fs.writeFileSync(POSTED_FILE, JSON.stringify([...set], null, 2));
+    const tmp = POSTED_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify([...set], null, 2));
+    fs.renameSync(tmp, POSTED_FILE);
   } catch (e) {
     console.error('Failed to save posted IDs:', e.message);
   }

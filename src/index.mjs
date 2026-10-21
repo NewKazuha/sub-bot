@@ -65,6 +65,8 @@ function startScheduler() {
     console.warn('⚠️ TELEGRAM_SESSION is missing (checked env and SESSION_STRING.txt). Telegram publishing will fail until it is set.');
   } else if (!CONFIG.TELEGRAM.API_ID || !CONFIG.TELEGRAM.API_HASH) {
     console.warn('⚠️ TELEGRAM_API_ID / TELEGRAM_API_HASH are missing. Telegram publishing will fail until both are set.');
+  } else if (!CONFIG.TELEGRAM.TARGET_CHANNEL) {
+    console.warn('⚠️ TELEGRAM_TARGET_CHANNEL is missing. Telegram publishing will fail until it is set.');
   }
   if (!ADMIN_KEY) {
     console.log('ℹ️ ADMIN_KEY is not set – the /check-now endpoint is disabled.');
