@@ -93,7 +93,7 @@ jobs:
           echo "✅ State pushed."
 
       - name: Chain next monitoring run
-        if: success()
+        if: always() && !cancelled()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
