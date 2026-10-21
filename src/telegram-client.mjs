@@ -186,13 +186,16 @@ export function loadPostedIds() {
         const raw = execSync(`git show ${ref}:data/posted.json`, {
           encoding: 'utf8',
           maxBuffer: 64 * 1024 * 1024, // posted.json is already ~1 MB; the default 1 MB throws ENOBUFS
-          stdio: ['ignore', 'pipe', 'ignore']
+          stdio: ['ignore', 'pipe', 'pipe']
         });
         const recovered = parsePosted(raw);
         console.error(`⚠️ Recovered ${recovered.size} posted keys from git ${ref}.`);
         return recovered;
       } catch (gitErr) {
-        console.error(`   ↳ recovery from git ${ref} failed: ${String(gitErr.message).split('\n')[0]}`);
+        const gitDetail = gitErr && gitErr.stderr
+          ? String(gitErr.stderr).trim().split('\n')[0]
+          : String(gitErr.message).split('\n')[0];
+        console.error(`   ↳ recovery from git ${ref} failed: ${gitDetail}`);
       }
     }
     throw new Error('posted.json is corrupt and git recovery failed (HEAD, HEAD~1). Aborting this run to prevent mass re-posting.');

@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
 
       - name: Setup Node.js 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -73,7 +75,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          node -e "const p=JSON.parse(require('fs').readFileSync('data/posted.json','utf8')); if(p.length<1000){console.error('state shrank to',p.length);process.exit(1)}" || { echo 'رفض إيداع حالة تالفة'; exit 1; }
+          node -e "const p=JSON.parse(require('fs').readFileSync('data/posted.json','utf8')); if(!Array.isArray(p)||p.length<1000){console.error('state invalid: '+(Array.isArray(p)?('shrank to '+p.length):'not an array'));process.exit(1)}" || { echo 'رفض إيداع حالة تالفة'; exit 1; }
           git add data/posted.json data/title-map.json || true
           if git diff --cached --quiet; then
             echo "ℹ️ No state changes to commit."

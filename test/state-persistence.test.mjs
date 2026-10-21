@@ -94,3 +94,73 @@ test('د: savePostedIds writes atomically and leaves no tmp/bak files behind', a
   const leftovers = fs.readdirSync(dataDir).filter(f => f.endsWith('.tmp') || f.endsWith('.bak'));
   assert.deepEqual(leftovers, [], `unexpected leftover files: ${JSON.stringify(leftovers)}`);
 });
+
+// ---------------------------------------------------------------------------
+// (هـ) corrupt file AND corrupt HEAD, but a healthy HEAD~1 -> recovered from HEAD~1
+// ---------------------------------------------------------------------------
+test('هـ: corrupt posted.json with a corrupt HEAD is recovered from git HEAD~1', async () => {
+  const dir = tmp();
+  fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'data', 'posted.json'), JSON.stringify(['k1', 'k2', 'k3']));
+
+  git(dir, ['init', '-q']);
+  git(dir, ['add', 'data/posted.json']);
+  git(dir, ['-c', 'user.name=state-test', '-c', 'user.email=state@test.local', 'commit', '-q', '-m', 'init']);
+
+  // Second commit stores a corrupt file: HEAD is unusable, HEAD~1 stays healthy.
+  fs.writeFileSync(path.join(dir, 'data', 'posted.json'), '{broken');
+  git(dir, ['add', 'data/posted.json']);
+  git(dir, ['-c', 'user.name=state-test', '-c', 'user.email=state@test.local', 'commit', '-q', '-m', 'corrupt']);
+
+  const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
+  assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
+  assert.match(r.stdout, /KEYS=3/);
+  assert.match(r.stderr, /HEAD~1/, `expected recovery from HEAD~1, stderr=${r.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// (و) valid JSON that is NOT an array + healthy git -> must recover, never
+//     return an empty set or a literal value
+// ---------------------------------------------------------------------------
+test('و: valid non-array JSON in posted.json is rejected and recovered from git HEAD', async () => {
+  const dir = tmp();
+  fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'data', 'posted.json'), JSON.stringify(['k1', 'k2', 'k3']));
+
+  git(dir, ['init', '-q']);
+  git(dir, ['add', 'data/posted.json']);
+  git(dir, ['-c', 'user.name=state-test', '-c', 'user.email=state@test.local', 'commit', '-q', '-m', 'init']);
+
+  // Valid JSON, but not an array — parsePosted must reject it and fall back to git.
+  fs.writeFileSync(path.join(dir, 'data', 'posted.json'), '{}');
+
+  const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
+  assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
+  assert.match(r.stdout, /KEYS=3/);
+  assert.match(r.stderr, /HEAD/, `expected recovery from git HEAD, stderr=${r.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// (ز) a posted.json larger than execSync's default 1 MB maxBuffer is still
+//     recovered (proves the explicit maxBuffer on the git show call)
+// ---------------------------------------------------------------------------
+test('ز: a posted.json above the default 1 MB maxBuffer is still recovered from git', async () => {
+  const dir = tmp();
+  fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
+  const keys = [];
+  for (let i = 0; i < 20000; i++) keys.push('anime-episode-key-' + i + '-' + 'x'.repeat(40));
+  const payload = JSON.stringify(keys);
+  assert.ok(Buffer.byteLength(payload) > 1024 * 1024, 'payload must exceed the default 1 MB maxBuffer');
+  fs.writeFileSync(path.join(dir, 'data', 'posted.json'), payload);
+
+  git(dir, ['init', '-q']);
+  git(dir, ['add', 'data/posted.json']);
+  git(dir, ['-c', 'user.name=state-test', '-c', 'user.email=state@test.local', 'commit', '-q', '-m', 'init']);
+
+  // Corrupt the working-tree copy only — the committed HEAD stays intact.
+  fs.writeFileSync(path.join(dir, 'data', 'posted.json'), '{broken');
+
+  const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
+  assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
+  assert.match(r.stdout, /KEYS=20000/);
+});
