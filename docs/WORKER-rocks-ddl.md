@@ -1,5 +1,9 @@
 # مواصفة العامل: `rocks-ddl-proxy`
 
+> ⚠️ **لم يُنفَّذ هذا المسار.** الحل المُعتمد هو **Chromium داخل الـrunner** (commit `929d5c1`،
+> `src/browser-fetch.mjs`) لأنه مُثبت ويعمل بلا نشر. يبقى هذا الملف مرجعًا للبديل
+> (Worker + Browser Rendering) إن احتجته لاحقًا — مثلًا إن صار تثبيت Chromium مكلفًا.
+
 **الغرض:** تمكين `sub-bot` من قراءة قائمة ملفات الترجمة وتنزيلها من `ddl.rocks-team.net`،
 الذي يحجب GitHub Actions.
 
