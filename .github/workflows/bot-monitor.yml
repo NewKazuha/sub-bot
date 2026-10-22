@@ -119,10 +119,12 @@ jobs:
         if: failure()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_TARGET_CHANNEL }}
+          # Admin DM only — NEVER TELEGRAM_TARGET_CHANNEL, that is the public
+          # channel and a failure notice there would be visible to followers.
+          CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
         run: |
           if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-            echo "ℹ️ Notification skipped (missing TELEGRAM_BOT_TOKEN or TELEGRAM_TARGET_CHANNEL)."
+            echo "ℹ️ Notification skipped — set TELEGRAM_ADMIN_CHAT_ID to enable failure alerts."
             exit 0
           fi
           TEXT="🔴 Bot monitor failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
