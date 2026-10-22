@@ -41,6 +41,7 @@ jobs:
           pip install --no-cache-dir curl_cffi
 
       - name: Run continuous monitor loop
+        id: monitor
         env:
           # Some Arabic fansub sites use certificate chains trusted by the
           # runner's system store but absent from Node's bundled CA set.
@@ -71,6 +72,7 @@ jobs:
           node src/action-runner.mjs
 
       - name: Commit & Push Processed State
+        id: commit
         if: always()
         run: |
           git config user.name "github-actions[bot]"
@@ -93,7 +95,7 @@ jobs:
           echo "✅ State pushed."
 
       - name: Chain next monitoring run
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.commit.outcome != 'failure'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
