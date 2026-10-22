@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { matchesEpisode } from './cloud-folders.mjs';
+import { fetchRenderedHtml, isRocksDdlHost } from './browser-fetch.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -655,18 +656,29 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
 }
 
 export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null) {
-  if (/(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) {
+  // Rocks-Team DDL is Cloudflare-protected: the listing only exists in a
+  // browser, so it is rendered with headless Chromium instead of fetched.
+  const isRocks = isRocksDdlHost(directoryUrl);
+
+  if (!isRocks && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) {
     const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp);
     if (goIndexFile) return goIndexFile;
   }
 
   try {
-    const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
-    if (!res.ok) return null;
-    const contentType = res.headers.get('content-type') || '';
-    if (!/html|text\//i.test(contentType)) return null;
+    let html = null;
+    if (isRocks) {
+      html = await fetchRenderedHtml(directoryUrl);
+      if (!html) return null;
+    } else {
+      const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
+      if (!res.ok) return null;
+      const contentType = res.headers.get('content-type') || '';
+      if (!/html|text\//i.test(contentType)) return null;
+      html = await res.text();
+    }
 
-    const $ = cheerio.load(await res.text());
+    const $ = cheerio.load(html);
     const candidates = [];
     $('a[href]').each((_, el) => {
       const href = normaliseLinkUrl($(el).attr('href'), directoryUrl);

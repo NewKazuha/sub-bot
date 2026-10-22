@@ -1,6 +1,7 @@
 import { checkNewReleases } from './feed-monitor.mjs';
 import { createPersistentClient } from './telegram-client.mjs';
 import { CONFIG } from './config.mjs';
+import { closeBrowser } from './browser-fetch.mjs';
 
 // Duration to keep the action worker alive checking continuously
 const RUN_DURATION_MINUTES = parseInt(process.env.RUN_DURATION_MINUTES || '25', 10);
@@ -82,6 +83,12 @@ async function runContinuousMonitor() {
     if (client) {
       try { await client.disconnect(); } catch { }
       console.log('📡 Persistent Telegram connection closed.');
+    }
+    // Always release the shared headless browser, on success and on failure.
+    try {
+      await closeBrowser();
+    } catch (e) {
+      console.warn('⚠️ Failed to close the headless browser:', e.message);
     }
   }
 }

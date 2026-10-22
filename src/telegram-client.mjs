@@ -22,6 +22,7 @@ import {
   resolveMediafireDirectDownload
 } from './cloud-folders.mjs';
 import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
+import { downloadViaBrowser, isRocksDdlHost } from './browser-fetch.mjs';
 import {
   resolveCanonicalTitle,
   resolveCanonicalTitlesBatch,
@@ -2993,7 +2994,13 @@ export async function checkTelegramChannels(existingClient = null) {
                     console.log(`   📥 Direct download: ${directUrl}`);
                     const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
                     const dlOptions = pageData?.source === 'mugi-worker' ? { expectedHost: new URL(directUrl).hostname } : {};
-                    await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl }, dlOptions);
+                    if (isRocksDdlHost(directUrl)) {
+                      // Rocks-Team DDL needs the browser's Cloudflare cookie.
+                      const ok = await downloadViaBrowser(directUrl, tempDest);
+                      if (!ok) throw new Error('Browser download failed');
+                    } else {
+                      await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl }, dlOptions);
+                    }
                     if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
                   } catch (e) {
                     console.warn(`   ⚠️ Direct download failed:`, e.message);
