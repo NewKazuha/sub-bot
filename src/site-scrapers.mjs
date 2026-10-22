@@ -688,10 +688,21 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
       }
     });
 
+    // A "?a=view" link opens the file viewer, not the file itself, and the DDL
+    // index lists every file twice (viewer + direct). Sorting is stable, so
+    // this only moves viewer links behind their direct twins.
+    candidates.sort((a, b) => Number(/[?&]a=view/i.test(a)) - Number(/[?&]a=view/i.test(b)));
+
     if (targetEp) {
       const epNorm = String(targetEp).replace(/^0+/, '');
       const match = candidates.find(u => {
-        const found = u.match(/(\d{1,4})/g) || [];
+        // Match against the DECODED url: in a percent-encoded path the escape
+        // "%20" fuses with the episode number ("%2041" -> "2041"), so the real
+        // number never appears and every lookup silently fell back to the
+        // first archive (picked episode 41 for episode 49).
+        let decoded = u;
+        try { decoded = decodeURIComponent(u); } catch { }
+        const found = decoded.match(/(\d{1,4})/g) || [];
         return found.some(n => n.replace(/^0+/, '') === epNorm);
       });
       if (match) return match;
