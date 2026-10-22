@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { matchesEpisode } from './cloud-folders.mjs';
-import { fetchRenderedHtml, isRocksDdlHost } from './browser-fetch.mjs';
+import { fetchRenderedHtml, isRocksDdlHost, isRocksHost } from './browser-fetch.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -785,6 +785,13 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
       console.log(`   🛡️ Successfully bypassed Cloudflare for ${siteConfig.name} via curl_cffi!`);
       html = cfHtml;
     }
+  }
+
+  // Rocks-Team blog is Cloudflare-403 for datacenter IPs; curl_cffi wins only
+  // ~29% of the time. Render it in the same browser used for its DDL index.
+  if (!html && isRocksHost(pageUrl)) {
+    html = await fetchRenderedHtml(pageUrl);
+    if (html) console.log(`   🛡️ Rendered ${siteConfig?.name || 'Rocks-Team'} via headless Chromium.`);
   }
 
   if (!html) {

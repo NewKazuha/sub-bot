@@ -35,6 +35,17 @@ export function isRocksDdlHost(url) {
   }
 }
 
+// Every host owned by Rocks-Team: the blog (www.rocks-team.net) and the DDL
+// index (ddl.rocks-team.net) share the same Cloudflare challenge.
+const ROCKS_HOSTS = new Set(['ddl.rocks-team.net', 'www.rocks-team.net', 'rocks-team.net']);
+
+/**
+ * True for any Rocks-Team owned host (blog + DDL index).
+ */
+export function isRocksHost(url) {
+  try { return ROCKS_HOSTS.has(new URL(url).hostname.toLowerCase()); } catch { return false; }
+}
+
 async function getContext() {
   if (browserContext) {
     // A context whose browser died (crash / external kill) is dead itself:
@@ -82,7 +93,7 @@ export async function fetchRenderedHtml(url, { timeoutMs = 45000 } = {}) {
     // The listing is rendered client-side: wait for the file links to appear
     // instead of guessing with a fixed sleep.
     await page.waitForFunction(
-      () => document.querySelectorAll('a[href*=".rar"],a[href*=".ass"],a[href*=".zip"]').length > 0,
+      () => document.querySelectorAll('a[href*=".rar"],a[href*=".ass"],a[href*=".zip"],a[href*="ddl.rocks-team.net"]').length > 0,
       null,
       { timeout: timeoutMs }
     );
@@ -98,30 +109,52 @@ export async function fetchRenderedHtml(url, { timeoutMs = 45000 } = {}) {
 }
 
 /**
- * Download a file with the browser context's cookie jar (cf_clearance).
+ * Download a file through Chromium's real download pipeline (the browser's own
+ * TLS/HTTP stack with its full fingerprint, so Cloudflare lets it through).
+ * `context.request` uses Node's HTTP stack and gets 403'd.
  * Returns true on success, false on failure (never throws).
  */
 export async function downloadViaBrowser(url, destPath) {
+  let page = null;
   try {
     const context = await getContext();
-    const response = await context.request.get(url);
-    if (!response.ok()) {
-      console.warn(`[browser-fetch] Browser download failed for ${url}: HTTP ${response.status()}`);
+    page = await context.newPage();
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 120000 }),
+      page.goto(url).catch(() => {}) // the download aborts navigation; failure is expected
+    ]);
+    const failure = await download.failure();
+    if (failure) {
+      console.warn(`[browser-fetch] Download failed for ${url}: ${failure}`);
       return false;
     }
-    // A Cloudflare challenge page answers 200 with HTML: writing it to disk
-    // would store the challenge instead of the release, so refuse it.
-    const contentType = (response.headers()['content-type'] || '').toLowerCase();
-    if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
-      console.warn('[browser-fetch] Refusing HTML response for ' + url + ' (content-type: ' + contentType + ')');
-      return false;
+    await download.saveAs(destPath);
+    // Cloudflare challenge pages are sometimes saved as files. Preserve the old
+    // HTML content-type guard by checking the first bytes on disk.
+    const fh = await fs.open(destPath, 'r');
+    try {
+      const buf = Buffer.alloc(8);
+      const { bytesRead } = await fh.read(buf, 0, 8, 0);
+      if (bytesRead < 4) {
+        console.warn(`[browser-fetch] Refusing empty/truncated download for ${url}`);
+        await fs.unlink(destPath).catch(() => {});
+        return false;
+      }
+      const head = buf.subarray(0, bytesRead).toString('latin1').trimStart();
+      if (head.startsWith('<')) {
+        console.warn(`[browser-fetch] Refusing HTML download for ${url} (starts with ${JSON.stringify(head.slice(0, 8))})`);
+        await fs.unlink(destPath).catch(() => {});
+        return false;
+      }
+    } finally {
+      await fh.close();
     }
-    const body = await response.body();
-    await fs.writeFile(destPath, body);
     return true;
   } catch (e) {
     console.warn(`[browser-fetch] Browser download failed for ${url}:`, e.message);
     return false;
+  } finally {
+    if (page) { try { await page.close(); } catch { } }
   }
 }
 
