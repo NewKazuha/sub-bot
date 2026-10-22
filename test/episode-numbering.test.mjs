@@ -516,5 +516,24 @@ test('bare season marker does not block resolution (Suikoden S01 - 03)', async (
   assert.ok(shared.length > 0, 'expected the two spellings to share at least one key');
 });
 
+// ---------------------------------------------------------------------------
+// Live defect 2026-10-22: "Specials 1&2" was not recognised as a range, so a
+// two-episode release was published as a single .ass instead of going to the
+// batch extractor. And "[Bam]" published under a team name that does not exist.
+// ---------------------------------------------------------------------------
+test('& is a batch separator, and [Bam] resolves to [BAM25]', async () => {
+  const T = '[Bam] Isekai Meikyuu de Harem wo - Specials 1&2';
+
+  assert.deepEqual(tc.extractBatchRange(T), [1, 2]);
+  assert.deepEqual(tc.extractBatchRange('X - 01&02'), [1, 2]);
+  assert.deepEqual(tc.extractBatchRange('X - 01 ~ 02'), [1, 2]);
+
+  assert.equal(tc.extractTeamAndFormatTitle(T), '[BAM25] Isekai Meikyuu de Harem wo - Specials 1&2');
+  assert.ok(tc.extractTeamAndFormatTitle('[Bam Subs] X - 01').startsWith('[BAM25]'));
+  // untouched: the real name and the unrelated Hoshizora alias
+  assert.ok(tc.extractTeamAndFormatTitle('[BAM25] Y - 02').startsWith('[BAM25]'));
+  assert.ok(tc.extractTeamAndFormatTitle('[Hoshizora] Z - 01').startsWith('[ReDEJA]'));
+});
+
 
 

@@ -483,8 +483,11 @@ export function extractBatchRange(title) {
     return [start, end];
   };
 
-  // 1. Tilde is unambiguous range (e.g. 001~005, 01~13, 01 ~ 13)
-  for (const m of s.matchAll(/(\d{1,4})\s*~\s*(\d{1,4})/g)) {
+  // 1. Tilde is unambiguous range (e.g. 001~005, 01~13, 01 ~ 13).
+  // '&' is the same idea ("Specials 1&2"): two digits around it can only mean
+  // a pair, and without this the release was treated as a single episode and
+  // published as one .ass instead of being sent to the batch extractor.
+  for (const m of s.matchAll(/(\d{1,4})\s*[~&]\s*(\d{1,4})/g)) {
     const r = valid(m[1], m[2], m.index);
     if (r) return r;
   }
@@ -1056,7 +1059,12 @@ export function extractTeamAndFormatTitle(text) {
   const rawTitle = formatCleanTitle(line0 || 'Anime Release');
 
   if (/^\[[^\]]+\]/.test(rawTitle)) {
-    return rawTitle.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
+    return rawTitle
+      .replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]')
+      // The same group posts under both "Bam" and "BAM25", and the source
+      // sometimes puts the short form in the bracket — which published the
+      // release under a team name that does not exist. Map it to the real one.
+      .replace(/^\[\s*bam(?:[-_\s]*subs?)?\s*\]/i, '[BAM25]');
   }
 
   let team = '';
