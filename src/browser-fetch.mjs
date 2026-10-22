@@ -15,6 +15,16 @@ let browserContext = null;
 let contextPromise = null;
 
 /**
+ * Drop every reference to the shared browser. Idempotent: safe to call from
+ * the crash handler, from the launcher failure path and from closeBrowser().
+ */
+function resetBrowserState() {
+  browser = null;
+  browserContext = null;
+  contextPromise = null;
+}
+
+/**
  * True only for the Rocks-Team DDL host (exact hostname match).
  */
 export function isRocksDdlHost(url) {
@@ -26,13 +36,24 @@ export function isRocksDdlHost(url) {
 }
 
 async function getContext() {
-  if (browserContext) return browserContext;
+  if (browserContext) {
+    // A context whose browser died (crash / external kill) is dead itself:
+    // drop it instead of handing out a broken context.
+    if (browser && browser.isConnected()) return browserContext;
+    resetBrowserState();
+  }
   if (!contextPromise) {
     contextPromise = (async () => {
       // Imported lazily so that merely importing this module never requires a
       // working Chromium install (and never slows down unrelated code paths).
       const { chromium } = await import('playwright');
       const launched = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+      // If Chromium dies on its own, the context dies with it. Reset only when
+      // the dead browser is still the current one, so a newer browser is never
+      // wiped by a late event from an older instance.
+      launched.once('disconnected', () => {
+        if (browser === launched) resetBrowserState();
+      });
       const context = await launched.newContext({
         userAgent: UA,
         viewport: { width: 1366, height: 768 }
@@ -41,9 +62,7 @@ async function getContext() {
       browserContext = context;
       return context;
     })().catch(err => {
-      contextPromise = null;
-      browser = null;
-      browserContext = null;
+      resetBrowserState();
       throw err;
     });
   }
@@ -90,6 +109,13 @@ export async function downloadViaBrowser(url, destPath) {
       console.warn(`[browser-fetch] Browser download failed for ${url}: HTTP ${response.status()}`);
       return false;
     }
+    // A Cloudflare challenge page answers 200 with HTML: writing it to disk
+    // would store the challenge instead of the release, so refuse it.
+    const contentType = (response.headers()['content-type'] || '').toLowerCase();
+    if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
+      console.warn('[browser-fetch] Refusing HTML response for ' + url + ' (content-type: ' + contentType + ')');
+      return false;
+    }
     const body = await response.body();
     await fs.writeFile(destPath, body);
     return true;
@@ -104,17 +130,23 @@ export async function downloadViaBrowser(url, destPath) {
  * from a clean browser (used at the end of a monitoring round).
  */
 export async function closeBrowser() {
+  let current = null;
   try {
     // Wait for a launch that is still in flight so we never leak a browser.
     if (contextPromise) await contextPromise.catch(() => { });
-    const current = browser;
-    browser = null;
-    browserContext = null;
-    contextPromise = null;
-    if (current) {
-      await current.close();
-    }
+    current = browser;
   } catch (e) {
     console.warn('[browser-fetch] Failed to close the headless browser:', e.message);
+  } finally {
+    // Idempotent: clears the singleton so the next round starts from a clean
+    // browser, whether or not the close below succeeded.
+    resetBrowserState();
+  }
+  if (current) {
+    try {
+      await current.close();
+    } catch (e) {
+      console.warn('[browser-fetch] Failed to close the headless browser:', e.message);
+    }
   }
 }
