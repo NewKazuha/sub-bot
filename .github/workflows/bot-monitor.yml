@@ -123,7 +123,7 @@ jobs:
             || { echo "❌ Dispatch failed — cron is NOT a reliable fallback (measured 1/10); failing this run so the stop is visible"; exit 1; }
 
       - name: Notify on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           # Admin DM only — NEVER TELEGRAM_TARGET_CHANNEL, that is the public

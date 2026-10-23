@@ -83,29 +83,43 @@ async function getContext() {
 /**
  * Render a page in headless Chromium and return its final HTML.
  * Returns null (never throws) when the page cannot be loaded.
+ *
+ * The Cloudflare challenge is intermittent rather than absolute: one run lost
+ * 8/8 renders while the very next run succeeded and published. Two attempts
+ * turn that flakiness into a usable hit rate without letting one dead page
+ * swallow the whole monitoring cycle.
  */
-export async function fetchRenderedHtml(url, { timeoutMs = 45000 } = {}) {
-  let page = null;
-  try {
-    const context = await getContext();
-    page = await context.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    // The listing is rendered client-side: wait for the file links to appear
-    // instead of guessing with a fixed sleep.
-    await page.waitForFunction(
-      () => document.querySelectorAll('a[href*=".rar"],a[href*=".ass"],a[href*=".zip"],a[href*="ddl.rocks-team.net"]').length > 0,
-      null,
-      { timeout: timeoutMs }
-    );
-    return await page.content();
-  } catch (e) {
-    console.warn(`[browser-fetch] Could not render ${url}:`, e.message);
-    return null;
-  } finally {
-    if (page) {
-      try { await page.close(); } catch { }
+const RENDER_ATTEMPTS = 2;
+
+export async function fetchRenderedHtml(url, { timeoutMs = 90000 } = {}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= RENDER_ATTEMPTS; attempt++) {
+    let page = null;
+    try {
+      const context = await getContext();
+      page = await context.newPage();
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+      // The listing is rendered client-side: wait for the file links to appear
+      // instead of guessing with a fixed sleep.
+      await page.waitForFunction(
+        () => document.querySelectorAll('a[href*=".rar"],a[href*=".ass"],a[href*=".zip"],a[href*="ddl.rocks-team.net"]').length > 0,
+        null,
+        { timeout: timeoutMs }
+      );
+      const html = await page.content();
+      console.log(`[browser-fetch] rendered on attempt ${attempt}/${RENDER_ATTEMPTS} for ${url}`);
+      return html;
+    } catch (e) {
+      lastError = e;
+      console.warn(`[browser-fetch] attempt ${attempt}/${RENDER_ATTEMPTS} failed for ${url}: ${e.message}`);
+    } finally {
+      if (page) {
+        try { await page.close(); } catch { }
+      }
     }
   }
+  console.warn(`[browser-fetch] Could not render ${url} after ${RENDER_ATTEMPTS} attempts:`, lastError?.message);
+  return null;
 }
 
 /**
