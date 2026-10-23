@@ -1762,7 +1762,10 @@ function parseEraiMessage(msg) {
   const sourceMatch = text.match(/Source:\s*(.+)/i);
   const source = sourceMatch ? sourceMatch[1].trim() : '';
 
-  const hasArabic = text.includes('🇸🇦');
+  // Erai lists the subtitle languages, sometimes as flags and sometimes as
+  // plain text. Requiring the 🇸🇦 emoji alone silently dropped every release
+  // that spelled it out — JoJo SBR 06 was marked as posted and never published.
+  const hasArabic = text.includes('🇸🇦') || /\barabic\b|العربية|عربي|عربى/i.test(text);
 
   const srcLower = source.toLowerCase().trim();
   const sourceName = SOURCE_FULL_NAME[srcLower] || source || 'Official';
