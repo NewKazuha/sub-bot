@@ -343,12 +343,14 @@ test('resolved=null on defect title B yields the pre-fix-shaped base keys (no fa
   const nullKeys = tc.getReleaseKeys(B, true, null);
   assert.deepEqual(nullKeys, tc.getReleaseKeys(B, true), 'explicit-null and default call must match');
   // Pre-fix base key families of B (unchanged: B never had a batch range).
+  // Keys are now source-scoped, so assert the FAMILY (suffix) rather than the
+  // exact string — the point of this test is which families exist, not their prefix.
   assert.ok(nullKeys.includes('disney_yozakura_san_chi_no_daisakusen_2nd_season_13_p2_01'), 'fullNorm base key missing');
-  assert.ok(nullKeys.includes('yozakura_san_chi_no_daisakusen_2nd_season_13_p2_01'), 'coreKey base key missing');
+  assert.ok(nullKeys.some(k => k.endsWith('yozakura_san_chi_no_daisakusen_2nd_season_13_p2_01')), 'coreKey base key missing');
   // No enrichment families on the null path:
-  assert.ok(!nullKeys.includes(A_FULL_NORM), 'no sequel keys on resolved=null');
-  assert.ok(!nullKeys.includes(B_ALT_FULL_NORM), 'no fast-path keys on resolved=null');
-  assert.ok(!nullKeys.includes(B_PER_PART_FULL_NORM), 'no stripped fast-path keys on resolved=null');
+  assert.ok(!nullKeys.some(k => k.endsWith(A_FULL_NORM)), 'no sequel keys on resolved=null');
+  assert.ok(!nullKeys.some(k => k.endsWith(B_ALT_FULL_NORM)), 'no fast-path keys on resolved=null');
+  assert.ok(!nullKeys.some(k => k.endsWith(B_PER_PART_FULL_NORM)), 'no stripped fast-path keys on resolved=null');
   assert.deepEqual(tc.getFansubReleaseKeys(B, null), tc.getFansubReleaseKeys(B));
 });
 
@@ -370,7 +372,9 @@ test('extractEpisodeNumber: parses SxxEyy formats correctly', () => {
 
 test('Chitose live defect: S01E15 and Part 2 - 02 overlap via sequel overflow', async () => {
   const titleA = '[Crunchyroll] Chitose-kun wa Ramune Bin no Naka Part 2 - 02';
-  const titleB = 'Chitose Is In The Ramune Bottle S01E15 CR WEB-DL Arabic AR';
+  // Same source on purpose: keys are now source-scoped, so a cross-source pair
+  // would no longer intersect — and this test is about sequel overflow, not dedup.
+  const titleB = '[Crunchyroll] Chitose Is In The Ramune Bottle S01E15 CR WEB-DL Arabic AR';
 
   assert.equal(tc.extractEpisodeNumber(titleA), '2');
   assert.equal(tc.extractEpisodeNumber(titleB), '15');
@@ -397,17 +401,18 @@ test('Chitose live defect: S01E15 and Part 2 - 02 overlap via sequel overflow', 
   const keysB = tc.getReleaseKeys(titleB, false, resolvedChitose);
   const overlapFansub = keysA.filter((k) => keysB.includes(k));
   assert.ok(overlapFansub.length >= 6, 'S01E15 must intersect with Part 2 - 02 via 15 - 13 = 2 overflow');
-  assert.ok(overlapFansub.includes('token_ep_2_chitose_kun'), 'token_ep_2_chitose_kun must match');
-  assert.ok(overlapFansub.includes('token_ep_02_chitose_kun'), 'token_ep_02_chitose_kun must match');
+  // Keys carry a source scope now, so match the family by suffix.
+  assert.ok(overlapFansub.some(k => k.endsWith('token_ep_2_chitose_kun')), 'token_ep_2_chitose_kun must match');
+  assert.ok(overlapFansub.some(k => k.endsWith('token_ep_02_chitose_kun')), 'token_ep_02_chitose_kun must match');
 
   // Official mode overlap (isOfficialPlatformRelease returns true for CR WEB-DL)
   assert.equal(tc.isOfficialPlatformRelease(titleB), true, 'CR WEB-DL must be recognized as official');
   const keysBOfficial = tc.getReleaseKeys(titleB, true, resolvedChitose);
   const overlapOfficial = keysA.filter((k) => keysBOfficial.includes(k));
   assert.ok(overlapOfficial.length >= 14, 'Official CR WEB-DL must intersect with Part 2 - 02 with >= 14 keys');
-  assert.ok(overlapOfficial.includes('chitose_kun_wa_ramune_bin_no_naka_part_2_02'), 'exact core title key must match');
-  assert.ok(overlapOfficial.includes('official_chitose_kun_wa_ramune_bin_no_naka_part_2_02'), 'exact official full title key must match');
-  assert.ok(overlapOfficial.includes('official_ep_2_chitose_kun'), 'official_ep_2_chitose_kun must match');
+  assert.ok(overlapOfficial.some(k => k.endsWith('chitose_kun_wa_ramune_bin_no_naka_part_2_02')), 'exact core title key must match');
+  assert.ok(overlapOfficial.some(k => k.endsWith('official_chitose_kun_wa_ramune_bin_no_naka_part_2_02')), 'exact official full title key must match');
+  assert.ok(overlapOfficial.some(k => k.endsWith('official_ep_2_chitose_kun')), 'official_ep_2_chitose_kun must match');
 });
 
 test('scene tag cleaning does not corrupt title words like Prime or Ara', () => {
@@ -533,6 +538,38 @@ test('& is a batch separator, and [Bam] resolves to [BAM25]', async () => {
   // untouched: the real name and the unrelated Hoshizora alias
   assert.ok(tc.extractTeamAndFormatTitle('[BAM25] Y - 02').startsWith('[BAM25]'));
   assert.ok(tc.extractTeamAndFormatTitle('[Hoshizora] Z - 01').startsWith('[ReDEJA]'));
+});
+
+// ---------------------------------------------------------------------------
+// Live defect 2026-10-23: a REVIVE fansub of Tokyo Revengers 04 was published,
+// and Erai's Disney+ copy of the SAME episode was then suppressed as a
+// duplicate. A fansub translation and an official one are different releases.
+// ---------------------------------------------------------------------------
+test('source-scoped dedup: different sources never suppress each other', () => {
+  const shared = (a, b) => {
+    const B = tc.getReleaseKeys(b, true, null);
+    return tc.getReleaseKeys(a, true, null).filter(k => B.includes(k));
+  };
+
+  assert.deepEqual(
+    shared('[REVIVE] Tokyo Revengers - Santen Sensou-hen - 04',
+           '[Disney+] Tokyo Revengers: Santen Sensou Hen - 04'),
+    [],
+    'a fansub and an official track must not suppress each other'
+  );
+
+  assert.deepEqual(
+    shared('[Crunchyroll] Dandadan - 05', '[Netflix] Dandadan - 05'),
+    [],
+    'two platforms carry two translations and must not suppress each other'
+  );
+
+  // Same source, different spelling -> still ONE release (dedup must survive).
+  assert.ok(
+    shared('[REVIVE] Tokyo Revengers - Santen Sensou-hen - 04',
+           '[REVIVE] Tokyo Revengers: Santen Sensou Hen 04').length > 0,
+    'same source must still dedupe across title spellings'
+  );
 });
 
 
