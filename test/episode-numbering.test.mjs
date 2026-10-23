@@ -572,5 +572,24 @@ test('source-scoped dedup: different sources never suppress each other', () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Live defect 2026-10-24: a KokoBoko mirror of a Crunchyroll post carries
+// "S01E03" while the original said "- 03" — same episode, no shared key.
+// ---------------------------------------------------------------------------
+test('S01E03 and "- 03" are one episode; S02E03 is a different one', () => {
+  const f = (t) => tc.getFansubReleaseKeys(t, null);
+  const dash = f('[Crunchyroll] Toaru Anbu no Item - 03');
+  const s01 = f('[Crunchyroll] Toaru Anbu no Item S01E03');
+  const s02 = f('[Crunchyroll] Toaru Anbu no Item S02E03');
+
+  assert.ok(dash.some(k => s01.includes(k)), 'S01E03 must dedupe against "- 03"');
+  assert.equal(dash.filter(k => s02.includes(k)).length, 0, 'S02E03 must not collide with episode 3');
+  assert.equal(
+    tc.getCoreAnimeEpisodeKey('[Crunchyroll] Toaru Anbu no Item S01E03'),
+    tc.getCoreAnimeEpisodeKey('[Crunchyroll] Toaru Anbu no Item - 03'),
+    'season one collapses to the bare episode number'
+  );
+});
+
 
 

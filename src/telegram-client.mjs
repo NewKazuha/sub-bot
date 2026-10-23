@@ -434,6 +434,10 @@ export function getCoreAnimeEpisodeKey(title) {
     .replace(/\b(?:end|ending|final|مكتمل)\b/gi, '')
     // Strip trailing scene tags ONLY after episode numbers at the tail
     .replace(/(\b(?:s\d{1,2}e\d{1,4}|\d{1,4})\b)(?:\s+[\(\[]?(?:cr|hidive|nf|netflix|dsnp|amzn|arabic|ara\s+ar|ar|web-?dl|web-?rip|multi-?subs?)[\)\]]?)+\s*$/i, '$1')
+    // "Show S01E03" and "Show - 03" are the same episode, and sources use both
+    // spellings freely (a KokoBoko mirror of a Crunchyroll post is exactly this
+    // case). Collapse only SEASON ONE, so S02E03 never collides with episode 3.
+    .replace(/\bs01e(\d{1,4})\b/gi, '$1')
     .replace(/\bii\b/gi, '2')
     .replace(/\biii\b/gi, '3')
     .replace(/\biv\b/gi, '4')
