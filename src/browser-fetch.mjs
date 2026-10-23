@@ -91,7 +91,7 @@ async function getContext() {
  */
 const RENDER_ATTEMPTS = 2;
 
-export async function fetchRenderedHtml(url, { timeoutMs = 90000 } = {}) {
+export async function fetchRenderedHtml(url, { timeoutMs = 60000 } = {}) {
   let lastError = null;
   for (let attempt = 1; attempt <= RENDER_ATTEMPTS; attempt++) {
     let page = null;

@@ -16,7 +16,10 @@ permissions:
 jobs:
   check-and-post:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 25 min of monitoring + ~4 min of setup, plus one overrunning cycle.
+    # At 35 the Rocks retries pushed runs over the limit and GitHub CANCELLED
+    # them — and a cancelled run never chains, so the bot silently stopped.
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -134,7 +137,9 @@ jobs:
             echo "ℹ️ Notification skipped — set TELEGRAM_ADMIN_CHAT_ID to enable failure alerts."
             exit 0
           fi
-          TEXT="🔴 Bot monitor failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # This step now also runs on cancellation, so the wording must fit
+          # both cases: "stopped" is true for a failure and for a cancel.
+          TEXT="🔴 Bot monitor stopped: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${TEXT}" \
