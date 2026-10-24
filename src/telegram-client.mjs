@@ -2402,10 +2402,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     if (teamMatch && /^(revive|rhythm|celestial|lazysano|suzume|kiyoshi|redeja|asahi|zarax|rocks|3yar|bruuhim|aurora)/i.test(teamMatch[1])) {
                       cleanTitle = `[${teamMatch[1]}] ${baseName.slice(teamMatch[0].length).trim()}`;
                     } else {
-                      // "Subdl" is the SITE the subtitle was taken from
-                      // (subdl.com), not a fansub team. Prefixing it published a
-                      // website as the group. Leave the title untagged instead —
-                      // the caption keeps whatever the filename said.
+                      cleanTitle = `[Subdl] ${cleanTitle}`;
                     }
                   }
                 }
