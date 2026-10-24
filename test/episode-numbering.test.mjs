@@ -541,37 +541,6 @@ test('& is a batch separator, and [Bam] resolves to [BAM25]', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Live defect 2026-10-23: a REVIVE fansub of Tokyo Revengers 04 was published,
-// and Erai's Disney+ copy of the SAME episode was then suppressed as a
-// duplicate. A fansub translation and an official one are different releases.
-// ---------------------------------------------------------------------------
-test('source-scoped dedup: different sources never suppress each other', () => {
-  const shared = (a, b) => {
-    const B = tc.getReleaseKeys(b, true, null);
-    return tc.getReleaseKeys(a, true, null).filter(k => B.includes(k));
-  };
-
-  assert.deepEqual(
-    shared('[REVIVE] Tokyo Revengers - Santen Sensou-hen - 04',
-           '[Disney+] Tokyo Revengers: Santen Sensou Hen - 04'),
-    [],
-    'a fansub and an official track must not suppress each other'
-  );
-
-  assert.deepEqual(
-    shared('[Crunchyroll] Dandadan - 05', '[Netflix] Dandadan - 05'),
-    [],
-    'two platforms carry two translations and must not suppress each other'
-  );
-
-  // Same source, different spelling -> still ONE release (dedup must survive).
-  assert.ok(
-    shared('[REVIVE] Tokyo Revengers - Santen Sensou-hen - 04',
-           '[REVIVE] Tokyo Revengers: Santen Sensou Hen 04').length > 0,
-    'same source must still dedupe across title spellings'
-  );
-});
-
 // ---------------------------------------------------------------------------
 // Live defect 2026-10-24: a KokoBoko mirror of a Crunchyroll post carries
 // "S01E03" while the original said "- 03" — same episode, no shared key.

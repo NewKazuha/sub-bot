@@ -538,7 +538,7 @@ function resolveSourceToken(title) {
   return mapped.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '') || 'unknown';
 }
 
-function buildReleaseKeys(title, isOfficial = false, resolved = null) {
+export function getReleaseKeys(title, isOfficial = false, resolved = null) {
   const fullNorm = fullNormalizeKey(title);
 
   const coreKey = getCoreAnimeEpisodeKey(title);
@@ -666,14 +666,14 @@ function buildReleaseKeys(title, isOfficial = false, resolved = null) {
     for (const dictName of dictStrings) {
       const syntheticTitle = buildSyntheticTitle(title, dictName);
       if (!syntheticTitle || syntheticTitle === title) continue;
-      additions.push(...buildReleaseKeys(syntheticTitle, isOfficial, null));
+      additions.push(...getReleaseKeys(syntheticTitle, isOfficial, null));
     }
 
     // (c)+(d) FAST-PATH + SEQUEL OVERFLOW: shared synthesis (single
     // implementation for both key functions); each extra title is re-run
     // through THIS function with resolved=null (recursion guard).
     for (const extraTitle of collectIdentityExtraTitles(title, epNum, resolved)) {
-      additions.push(...buildReleaseKeys(extraTitle, isOfficial, null));
+      additions.push(...getReleaseKeys(extraTitle, isOfficial, null));
     }
 
     return Array.from(new Set([...baseKeys, ...additions].filter(Boolean)));
@@ -681,23 +681,6 @@ function buildReleaseKeys(title, isOfficial = false, resolved = null) {
     // Fail-open: identity layer trouble must never shrink or block key generation.
     return baseKeys;
   }
-}
-
-/**
- * Two translations of one episode are two DIFFERENT releases, not one: a fansub
- * and an official track, or two platforms (Crunchyroll vs Netflix), each carry
- * their own translation. Every key is therefore scoped to its source so one can
- * never suppress the other. The fullNorm key already begins with the source
- * token, so it is left as-is — which also keeps the existing state meaningful.
- */
-export function getReleaseKeys(title, isOfficial = false, resolved = null) {
-  const keys = buildReleaseKeys(title, isOfficial, resolved);
-  const src = resolveSourceToken(title);
-  // Some families already carry the source — either as a leading token
-  // ("netflix_jojo…") or as a trailing one ("…_ep_04_crunchyroll"). Those are
-  // left alone; only the genuinely source-agnostic families get scoped.
-  const isScoped = (k) => k.startsWith(src + '_') || k.endsWith('_' + src);
-  return Array.from(new Set(keys.map(k => (isScoped(k) ? k : `${src}__${k}`))));
 }
 
 // Fansub releases are deliberately deduplicated within the same team only.
