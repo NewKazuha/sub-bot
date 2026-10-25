@@ -443,6 +443,65 @@ export function getDriveDirectUrl(fileId) {
   return `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`;
 }
 
+export async function downloadGoogleDriveFileToDisk(fileId, destPath, fileName = '') {
+  const url = getDriveDirectUrl(fileId);
+  const cookie = process.env.GOOGLE_DRIVE_COOKIE || '';
+  const headers = {
+    'User-Agent': UA,
+    ...(cookie ? { 'Cookie': cookie } : {})
+  };
+
+  try {
+    let res = await fetchWithTimeout(url, { headers }, 60_000);
+    if (!res.ok) {
+      console.warn(`   ⚠️ Google Drive HTTP ${res.status} for file: ${fileName || fileId}`);
+      return false;
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) {
+      const html = await res.text();
+      // Check if it's a large file confirmation form (virus-scan warning)
+      const $ = cheerio.load(html);
+      const form = $('form').first();
+      const action = form.attr('action');
+      const params = new URLSearchParams();
+      form.find('input[name]').each((_, input) => {
+        const name = $(input).attr('name');
+        const value = $(input).attr('value') || '';
+        if (name) params.set(name, value);
+      });
+
+      if (action && params.has('confirm')) {
+        const confirmedUrl = new URL(action, res.url);
+        confirmedUrl.search = params.toString();
+        res = await fetchWithTimeout(confirmedUrl.toString(), { headers }, 60_000);
+        const nextType = (res.headers.get('content-type') || '').toLowerCase();
+        if (res.ok && !nextType.includes('text/html')) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          fs.writeFileSync(destPath, buf);
+          return true;
+        }
+      }
+
+      if (html.includes('Quota exceeded')) {
+        console.warn(`   ⚠️ Google Drive download quota exceeded for file: "${fileName || fileId}"`);
+      } else {
+        console.warn(`   ⚠️ Google Drive returned HTML instead of binary for file: "${fileName || fileId}"`);
+      }
+      return false;
+    }
+
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(destPath, buf);
+    return true;
+  } catch (e) {
+    console.warn(`   ⚠️ Google Drive download failed for file "${fileName || fileId}":`, e.message);
+    return false;
+  }
+}
+
+
 export async function listDriveFolder(folderUrl) {
   try {
     const idMatch = folderUrl.match(/(?:folders|folderview\?id=)\/?([\w-]{20,})/);
@@ -615,14 +674,7 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
         console.log(`   📥 Downloading Drive sub: ${sub.name}`);
         const subDest = path.join(unpackDir, safeRemoteBaseName(sub.name, `drive_sub_${Date.now()}`));
         if (!isInsideDir(subDest, unpackDir)) throw new Error('unsafe cloud file name: ' + sub.name);
-        const subUrl = getDriveDirectUrl(sub.id);
-        try {
-          const res = await fetchWithTimeout(subUrl, {}, 30_000);
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            fs.writeFileSync(subDest, buf);
-          }
-        } catch {}
+        await downloadGoogleDriveFileToDisk(sub.id, subDest, sub.name);
       }));
 
       if (hasFonts) {
@@ -634,14 +686,7 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
           await Promise.all(chunk.map(async (font) => {
             const fontDest = path.join(fontsDir, safeRemoteBaseName(font.name, `drive_font_${Date.now()}`));
             if (!isInsideDir(fontDest, fontsDir)) throw new Error('unsafe cloud file name: ' + font.name);
-            const fontUrl = getDriveDirectUrl(font.id);
-            try {
-              const res = await fetchWithTimeout(fontUrl, {}, 30_000);
-              if (res.ok) {
-                const buf = Buffer.from(await res.arrayBuffer());
-                fs.writeFileSync(fontDest, buf);
-              }
-            } catch {}
+            await downloadGoogleDriveFileToDisk(font.id, fontDest, font.name);
           }));
         }
       }
@@ -664,11 +709,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
     console.log(`   📥 Downloading single Drive subtitle: ${singleSub.name}`);
     const destPath = path.join(destDir, safeRemoteBaseName(singleSub.name, `drive_sub_${Date.now()}`));
     if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + singleSub.name);
-    const subUrl = getDriveDirectUrl(singleSub.id);
-    const res = await fetchWithTimeout(subUrl);
-    if (res.ok) {
-      const buf = Buffer.from(await res.arrayBuffer());
-      fs.writeFileSync(destPath, buf);
+    const ok = await downloadGoogleDriveFileToDisk(singleSub.id, destPath, singleSub.name);
+    if (ok) {
       return {
         filePath: destPath,
         isArchive: false,
@@ -689,11 +731,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
     console.log(`   📦 Drive: found archive: ${chosen.name}`);
     const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, `drive_arc_${Date.now()}`));
     if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
-    const arcUrl = getDriveDirectUrl(chosen.id);
-    const res = await fetchWithTimeout(arcUrl);
-    if (res.ok) {
-      const buf = Buffer.from(await res.arrayBuffer());
-      fs.writeFileSync(destPath, buf);
+    const ok = await downloadGoogleDriveFileToDisk(chosen.id, destPath, chosen.name);
+    if (ok) {
       return {
         filePath: destPath,
         isArchive: true,
