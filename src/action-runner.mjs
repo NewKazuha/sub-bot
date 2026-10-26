@@ -1,3 +1,5 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { checkNewReleases } from './feed-monitor.mjs';
 import { createPersistentClient } from './telegram-client.mjs';
 import { CONFIG } from './config.mjs';
@@ -6,6 +8,46 @@ import { closeBrowser } from './browser-fetch.mjs';
 // Duration to keep the action worker alive checking continuously
 const RUN_DURATION_MINUTES = parseInt(process.env.RUN_DURATION_MINUTES || '25', 10);
 const CHECK_INTERVAL_SECONDS = parseInt(process.env.CHECK_INTERVAL_SECONDS || '60', 10);
+
+/**
+ * Core monitoring loop engine with injectable clock and sleep for deterministic testing.
+ */
+export async function runLoop({
+  windowMs,
+  cycleBudgetMs = 0,
+  checkIntervalMs = 60 * 1000,
+  check,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise(r => setTimeout(r, ms)),
+  onCycleError = null,
+  log = console.log,
+} = {}) {
+  const startTime = now();
+  const endTime = startTime + windowMs;
+
+  let cycle = 1;
+  while (now() + cycleBudgetMs <= endTime) {
+    log(`\n🔄 [Cycle #${cycle} - ${new Date(now()).toISOString()}]`);
+    try {
+      await check();
+    } catch (err) {
+      if (onCycleError) await onCycleError(cycle, err);
+      else console.error(`Cycle #${cycle} error:`, err.message);
+    }
+
+    const timeLeft = endTime - now();
+    if (timeLeft < cycleBudgetMs) {
+      break;
+    }
+
+    log(`⏳ Sleeping ${Math.round(checkIntervalMs / 1000)}s until next check... (Remaining window: ${Math.round(timeLeft / 60000)}m)`);
+    await sleep(checkIntervalMs);
+    cycle++;
+  }
+
+  log(`\n🏁 Continuous monitor window finished successfully after ${cycle} cycles.\n`);
+  return { cycles: cycle, elapsed: now() - startTime };
+}
 
 async function runContinuousMonitor() {
   console.log(`\n======================================================`);
@@ -46,15 +88,14 @@ async function runContinuousMonitor() {
       return;
     }
 
-    const startTime = Date.now();
-    const endTime = startTime + RUN_DURATION_MINUTES * 60 * 1000;
-
-    let cycle = 1;
-    while (Date.now() < endTime) {
-      console.log(`\n🔄 [Cycle #${cycle} - ${new Date().toISOString()}]`);
-      try {
+    await runLoop({
+      windowMs: RUN_DURATION_MINUTES * 60 * 1000,
+      cycleBudgetMs: 6 * 60 * 1000,
+      checkIntervalMs: CHECK_INTERVAL_SECONDS * 1000,
+      check: async () => {
         await checkNewReleases(client);
-      } catch (err) {
+      },
+      onCycleError: async (cycle, err) => {
         console.error(`Cycle #${cycle} error:`, err.message);
         // If client disconnected mid-cycle, try to reconnect for next cycle
         if (client && !client.connected) {
@@ -67,18 +108,7 @@ async function runContinuousMonitor() {
           }
         }
       }
-
-      const timeLeft = endTime - Date.now();
-      if (timeLeft <= CHECK_INTERVAL_SECONDS * 1000) {
-        break;
-      }
-
-      console.log(`⏳ Sleeping ${CHECK_INTERVAL_SECONDS}s until next check... (Remaining window: ${Math.round(timeLeft / 60000)}m)`);
-      await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_SECONDS * 1000));
-      cycle++;
-    }
-
-    console.log(`\n🏁 Continuous monitor window finished successfully after ${cycle} cycles.\n`);
+    });
   } finally {
     if (client) {
       try { await client.disconnect(); } catch { }
@@ -93,7 +123,10 @@ async function runContinuousMonitor() {
   }
 }
 
-runContinuousMonitor().catch(e => {
-  console.error('Fatal runner error:', e);
-  process.exit(1);
-});
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  runContinuousMonitor().catch(e => {
+    console.error('Fatal runner error:', e);
+    process.exit(1);
+  });
+}
