@@ -59,3 +59,46 @@ test('runLoop: exits immediately without sleeping when remaining window is less 
   assert.equal(result.elapsed, 20 * 60 * 1000);
 });
 
+test('runLoop: aborts a hanging cycle with cycleTimeoutMs, recovers, and finishes window', { timeout: 1000 }, async () => {
+  let t = 0;
+  let teardowns = 0;
+  const now = () => t;
+  const sleep = async (ms) => { t += ms; };
+  // Check hangs forever
+  const check = async () => new Promise(() => {});
+
+  const windowMs = 25 * 60 * 1000;
+  const cycleBudgetMs = 6 * 60 * 1000;
+  const checkIntervalMs = 60 * 1000;
+  const cycleTimeoutMs = 20; // 20ms real-time timeout in test
+
+  const onCycleTimeout = async (cycle) => {
+    teardowns++;
+    // Advance virtual time by 10 minutes when timeout occurs
+    t += 10 * 60 * 1000;
+  };
+
+  const result = await runLoop({
+    windowMs,
+    cycleBudgetMs,
+    checkIntervalMs,
+    cycleTimeoutMs,
+    check,
+    now,
+    sleep,
+    onCycleTimeout,
+    log: () => {}
+  });
+
+  // 1. Hanging cycle was cut and timeouts tracked
+  assert.ok(result.timeouts >= 1, `Expected at least 1 timeout, got ${result.timeouts}`);
+  assert.equal(teardowns, result.timeouts, 'Teardown should be called on each timeout');
+
+  // 2. Loop recovered and completed multiple cycles (didn't abort whole window on first timeout)
+  assert.equal(result.cycles, 2, 'Should have survived cycle 1 and proceeded to cycle 2');
+
+  // 3. Window finished cleanly within duration
+  assert.ok(result.elapsed <= windowMs, `Window overran! ${result.elapsed / 60000}m`);
+});
+
+

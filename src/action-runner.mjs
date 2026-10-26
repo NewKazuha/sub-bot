@@ -12,27 +12,66 @@ const CHECK_INTERVAL_SECONDS = parseInt(process.env.CHECK_INTERVAL_SECONDS || '6
 /**
  * Core monitoring loop engine with injectable clock and sleep for deterministic testing.
  */
+async function executeCycle(check, timeoutMs) {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return await check();
+  }
+
+  let timerId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      const err = new Error('cycle timeout');
+      err.isCycleTimeout = true;
+      reject(err);
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([check(), timeoutPromise]);
+  } finally {
+    clearTimeout(timerId);
+  }
+}
+
+/**
+ * Core monitoring loop engine with injectable clock and sleep for deterministic testing.
+ */
 export async function runLoop({
   windowMs,
   cycleBudgetMs = 0,
+  cycleTimeoutMs = 10 * 60 * 1000,
   checkIntervalMs = 60 * 1000,
   check,
   now = () => Date.now(),
   sleep = (ms) => new Promise(r => setTimeout(r, ms)),
   onCycleError = null,
+  onCycleTimeout = null,
   log = console.log,
 } = {}) {
   const startTime = now();
   const endTime = startTime + windowMs;
 
   let cycle = 1;
+  let timeouts = 0;
   while (now() + cycleBudgetMs <= endTime) {
     log(`\n🔄 [Cycle #${cycle} - ${new Date(now()).toISOString()}]`);
     try {
-      await check();
+      await executeCycle(check, cycleTimeoutMs);
     } catch (err) {
-      if (onCycleError) await onCycleError(cycle, err);
-      else console.error(`Cycle #${cycle} error:`, err.message);
+      if (err.isCycleTimeout) {
+        timeouts++;
+        log(`⚠️ [Cycle #${cycle}] Cycle timed out after ${Math.round(cycleTimeoutMs / 1000)}s!`);
+        if (onCycleTimeout) {
+          try {
+            await onCycleTimeout(cycle);
+          } catch (teardownErr) {
+            log(`⚠️ [Cycle #${cycle}] Teardown error:`, teardownErr.message);
+          }
+        }
+      } else {
+        if (onCycleError) await onCycleError(cycle, err);
+        else console.error(`Cycle #${cycle} error:`, err.message);
+      }
     }
 
     const timeLeft = endTime - now();
@@ -46,7 +85,7 @@ export async function runLoop({
   }
 
   log(`\n🏁 Continuous monitor window finished successfully after ${cycle} cycles.\n`);
-  return { cycles: cycle, elapsed: now() - startTime };
+  return { cycles: cycle, elapsed: now() - startTime, timeouts };
 }
 
 async function runContinuousMonitor() {
@@ -88,12 +127,50 @@ async function runContinuousMonitor() {
       return;
     }
 
+    const CYCLE_TIMEOUT_MS = parseInt(process.env.CYCLE_TIMEOUT_MS || String(10 * 60 * 1000), 10);
+    const TEARDOWN_TIMEOUT_MS = 30 * 1000;
+
+    const timeoutGuard = (promise, ms, desc) => Promise.race([
+      promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`${desc} timed out after ${ms / 1000}s`)), ms))
+    ]);
+
     await runLoop({
       windowMs: RUN_DURATION_MINUTES * 60 * 1000,
       cycleBudgetMs: 6 * 60 * 1000,
+      cycleTimeoutMs: CYCLE_TIMEOUT_MS,
       checkIntervalMs: CHECK_INTERVAL_SECONDS * 1000,
       check: async () => {
         await checkNewReleases(client);
+      },
+      onCycleTimeout: async (cycle) => {
+        console.warn(`⚠️ [Cycle #${cycle}] Performing bounded teardown of occupied resources...`);
+        // 1. Disconnect Telegram client (bounded by 30s)
+        if (client) {
+          try {
+            await timeoutGuard(client.disconnect(), TEARDOWN_TIMEOUT_MS, 'client.disconnect');
+            console.log('📡 Persistent Telegram client disconnected.');
+          } catch (e) {
+            console.warn('⚠️ Client disconnect failed/timed out:', e.message);
+          }
+        }
+        // 2. Close headless browser (bounded by 30s)
+        try {
+          await timeoutGuard(closeBrowser(), TEARDOWN_TIMEOUT_MS, 'closeBrowser');
+          console.log('🌐 Headless browser closed.');
+        } catch (e) {
+          console.warn('⚠️ Browser close failed/timed out:', e.message);
+        }
+        // 3. Reconnect Telegram client before next cycle
+        if (client) {
+          try {
+            console.log('🔄 Reconnecting Telegram client...');
+            await timeoutGuard(client.connect(), TEARDOWN_TIMEOUT_MS, 'client.connect');
+            console.log('✅ Reconnected successfully.');
+          } catch (reconErr) {
+            console.error('❌ Reconnection failed:', reconErr.message);
+          }
+        }
       },
       onCycleError: async (cycle, err) => {
         console.error(`Cycle #${cycle} error:`, err.message);
