@@ -202,8 +202,12 @@ async function runContinuousMonitor() {
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectRun) {
-  runContinuousMonitor().catch(e => {
-    console.error('Fatal runner error:', e);
-    process.exit(1);
-  });
+  runContinuousMonitor()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch(e => {
+      console.error('Fatal runner error:', e);
+      process.exit(1);
+    });
 }
