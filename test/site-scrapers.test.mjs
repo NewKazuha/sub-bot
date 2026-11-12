@@ -21,6 +21,10 @@ const {
   isMugiHost,
   __setFetchImpl,
   __resetMugiWorkerState,
+  __resetNegativeCache,
+  __getNegativeCacheStats,
+  __setNowImpl,
+  resolveScrapeNegativeTtlMinutes,
 } = ss;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +116,7 @@ function installStub({ root = rootListing, s4 = s4Listing, calls = [], options =
 
 beforeEach(() => {
   __resetMugiWorkerState();
+  __resetNegativeCache();
 });
 
 // ---------------------------------------------------------------------------
@@ -304,4 +309,160 @@ test('over-long folder names are skipped and never requested', async () => {
   const result = await resolveMugiSubtitleFromWorker(`[Mugi-Subs] ${longName}`, '49');
   assert.equal(result, null);
   assert.ok(!calls.some(u => u.includes(encodeURIComponent(longName))), 'must not request the over-long folder');
+});
+
+// ---------------------------------------------------------------------------
+// 13. P1-1b: the negative cache for "no download links"
+// ---------------------------------------------------------------------------
+
+const NO_LINK_HTML = '<html><head><title>Release</title></head><body><p>No links here</p></body></html>';
+
+function htmlResponse(html, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: name => (String(name).toLowerCase() === 'content-type' ? 'text/html; charset=utf-8' : null),
+    },
+    text: async () => html,
+  };
+}
+
+/** Stub the PAGE fetch (the non-Mugi path goes through globalThis.fetch). */
+function installPageFetch(html = NO_LINK_HTML) {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return htmlResponse(html);
+  };
+  return { calls, restore: () => { globalThis.fetch = original; } };
+}
+
+test('P1-1b: a link-less page is fetched ONCE and then served from the negative cache', async () => {
+  let clock = 1_700_000_000_000;
+  __setNowImpl(() => clock);
+  const { calls, restore } = installPageFetch();
+  try {
+    const url = 'https://lazysano.test/post-1';
+
+    const first = await scrapePostPage(url, null, null, 'Release 01');
+    assert.equal(calls.length, 1, 'the first scrape must fetch the page exactly once');
+    assert.equal(first.bestDownloadUrl, null, 'the page has no download link');
+    assert.equal(first.videoLinks.directSub, null, 'the page has no direct sub');
+    assert.notEqual(first.negativeCached, true, 'the first scrape is not a cache hit');
+
+    const second = await scrapePostPage(url, null, null, 'Release 01');
+    assert.equal(calls.length, 1, 'the second scrape must NOT make a network request');
+    assert.equal(second.negativeCached, true, 'the second scrape is answered from the cache');
+    assert.equal(second.bestDownloadUrl, null);
+    assert.equal(second.videoLinks, null);
+
+    const stats = __getNegativeCacheStats();
+    assert.equal(stats.hits, 1, 'the cached URL must be counted as a hit');
+    assert.equal(stats.misses, 1, 'the first URL must be counted as a miss');
+    assert.equal(stats.size, 1);
+
+    // The TTL expires -> the page is fetched again.
+    clock += 15 * 60_000 + 1;
+    const third = await scrapePostPage(url, null, null, 'Release 01');
+    assert.equal(calls.length, 2, 'an expired entry must trigger a new fetch');
+    assert.notEqual(third.negativeCached, true);
+  } finally {
+    restore();
+    __resetNegativeCache();
+  }
+});
+
+test('P1-1b: SCRAPE_NEGATIVE_TTL_MINUTES is validated exactly like MAX_CONSECUTIVE_CYCLE_FAILURES', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(String(m));
+
+  for (const bad of ['0', 'abc', '-1']) {
+    assert.equal(resolveScrapeNegativeTtlMinutes({ value: bad, env: {}, warn }), 15,
+      `an invalid TTL (${bad}) must fall back to 15`);
+  }
+  assert.equal(warnings.length, 3, 'every invalid value must warn');
+  assert.ok(warnings.every(w => /SCRAPE_NEGATIVE_TTL_MINUTES/.test(w)), `unexpected warnings: ${JSON.stringify(warnings)}`);
+
+  assert.equal(resolveScrapeNegativeTtlMinutes({ value: '60', env: {}, warn }), 60, '60 must be honoured');
+  assert.equal(warnings.length, 3, 'a valid value must not warn');
+
+  // An unset / empty env falls back to 15 WITHOUT a warning.
+  assert.equal(resolveScrapeNegativeTtlMinutes({ env: {}, warn }), 15);
+  assert.equal(resolveScrapeNegativeTtlMinutes({ env: { SCRAPE_NEGATIVE_TTL_MINUTES: '' }, warn }), 15);
+  assert.equal(warnings.length, 3, 'an unset TTL must not warn');
+});
+
+test('P1-1b: the runtime TTL honours SCRAPE_NEGATIVE_TTL_MINUTES=60 and an invalid value falls back to 15', async () => {
+  const previous = process.env.SCRAPE_NEGATIVE_TTL_MINUTES;
+  let clock = 1_700_000_000_000;
+  __setNowImpl(() => clock);
+  const { calls, restore } = installPageFetch();
+  try {
+    process.env.SCRAPE_NEGATIVE_TTL_MINUTES = '60';
+    const url = 'https://lazysano.test/post-ttl';
+    await scrapePostPage(url, null, null, 'Release 02');
+    assert.equal(calls.length, 1);
+
+    // 30 minutes later the entry is still live (60-minute TTL).
+    clock += 30 * 60_000;
+    await scrapePostPage(url, null, null, 'Release 02');
+    assert.equal(calls.length, 1, 'a 60-minute TTL must still be live after 30 minutes');
+
+    // Past the 60-minute TTL the page is fetched again.
+    clock += 31 * 60_000;
+    await scrapePostPage(url, null, null, 'Release 02');
+    assert.equal(calls.length, 2, 'an expired entry must trigger a new fetch');
+
+    // An invalid TTL falls back to 15 minutes (and warns).
+    __resetNegativeCache();
+    const realWarn = console.warn;
+    const warnings = [];
+    console.warn = (m) => { warnings.push(String(m)); realWarn(m); };
+    try {
+      process.env.SCRAPE_NEGATIVE_TTL_MINUTES = 'abc';
+      const badUrl = 'https://lazysano.test/post-bad-ttl';
+      const before = calls.length;
+      await scrapePostPage(badUrl, null, null, 'Release 03');
+      clock += 14 * 60_000;
+      await scrapePostPage(badUrl, null, null, 'Release 03');
+      assert.equal(calls.length, before + 1, 'the fallback TTL (15 min) must still be live after 14 minutes');
+      assert.ok(warnings.some(w => /invalid SCRAPE_NEGATIVE_TTL_MINUTES/.test(w)),
+        `the invalid TTL must warn: ${JSON.stringify(warnings)}`);
+    } finally {
+      console.warn = realWarn;
+    }
+  } finally {
+    if (previous === undefined) delete process.env.SCRAPE_NEGATIVE_TTL_MINUTES;
+    else process.env.SCRAPE_NEGATIVE_TTL_MINUTES = previous;
+    restore();
+    __resetNegativeCache();
+  }
+});
+
+test('P1-1b: the negative cache is bounded — it never exceeds its cap and evicts the oldest', async () => {
+  const { calls, restore } = installPageFetch();
+  try {
+    const cap = __getNegativeCacheStats().maxEntries;
+    assert.ok(cap >= 1, 'the cache must have a cap');
+    for (let i = 0; i < cap + 5; i++) {
+      await scrapePostPage(`https://lazysano.test/post-${i}`, null, null, `Release ${i}`);
+    }
+    assert.equal(calls.length, cap + 5, 'every distinct URL must be fetched once');
+    const stats = __getNegativeCacheStats();
+    assert.equal(stats.size, cap, 'the map must never grow beyond its cap');
+    assert.equal(stats.maxEntries, cap);
+
+    // The oldest entries were evicted -> they are fetched again.
+    const before = calls.length;
+    await scrapePostPage('https://lazysano.test/post-0', null, null, 'Release 0');
+    assert.equal(calls.length, before + 1, 'the evicted (oldest) entry must be fetched again');
+    // The newest entry is still cached.
+    await scrapePostPage(`https://lazysano.test/post-${cap + 4}`, null, null, 'Release newest');
+    assert.equal(calls.length, before + 1, 'the newest entry must still be cached');
+  } finally {
+    restore();
+    __resetNegativeCache();
+  }
 });

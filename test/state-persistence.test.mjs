@@ -17,7 +17,7 @@ import {
   MAX_ELEMENTS,
   MAX_BYTES,
 } from '../scripts/merge-posted-state.mjs';
-import { createCycleCounters } from '../src/telegram-client.mjs';
+import { createCycleCounters, formatNoLinksBySource } from '../src/telegram-client.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const CLIENT_URL = pathToFileURL(path.join(REPO_ROOT, 'src', 'telegram-client.mjs')).href;
@@ -1641,4 +1641,95 @@ test('R4: the default state writer is atomic and leaves no temp residue', () => 
   assert.ok(fs.existsSync(dest), 'the state file must be written');
   const residue = fs.readdirSync(dir).filter(f => f.endsWith('.tmp'));
   assert.deepEqual(residue, [], `no temp residue may remain: ${residue.join(',')}`);
+});
+
+// ===========================================================================
+// P1 TRANCHE 1 — ITEM 1 (the dispatch ledger) + ITEM 3 (the source counter)
+// ===========================================================================
+
+test('P1-5: a dispatched batch is DEFERRED and recorded in the dispatch ledger, never as published', async () => {
+  const dir = tmp();
+  const message = [
+    'Title: Some Anime Title 01~03',
+    'Source: Erai-Raws',
+    'Subtitles: Arabic \u{1F1F8}\u{1F1E6}',
+  ].join('\n');
+  const body = `
+let dispatches = 0;
+globalThis.fetch = async () => { dispatches++; return { status: 204, ok: true, headers: { get: () => null }, text: async () => '' }; };
+const summary = await m.checkTelegramChannels({
+  connected: true,
+  getMessages: async (chatId) => chatId === 2084152036 ? [{
+    id: 4242,
+    message: ${JSON.stringify(message)},
+    entities: [{ className: 'MessageEntityTextUrl', url: 'https://nyaa.si/download/Some.Anime.01.torrent' }],
+    media: null,
+  }] : [],
+  getDialogs: async () => [{ id: 2084152036, title: 'Erai-Raws [Official]' }],
+});
+console.log('SUMMARY=' + JSON.stringify(summary));
+console.log('DISPATCHES=' + dispatches);
+`;
+  const r = runStubbedCycle(dir, body, { GH_PAT: 'test-pat' });
+  assert.equal(r.status, 0, `the child must finish cleanly: ${r.stderr}`);
+  const line = (r.stdout.match(/SUMMARY=(.*)/) || [])[1];
+  assert.ok(line, `the summary must be printed: ${r.stdout}\n${r.stderr}`);
+  const summary = JSON.parse(line);
+
+  // The counters say what happened: DEFERRED, never published, never skipped.
+  assert.equal(summary.deferred, 1, `a dispatched batch must be DEFERRED: ${JSON.stringify(summary)}`);
+  assert.equal(summary.published, 0, 'a dispatched batch is never published');
+  assert.equal(summary.skipped, 0, 'a dispatched batch is never skipped');
+  assert.match(r.stdout + r.stderr, /DEFERRED \(dispatched to sub-extractor, publication NOT confirmed\)/,
+    'the dispatch must have its own log line');
+  assert.match(r.stdout, /DISPATCHES=1/, 'the batch must have been dispatched exactly once');
+
+  // The state records the DISPATCH — never a publication.
+  const posted = JSON.parse(fs.readFileSync(path.join(dir, 'data', 'posted.json'), 'utf8'));
+  assert.ok(posted.includes('dispatched:tg_2084152036_4242'),
+    `the message must be in the dispatch ledger: ${JSON.stringify(posted)}`);
+  assert.ok(posted.some(k => k.startsWith('dispatched:') && k !== 'dispatched:tg_2084152036_4242'),
+    `the release keys must be in the dispatch ledger: ${JSON.stringify(posted)}`);
+  assert.equal(posted.includes('tg_2084152036_4242'), false,
+    'a dispatch must NOT be stored as a plain posted key');
+
+  // The next cycle sees the same message and must NOT dispatch it again.
+  const second = runStubbedCycle(dir, body, { GH_PAT: 'test-pat' });
+  assert.equal(second.status, 0, `the second child must finish cleanly: ${second.stderr}`);
+  const secondLine = (second.stdout.match(/SUMMARY=(.*)/) || [])[1];
+  assert.ok(secondLine, `the second summary must be printed: ${second.stdout}\n${second.stderr}`);
+  const secondSummary = JSON.parse(secondLine);
+  assert.match(second.stdout, /DISPATCHES=0/, 'a dispatched batch must not be dispatched again');
+  assert.equal(secondSummary.deferred, 0, 'the second cycle must not defer the batch again');
+  assert.equal(secondSummary.skipped, 1, 'the already-dispatched message is skipped');
+});
+
+test('P1-5: a legacy plain posted key keeps suppressing re-processing and is never moved into the ledger', async () => {
+  const dir = tmp();
+  const r = runIn(dir, `
+    const s = m.loadPostedIds();
+    m.markReleaseAsPosted(s, 'tg_7_77', ['legacy_ep_9']);
+    console.log('HANDLED=' + m.isMessageAlreadyHandled(s, 'tg_7_77'));
+    console.log('KNOWN=' + m.isReleaseAlreadyPostedOrDispatched(s, ['legacy_ep_9']));
+    console.log('DISPATCHED=' + m.isReleaseDispatched(s, ['legacy_ep_9']));
+    m.markReleaseAsKnown(s, 'tg_8_88', ['legacy_ep_9']);
+    console.log('PLAIN=' + s.has('tg_8_88'));
+    console.log('LEDGER=' + s.has('dispatched:tg_8_88'));
+  `);
+  assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
+  assert.match(r.stdout, /HANDLED=true/, 'a legacy plain key must still suppress the message');
+  assert.match(r.stdout, /KNOWN=true/, 'a legacy plain key must still suppress the release');
+  assert.match(r.stdout, /DISPATCHED=false/, 'a published release is not a dispatched one');
+  assert.match(r.stdout, /PLAIN=true/, 'a published release stays a plain posted key');
+  assert.match(r.stdout, /LEDGER=false/, 'a published release must not be moved into the dispatch ledger');
+});
+
+test('P1-1c: the per-source no-links counter prints ONE line per cycle', () => {
+  assert.equal(formatNoLinksBySource(new Map()), null, 'an empty counter prints no line');
+  const line = formatNoLinksBySource(new Map([
+    ['lazysano.com', 6],
+    ['rhythm-sub.com', 5],
+    ['celestial-dragons.com', 3],
+  ]));
+  assert.equal(line, 'ℹ️ sources with no links this cycle: lazysano.com=6, rhythm-sub.com=5, celestial-dragons.com=3');
 });

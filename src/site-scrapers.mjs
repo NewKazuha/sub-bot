@@ -42,6 +42,126 @@ export function __resetMugiWorkerState() {
   mugiFetchImpl = (...args) => globalThis.fetch(...args);
 }
 
+// ---------------------------------------------------------------------------
+// P1-1b: the negative cache for "no download links".
+//
+// The live P0 run re-scraped the SAME ~12 URLs every 60 s because their pages
+// carry no usable download link: every one of those fetches was pure waste
+// (and load on the fansub site). A URL that was fetched and found to have no
+// link is therefore remembered for SCRAPE_NEGATIVE_TTL_MINUTES and answered
+// from memory — with NO network request — until its entry expires.
+//
+// The cache lives in the process only: nothing is persisted (the runner is
+// short-lived) and the map is bounded, so it can never grow without limit.
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_SCRAPE_NEGATIVE_TTL_MINUTES = 15;
+export const SCRAPE_NEGATIVE_CACHE_MAX_ENTRIES = 500;
+
+// url -> expiry epoch ms
+const negativeCache = new Map();
+let negativeCacheHits = 0;
+let negativeCacheMisses = 0;
+let negativeNowImpl = () => Date.now();
+// The last invalid TTL value that was warned about (one warning per value,
+// never one per scrape).
+let lastInvalidTtlWarning = null;
+
+/** The warning an invalid TTL produces (one message, two callers). */
+function negativeTtlWarning(raw) {
+  return `⚠️ invalid SCRAPE_NEGATIVE_TTL_MINUTES (${raw}) — falling back to ${DEFAULT_SCRAPE_NEGATIVE_TTL_MINUTES}`;
+}
+
+/**
+ * Resolve the negative-cache TTL (in minutes).
+ * An invalid value NEVER disables the cache: it falls back to 15 minutes with
+ * a warning — the same contract as MAX_CONSECUTIVE_CYCLE_FAILURES.
+ */
+export function resolveScrapeNegativeTtlMinutes({ value, env = process.env, warn = (m) => console.warn(m) } = {}) {
+  const injected = value !== undefined && value !== null && value !== '';
+  const raw = injected ? value : (env && env.SCRAPE_NEGATIVE_TTL_MINUTES);
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return DEFAULT_SCRAPE_NEGATIVE_TTL_MINUTES;
+  }
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || n < 1) {
+    warn(negativeTtlWarning(raw));
+    return DEFAULT_SCRAPE_NEGATIVE_TTL_MINUTES;
+  }
+  return n;
+}
+
+/** The TTL in force right now (warns once per distinct invalid value). */
+function currentNegativeTtlMinutes() {
+  const raw = process.env.SCRAPE_NEGATIVE_TTL_MINUTES;
+  const trimmed = String(raw ?? '').trim();
+  const n = trimmed === '' ? NaN : Number(trimmed);
+  if (trimmed !== '' && Number.isFinite(n) && n >= 1) {
+    lastInvalidTtlWarning = null; // a valid value resets the one-shot warning
+  }
+  return resolveScrapeNegativeTtlMinutes({
+    env: process.env,
+    warn: (msg) => {
+      // One warning per distinct invalid value — never one per scrape.
+      if (lastInvalidTtlWarning === trimmed) return;
+      lastInvalidTtlWarning = trimmed;
+      console.warn(msg);
+    },
+  });
+}
+
+/** A live negative entry for this URL (its expiry in epoch ms), or null. */
+function negativeCacheLookup(url, nowMs) {
+  if (!negativeCache.has(url)) {
+    negativeCacheMisses++;
+    return null;
+  }
+  const expiry = negativeCache.get(url);
+  if (expiry <= nowMs) {
+    negativeCache.delete(url); // lazy expiry
+    negativeCacheMisses++;
+    return null;
+  }
+  negativeCacheHits++;
+  return expiry;
+}
+
+/** Remember a no-link URL. The map is bounded: the oldest entry is evicted. */
+function negativeCacheStore(url, nowMs, ttlMinutes) {
+  const expiry = nowMs + ttlMinutes * 60_000;
+  negativeCache.delete(url); // re-insert: the newest entry is evicted last
+  while (negativeCache.size >= SCRAPE_NEGATIVE_CACHE_MAX_ENTRIES) {
+    const oldest = negativeCache.keys().next().value;
+    if (oldest === undefined) break;
+    negativeCache.delete(oldest);
+  }
+  negativeCache.set(url, expiry);
+  return expiry;
+}
+
+// Test hooks for the negative cache. Not used by production code paths.
+export function __setNowImpl(fn) {
+  negativeNowImpl = typeof fn === 'function' ? fn : () => Date.now();
+}
+
+/** Reset the cache, its counters AND the injected clock. */
+export function __resetNegativeCache() {
+  negativeCache.clear();
+  negativeCacheHits = 0;
+  negativeCacheMisses = 0;
+  negativeNowImpl = () => Date.now();
+  lastInvalidTtlWarning = null;
+}
+
+export function __getNegativeCacheStats() {
+  return {
+    hits: negativeCacheHits,
+    misses: negativeCacheMisses,
+    size: negativeCache.size,
+    maxEntries: SCRAPE_NEGATIVE_CACHE_MAX_ENTRIES,
+  };
+}
+
 // True only for mugi-subs.com and its subdomains. Uses the parsed hostname so
 // lookalikes (notmugi-subs.com, mugi-subs.com.evil.com) never match.
 export function isMugiHost(url) {
@@ -717,9 +837,28 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
 }
 
 export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null, releaseTitle = null) {
+  // P1-1b: a URL that was already fetched and found to have NO download link
+  // is answered from the negative cache — with NO network request at all —
+  // until its entry expires. This is what stops the same pages from being
+  // re-scraped every 60 s.
+  const cachedExpiry = negativeCacheLookup(pageUrl, negativeNowImpl());
+  if (cachedExpiry) {
+    const until = new Date(cachedExpiry).toISOString();
+    console.log(`⏭️ Negative cache: no links for ${pageUrl} (skipping until ${until})`);
+    return {
+      bestDownloadUrl: null,
+      videoLinks: null,
+      negativeCached: true,
+      negativeCachedUntil: until,
+    };
+  }
+
   // Mugi-Subs is Cloudflare-403 for datacenter IPs, so scrapePostPage must not
   // fetch the article. Resolve the subtitle through the public worker API and
   // never fall through to the blocked page.
+  // This path is deliberately NOT negative-cached: the worker lookup has its
+  // own root-listing cache and circuit breaker, and a worker OUTAGE must
+  // never be remembered as "this page has no links".
   if (isMugiHost(pageUrl)) {
     let effectiveTitle = releaseTitle;
     if (!effectiveTitle) {
@@ -998,7 +1137,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
 
   const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || buzzheavier || null);
 
-  return {
+  const result = {
     title,
     pageUrl,
     bestDownloadUrl,
@@ -1017,6 +1156,16 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
       h264: h264Link
     }
   };
+
+  // P1-1b: remember a page WITHOUT a usable link, so the next cycle answers
+  // from the cache instead of re-fetching it. A failed fetch never reaches
+  // this point (it returns null earlier), so only a genuinely link-less page
+  // is remembered — a transient error can never poison the cache.
+  if (!result.bestDownloadUrl && !result.videoLinks?.directSub) {
+    negativeCacheStore(pageUrl, negativeNowImpl(), currentNegativeTtlMinutes());
+  }
+
+  return result;
 }
 
 export async function resolveBuzzheavierDownloadUrl(buzzUrl) {

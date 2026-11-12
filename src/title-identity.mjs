@@ -448,7 +448,24 @@ export async function resolveCanonicalTitlesBatch(titles) {
 // trailing tags. Used by the synthetic re-run families in
 // telegram-client.mjs. Exported for tests (fidelity assertions).
 // Returns null when no safe split point is found (caller skips).
+//
+// P1-2 (Layer 1 — the ROOT of the "a series-level key swallows an episode"
+// defect): the name-matching used to CONSUME a BARE episode token
+// (" <num>", no dash — e.g. "[BAM] Kanojo no Tomodachi 04 [END]"), so the
+// synthetic title lost the episode ("[BAM] Kanojo no Tomodachi [END]") and
+// its key family degraded to a SERIES-LEVEL key — which then suppressed
+// every later episode of the same anime (the dedup decision is "any key
+// matches"). The bare token is now split off the name region and kept
+// VERBATIM: the substitution replaces the anime-name part ONLY, so the
+// synthetic title carries the SAME episode as the original.
+//
+// The token shape mirrors extractEpisodeNumber's rule 2 (telegram-client.mjs):
+// a number delimited by whitespace and followed by a tag/paren/dot or the
+// end of the title. It is a LOCAL copy on purpose — title-identity.mjs must
+// not import telegram-client.mjs (that would be a circular import).
 // --------------------------------------------------------------------
+const BARE_EPISODE_TOKEN = /(?:\s+|~)(\d{1,4})(?:\s*v\d+)?(?=\s*\[|\s*\(|\s*\.|\s*$)/;
+
 export function buildSyntheticTitle(originalTitle, replacementName) {
   try {
     const title = String(originalTitle ?? '');
@@ -495,6 +512,22 @@ export function buildSyntheticTitle(originalTitle, replacementName) {
     const trailingTags = tagMatch ? tagMatch[1] : '';
     const nameRegion = rest.slice(0, rest.length - trailingTags.length).trim();
     if (!nameRegion) return null;
+
+    // P1-2 (Layer 1): the name region can still carry a BARE episode token
+    // (" 04") that no explicit pattern matched. Split it off and keep it
+    // verbatim, so the synthetic title keeps the ORIGINAL's episode instead
+    // of degrading to a series-level key family.
+    const bare = nameRegion.match(BARE_EPISODE_TOKEN);
+    if (bare && bare.index > 0) {
+      const syntheticName = nameRegion.slice(0, bare.index).trim();
+      if (syntheticName) {
+        // The suffix starts at the whitespace in front of the token, so the
+        // spacing of the original announcement is preserved verbatim; only
+        // the anime-name part is replaced.
+        return `${platform}${name}${nameRegion.slice(bare.index)}${trailingTags}`;
+      }
+    }
+
     return `${platform}${name}${trailingTags}`;
   } catch {
     return null;

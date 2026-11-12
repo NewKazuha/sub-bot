@@ -390,7 +390,8 @@ export function extractSecondaryEpisodeNumber(title) {
 
 // Replace the FIRST episode token with the pad2 dash form " - 01". Internal:
 // used only by the fast-path / sequel synthesis below. Returns null when no
-// episode token. Token locating mirrors buildSyntheticTitle exactly (F7):
+// episode token. Token locating mirrors buildSyntheticTitle's EXPLICIT token
+// rules (F7):
 //   - operate on the region AFTER the leading platform bracket (a number
 //     inside the platform bracket is never an episode token),
 //   - require idx > 0 (a real name region must exist),
@@ -401,6 +402,11 @@ export function extractSecondaryEpisodeNumber(title) {
 //     batch guard would reject the defect's own sequel title "...Part 2 - 13".)
 // The EP_PATTERNS lookaheads keep numbers inside "[...]" (e.g. "[P2 - 01]")
 // unmatchable, so bracket-internal numbers are never rewritten.
+// P1-2: buildSyntheticTitle additionally splits off a BARE episode token
+// (" 04"). That fallback is deliberately NOT mirrored here: this function
+// REWRITES the token into the pad2 dash form, so locating a bare token would
+// rewrite the announcement's shape (the bare form is kept as-is by the
+// synthetic title).
 function replacePrimaryEpisode(title, ep) {
   try {
     const s = String(title ?? '');
@@ -898,8 +904,81 @@ export function getFansubReleaseKeys(title, resolved = null) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// P1-2 (Layer 2 — the GUARD): a series-level key must not suppress an
+// episode-scoped candidate.
+//
+// A release key is either scoped to ONE EPISODE (it carries an episode
+// marker) or it is SERIES-LEVEL (the anime name only). The stored state
+// contains BOTH kinds, because the synthetic (canonical re-run) family used
+// to emit a series-level key for every release: the name-matching consumed
+// the bare episode token ("<anime> 04" -> "<anime>"), so the synthetic key
+// family lost the episode. P1-2 Layer 1 fixed that root cause, but the
+// keys that are ALREADY in the state stay there (no state migration), and
+// any other path that emits a series-level key for an episode-scoped
+// candidate would reopen the hole. So the dedup DECISION itself is guarded:
+// for an episode-scoped candidate a series-level match is NOT decisive —
+// the episode-scoped keys decide. A candidate with no episode at all keeps
+// the previous behaviour ("any key matches").
+// ---------------------------------------------------------------------------
+
+/**
+ * Does this release key carry an EPISODE marker (is it scoped to a single
+ * episode)? The families are explicit:
+ *   - `_ep_<n>`        — the episode-key family: `…_ep_4`,
+ *                        `official_ep_4_<core>`, `token_ep_4_<prefix>`,
+ *                        `official_sorted_ep_4_<sig>`,
+ *                        `official_condensed_ep_4_<condensed>`,
+ *                        `<slug>_ep_4_<source>`
+ *   - `_batch_<a>_<b>` — the batch (episode RANGE) family
+ *   - `_s<d>e<d>`      — the `S01E10` marker
+ *   - a numeric token  — the episode number of the NORMALIZED title
+ *                        (`kanojo_no_tomodachi_04`). The token is accepted in
+ *                        ANY position, not only trailing: the official
+ *                        fullNorm keeps the trailing tags after the number
+ *                        (`…_04__end`) and a batch fullNorm keeps the range
+ *                        inline (`…_01_13_end`).
+ * Everything else (the anime name only, e.g. `fansub_bam25_kanojo_no_tomodachi`)
+ * is SERIES-LEVEL.
+ */
+export function isEpisodeScopedKey(key) {
+  const k = String(key ?? '');
+  if (!k) return false;
+  if (/(?:^|_)ep_\d{1,4}(?:_|$)/.test(k)) return true;
+  if (/(?:^|_)batch_\d{1,4}_\d{1,4}(?:_|$)/.test(k)) return true;
+  if (/(?:^|_)s\d{1,2}e\d{1,4}(?:_|$)/i.test(k)) return true;
+  if (/(?:^|_)(\d{1,4})(?=_|$)/.test(k)) return true;
+  return false;
+}
+
+/**
+ * The release-level dedup decision.
+ *
+ * P1-2 (Layer 2): when the candidate is scoped to an episode, a match on a
+ * SERIES-LEVEL key is not decisive — the episode-scoped keys decide (a
+ * series-level key stored for episode 01 must not swallow episode 04).
+ * A candidate with no episode at all keeps the previous behaviour ("any key
+ * matches"), so an episode-less release is still suppressed by a series-level
+ * key.
+ *
+ * `isReleasePostedByAnyKey` keeps the pre-P1-2 semantics ("any key matches")
+ * available for callers that rely on them.
+ */
 export function isReleaseAlreadyPosted(posted, keys) {
-  return keys.some(k => posted.has(k));
+  const list = Array.isArray(keys) ? keys : [];
+  const episodeScoped = list.filter(k => isEpisodeScopedKey(k));
+  // An episode-LESS candidate: unchanged behaviour ("any key matches").
+  if (episodeScoped.length === 0) return list.some(k => posted.has(k));
+  // An episode-scoped candidate: only the episode-scoped keys decide.
+  return episodeScoped.some(k => posted.has(k));
+}
+
+/**
+ * The pre-P1-2 dedup decision ("any key matches") — kept available for
+ * callers that rely on the unguarded semantics.
+ */
+export function isReleasePostedByAnyKey(posted, keys) {
+  return (Array.isArray(keys) ? keys : []).some(k => posted.has(k));
 }
 
 export function markReleaseAsPosted(posted, msgKey, keys = []) {
@@ -908,6 +987,136 @@ export function markReleaseAsPosted(posted, msgKey, keys = []) {
     if (k) posted.add(k);
   }
   savePostedIds(posted);
+}
+
+// ---------------------------------------------------------------------------
+// P1-5 (H10): the dispatch ledger — "dispatched" is NOT "published".
+//
+// A multi-episode batch that is handed to the sub-extractor repository is
+// only ACCEPTED there (HTTP 204); this bot never sees the published file.
+// Recording it as a plain posted key made the state claim a publication that
+// never happened here — and a lost dispatch was never retried.
+//
+// The ledger lives INSIDE the existing posted.json (no new state file): a
+// dispatched batch is recorded as `dispatched:<msgKey>` and
+// `dispatched:<releaseKey>`, and the dedup gates consult it, so the batch is
+// still not dispatched twice.
+// ---------------------------------------------------------------------------
+
+/** The prefix of every dispatch-ledger key inside posted.json. */
+export const DISPATCH_LEDGER_PREFIX = 'dispatched:';
+
+/** The state file's key-length cap (scripts/merge-posted-state.mjs). */
+const MAX_POSTED_KEY_LENGTH = 512;
+
+/** The ledger key of a message key or a release key. */
+export function dispatchLedgerKey(key) {
+  return key ? `${DISPATCH_LEDGER_PREFIX}${key}` : null;
+}
+
+/**
+ * The message-level gate: the message was already handled — published OR
+ * dispatched — in an earlier cycle. Legacy plain `tg_<chat>_<id>` keys keep
+ * working exactly as before.
+ */
+export function isMessageAlreadyHandled(posted, msgKey) {
+  if (!msgKey) return false;
+  return posted.has(msgKey) || posted.has(dispatchLedgerKey(msgKey));
+}
+
+/** Was this release handed to the sub-extractor instead of published here? */
+export function isReleaseDispatched(posted, keys) {
+  return keys.some(k => k && posted.has(dispatchLedgerKey(k)));
+}
+
+/**
+ * The release-level gate: a release that was published OR dispatched must
+ * not be processed again. This is the gate that also consults the dispatch
+ * ledger; the dedup half is `isReleaseAlreadyPosted`, which carries the
+ * P1-2 (Layer 2) guard — a series-level key never decides an episode-scoped
+ * candidate. The dispatch-ledger half is UNCHANGED by P1-2.
+ */
+export function isReleaseAlreadyPostedOrDispatched(posted, keys) {
+  return isReleaseAlreadyPosted(posted, keys) || isReleaseDispatched(posted, keys);
+}
+
+/**
+ * Record a DISPATCHED batch in the ledger — NEVER as a plain posted key, so
+ * the state stays honest about what actually happened.
+ */
+export function markReleaseAsDispatched(posted, msgKey, keys = []) {
+  const added = [];
+  const addLedgerKey = (key) => {
+    const ledgerKey = dispatchLedgerKey(key);
+    if (!ledgerKey) return;
+    if (ledgerKey.length > MAX_POSTED_KEY_LENGTH) {
+      // A key the merge script would reject would make the WHOLE state file
+      // invalid (a red push) — the ledger entry is dropped instead.
+      console.warn(`   ⚠️ Dispatch ledger key too long (${ledgerKey.length} > ${MAX_POSTED_KEY_LENGTH}) — not recorded.`);
+      return;
+    }
+    posted.add(ledgerKey);
+    added.push(ledgerKey);
+  };
+  addLedgerKey(msgKey);
+  for (const k of keys) addLedgerKey(k);
+  savePostedIds(posted);
+  return added;
+}
+
+/**
+ * A release-level dedup hit: the release is already known, so the message is
+ * skipped. A release that was only DISPATCHED is recorded in the dispatch
+ * ledger — never as a plain posted key (the state must not claim a
+ * publication that this bot did not make).
+ */
+export function markReleaseAsKnown(posted, msgKey, keys = []) {
+  if (isReleaseAlreadyPosted(posted, keys)) {
+    markReleaseAsPosted(posted, msgKey, keys);
+  } else {
+    markReleaseAsDispatched(posted, msgKey, keys);
+  }
+}
+
+/**
+ * The Erai batch dispatch outcome (P1-5).
+ *
+ * A dispatched batch is DEFERRED: the publication happens in the
+ * sub-extractor repository and is NOT confirmed here, so it is never counted
+ * as published (and never as skipped either — it was handed over). It is
+ * recorded in the dispatch ledger, not as a published release.
+ */
+export function recordDispatchedBatch(posted, msgKey, releaseKeys = [], { title = '', counters = null } = {}) {
+  if (counters && typeof counters.countDeferred === 'function') counters.countDeferred(msgKey);
+  markReleaseAsDispatched(posted, msgKey, releaseKeys);
+  console.warn(`   ⏸️ DEFERRED (dispatched to sub-extractor, publication NOT confirmed): "${title}"`);
+}
+
+// ---------------------------------------------------------------------------
+// P1-1c: the per-source "no links" counter (observability ONLY — it never
+// changes the red/green policy; the owner has not approved that).
+// ---------------------------------------------------------------------------
+
+/** The host of a URL ('unknown' when it cannot be parsed). */
+export function sourceHostOf(url) {
+  try {
+    return new URL(String(url)).hostname.toLowerCase() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * The per-source no-links counter as ONE operator-facing line.
+ * Returns null when nothing was counted (an empty line is noise).
+ */
+export function formatNoLinksBySource(counts) {
+  const map = counts instanceof Map ? counts : new Map(Object.entries(counts || {}));
+  const entries = [...map.entries()]
+    .filter(([, n]) => Number(n) > 0)
+    .sort((a, b) => (Number(b[1]) - Number(a[1])) || String(a[0]).localeCompare(String(b[0])));
+  if (!entries.length) return null;
+  return `ℹ️ sources with no links this cycle: ${entries.map(([host, n]) => `${host}=${n}`).join(', ')}`;
 }
 
 export function formatCleanTitle(raw) {
@@ -2285,6 +2494,15 @@ export async function checkTelegramChannels(existingClient = null) {
     countAttempted, countPublished, countFailed, countDeferred, countSkipped, classified,
   } = createCycleCounters(summary);
 
+  // P1-1c: the per-source "no links" counter. OBSERVABILITY ONLY — it never
+  // changes the red/green policy (the owner has not approved that); it is
+  // printed once per cycle so the broken sources are visible.
+  const noLinksBySource = new Map();
+  const countNoLinks = (url) => {
+    const host = sourceHostOf(url);
+    noLinksBySource.set(host, (noLinksBySource.get(host) || 0) + 1);
+  };
+
   const sessionStr = CONFIG.TELEGRAM.SESSION;
   if (!sessionStr) {
     throw createFatalError('AUTH_SESSION_CONFIG', 'No Telegram SESSION found in config.', summary);
@@ -2442,8 +2660,9 @@ export async function checkTelegramChannels(existingClient = null) {
         for (const msg of msgs) {
           const msgKey = `tg_${chat.id}_${msg.id}`;
           const text = msg.message || '';
-          if (posted.has(msgKey)) {
-            // Already published in an earlier cycle — a non-fatal skip.
+          if (isMessageAlreadyHandled(posted, msgKey)) {
+            // Already published OR already dispatched in an earlier cycle — a
+            // non-fatal skip (the dispatch ledger is consulted as well).
             countSkipped(msgKey);
             continue;
           }
@@ -2470,10 +2689,13 @@ export async function checkTelegramChannels(existingClient = null) {
             const eraiResolved = await resolveCanonicalTitle(formattedTitle);
             const releaseKeys = getReleaseKeys(formattedTitle, true, eraiResolved);
 
-            if (isReleaseAlreadyPosted(posted, releaseKeys)) {
-              console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted as official release. Skipping.`);
+            if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+              // P1-5: the log must not claim a publication that never
+              // happened here — a dispatched release is named as such.
+              const wasDispatched = isReleaseDispatched(posted, releaseKeys);
+              console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already ${wasDispatched ? 'dispatched to the sub-extractor' : 'posted as official release'}. Skipping.`);
               countSkipped(msgKey); // dedup hit
-              markReleaseAsPosted(posted, msgKey, releaseKeys);
+              markReleaseAsKnown(posted, msgKey, releaseKeys);
               continue;
             }
 
@@ -2486,8 +2708,13 @@ export async function checkTelegramChannels(existingClient = null) {
                 console.log(`   🚀 Dispatching batch extraction to sub-extractor workflow...`);
                 const dispatched = await dispatchBatchExtractor(eraiData.torrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
                 if (dispatched) {
-                  countSkipped(msgKey); // handed over to the extractor workflow
-                  markReleaseAsPosted(posted, msgKey, releaseKeys);
+                  // DEFERRED — the batch was handed to the sub-extractor
+                  // repository, but the publication there is NOT confirmed
+                  // here. It is recorded in the DISPATCH LEDGER (never as a
+                  // published release) so the state does not claim a
+                  // publication this bot never made — and it is not
+                  // dispatched a second time.
+                  recordDispatchedBatch(posted, msgKey, releaseKeys, { title: formattedTitle, counters: { countDeferred } });
                 } else {
                   // DEFERRED — never counted as failed, and deliberately NOT
                   // marked as posted so the release is retried next cycle.
@@ -2613,10 +2840,10 @@ export async function checkTelegramChannels(existingClient = null) {
                   ? getReleaseKeys(cleanTitle, true, cleanTitleResolved)
                   : getFansubReleaseKeys(cleanTitle, cleanTitleResolved);
 
-                if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
                   countSkipped(msgKey); // dedup hit
-                  markReleaseAsPosted(posted, msgKey, releaseKeys);
-                  if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
+                  markReleaseAsKnown(posted, msgKey, releaseKeys);
+                  if (linkedMsgId) markReleaseAsKnown(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
                   continue;
                 }
 
@@ -2764,9 +2991,9 @@ export async function checkTelegramChannels(existingClient = null) {
               ? getReleaseKeys(rawTitle, true, rawTitleResolved)
               : getFansubReleaseKeys(rawTitle, rawTitleResolved);
 
-            if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+            if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
               countSkipped(msgKey); // dedup hit
-              markReleaseAsPosted(posted, msgKey, releaseKeys);
+              markReleaseAsKnown(posted, msgKey, releaseKeys);
               continue;
             }
 
@@ -2999,9 +3226,9 @@ export async function checkTelegramChannels(existingClient = null) {
                 const titleLineResolved = await resolveCanonicalTitle(titleLine);
                 const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
 
-                if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
                   countSkipped(msgKey); // dedup hit
-                  markReleaseAsPosted(posted, msgKey, releaseKeys);
+                  markReleaseAsKnown(posted, msgKey, releaseKeys);
                   continue;
                 }
 
@@ -3062,9 +3289,9 @@ export async function checkTelegramChannels(existingClient = null) {
             if (titleLine) {
               const titleLineResolved = await resolveCanonicalTitle(titleLine);
               const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
-              if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+              if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
                 countSkipped(msgKey); // dedup hit
-                markReleaseAsPosted(posted, msgKey, releaseKeys);
+                markReleaseAsKnown(posted, msgKey, releaseKeys);
                 continue;
               }
 
@@ -3072,9 +3299,21 @@ export async function checkTelegramChannels(existingClient = null) {
               const postPageUrl = urlMatches.find(u => !u.includes('t.me') && !u.includes('twitter'));
               if (postPageUrl) {
                 const pageData = await scrapePostPage(postPageUrl, null, extractEpisodeNumber(titleLine) || null, titleLine);
-                if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
-                else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
-                if (pageData) {
+                // P1-1b: a negative-cached candidate was already fetched and
+                // found to have NO link — the request was not made again. It
+                // is logged distinctly and left unclassified on purpose: the
+                // message can still be published from another candidate, and
+                // the per-message safety net counts it as skipped.
+                const negativeCached = Boolean(pageData?.negativeCached);
+                if (negativeCached) {
+                  countNoLinks(postPageUrl);
+                  console.log(`   ⏭️ Negative cache: no links for ${postPageUrl} — skipped this cycle (no fetch).`);
+                } else if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
+                else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) {
+                  countNoLinks(postPageUrl);
+                  console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
+                }
+                if (pageData && !negativeCached) {
                   let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
                   if (pageData.videoLinks?.top4top) {
                     const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
@@ -3167,9 +3406,9 @@ export async function checkTelegramChannels(existingClient = null) {
           const titleLineResolved = await resolveCanonicalTitle(titleLine);
           let releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
 
-          if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+          if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
             countSkipped(msgKey); // dedup hit
-            markReleaseAsPosted(posted, msgKey, releaseKeys);
+            markReleaseAsKnown(posted, msgKey, releaseKeys);
             continue;
           }
 
@@ -3262,10 +3501,22 @@ export async function checkTelegramChannels(existingClient = null) {
             const targetEp = extractEpisodeNumber(titleLine);
             const pageData = await scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine);
 
-            if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
-            else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
+            // P1-1b: a negative-cached candidate was already fetched and found
+            // to have NO link — the request was not made again. It is logged
+            // distinctly and left unclassified on purpose: this message can
+            // still be published from another candidate URL, and the
+            // per-message safety net counts it as skipped.
+            const negativeCached = Boolean(pageData?.negativeCached);
+            if (negativeCached) {
+              countNoLinks(postPageUrl);
+              console.log(`   ⏭️ Negative cache: no links for ${postPageUrl} — skipped this cycle (no fetch).`);
+            } else if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
+            else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) {
+              countNoLinks(postPageUrl);
+              console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
+            }
 
-            if (pageData) {
+            if (pageData && !negativeCached) {
               const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
               fs.mkdirSync(fansubWorkDir, { recursive: true });
 
@@ -3531,6 +3782,9 @@ export async function checkTelegramChannels(existingClient = null) {
   }
 
   finalizePostedState(posted, summary);
+  // P1-1c: one line per cycle with the sources that had no links.
+  const noLinksLine = formatNoLinksBySource(noLinksBySource);
+  if (noLinksLine) console.log(noLinksLine);
   console.log(`\n🏁 Telegram check finished. Processed ${summary.published} new release(s).\n`);
   return summary;
 }

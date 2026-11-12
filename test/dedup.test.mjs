@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // Isolation: temp cwd BEFORE importing src modules so data/posted.json and
 // data/title-map.json in the repo are never touched by tests.
@@ -21,7 +23,14 @@ const {
   __setTitleMapFile,
   __resetTitleIdentityState,
 } = ti;
-const { getReleaseKeys, getFansubReleaseKeys, isReleaseAlreadyPosted } = await import('../src/telegram-client.mjs');
+const {
+  getReleaseKeys,
+  getFansubReleaseKeys,
+  isReleaseAlreadyPosted,
+  isReleasePostedByAnyKey,
+  isEpisodeScopedKey,
+  extractEpisodeNumber,
+} = await import('../src/telegram-client.mjs');
 
 const MAP_FILE = path.join(tempDir, 'data', 'title-map.json');
 
@@ -298,4 +307,229 @@ test('batch: duplicates resolve with one fetch per unique title; getCachedCanoni
   assert.equal(state.calls, 2);
   assert.deepEqual(getCachedCanonical(PAIRS[0].b), { romaji: 'Overgeared', english: 'Overgeared' });
   assert.deepEqual(getCachedCanonical(PAIRS[0].a), { romaji: 'Overgeared', english: 'Overgeared' });
+});
+
+// ===========================================================================
+// P1-2 — the series-level key that swallows an episode
+//
+// Layer 1 (ROOT, src/title-identity.mjs): buildSyntheticTitle must keep the
+//   original title's episode — the substitution replaces the anime-name part
+//   ONLY. Before the fix, a bare episode token (" <num>", no dash) was
+//   consumed by the name-matching, so the synthetic ("canonical re-run") key
+//   family degraded to a SERIES-LEVEL key.
+// Layer 2 (GUARD, src/telegram-client.mjs): a series-level key must never
+//   decide the dedup of an episode-scoped candidate.
+// ===========================================================================
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * The REAL production state (read-only): the blob of the base commit. The
+ * state file itself is never written by the tests.
+ */
+function loadProductionState() {
+  const raw = execFileSync('git', ['show', 'HEAD:data/posted.json'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024, // posted.json is ~2 MB — the default 1 MB throws ENOBUFS
+  });
+  return new Set(JSON.parse(raw));
+}
+
+// The series-level keys of that anime (stored when episodes 01/02 were
+// published — they stay in the state, no migration).
+const KANOJO_SERIES_KEYS = [
+  'fansub_bam25_kanojo_no_tomodachi',
+  'kanojo_no_tomodachi',
+  'official_kanojo_no_tomodachi',
+];
+
+// ---------------------------------------------------------------------------
+// P1-2 / Layer 1 — buildSyntheticTitle keeps the episode (every shape)
+// ---------------------------------------------------------------------------
+test('P1-2 L1: buildSyntheticTitle keeps the episode of every announcement shape', () => {
+  const NAME = 'Kanojo no Tomodachi';
+  // [original title, expected episode, note]
+  const CASES = [
+    ['[BAM] Kanojo no Tomodachi - 04 [END]', '4', 'dash form'],
+    ['[BAM] Kanojo no Tomodachi 04 [END]', '4', 'bare form — the defect shape'],
+    ['[BAM] Kanojo no Tomodachi 04 [1080p][END]', '4', 'bare form + quality tags'],
+    ['[BAM] Kanojo no Tomodachi [04] [END]', '', 'bracketed form (no detectable episode; the bracket survives)'],
+    ['[BAM] Kanojo no Tomodachi', '', 'no episode at all'],
+    ['[BAM] Kanojo no Tomodachi [END]', '', 'no episode at all (tags only)'],
+  ];
+  for (const [title, ep, note] of CASES) {
+    assert.equal(extractEpisodeNumber(title), ep, `fixture: the original episode of "${title}" (${note})`);
+    const synthetic = buildSyntheticTitle(title, NAME);
+    assert.ok(synthetic, `no synthetic title for "${title}" (${note})`);
+    assert.equal(
+      extractEpisodeNumber(synthetic),
+      ep,
+      `the synthetic title must carry the SAME episode as the original (${note}): "${synthetic}"`
+    );
+  }
+
+  // The substitution replaces the anime-name part ONLY — the episode token
+  // and the trailing tags are kept verbatim.
+  assert.equal(
+    buildSyntheticTitle('[BAM] Hito no Sanga 04 [END]', NAME),
+    '[BAM] Kanojo no Tomodachi 04 [END]'
+  );
+  assert.equal(
+    buildSyntheticTitle('[BAM] Hito no Sanga - 04 [END]', NAME),
+    '[BAM] Kanojo no Tomodachi - 04 [END]'
+  );
+  assert.equal(
+    buildSyntheticTitle('[BAM] Hito no Sanga [04] [END]', NAME),
+    '[BAM] Kanojo no Tomodachi [04] [END]'
+  );
+  // No episode in the original -> the synthetic gains none.
+  assert.equal(buildSyntheticTitle('[BAM] Hito no Sanga', NAME), '[BAM] Kanojo no Tomodachi');
+  assert.equal(buildSyntheticTitle('[BAM] Hito no Sanga [END]', NAME), '[BAM] Kanojo no Tomodachi [END]');
+
+  // A batch range is REJECTED outright (the documented "reject over-guessing"
+  // bias): no synthetic title is produced at all, so the range can never be
+  // mangled and no synthetic key family is emitted for a batch.
+  assert.equal(buildSyntheticTitle('[BAM] Kanojo no Tomodachi 01~04 [END]', NAME), null);
+  assert.equal(buildSyntheticTitle('[BAM] Kanojo no Tomodachi 01-04 [END]', NAME), null);
+  // ... and the batch keys still carry the range intact.
+  const batchKeys = getFansubReleaseKeys('[BAM] Kanojo no Tomodachi 01~04 [END]', null);
+  assert.ok(batchKeys.includes('fansub_bam25_kanojo_no_tomodachi_batch_1_4'), `batch range lost; keys=${JSON.stringify(batchKeys)}`);
+  assert.ok(batchKeys.includes('fansub_bam25_kanojo_no_tomodachi_batch_01_04'), `batch range lost; keys=${JSON.stringify(batchKeys)}`);
+});
+
+// ---------------------------------------------------------------------------
+// P1-2 / Layer 2 — the guard
+// ---------------------------------------------------------------------------
+test('P1-2 L2: a series-level stored key does not suppress an episode-scoped candidate', () => {
+  const candidateKeys = getFansubReleaseKeys('[BAM] Kanojo no Tomodachi 04 [END]', null);
+  assert.ok(
+    candidateKeys.some(k => isEpisodeScopedKey(k)),
+    'the fixture must be episode-scoped'
+  );
+
+  // The series-level key the production state carries for episodes 01/02.
+  assert.equal(
+    isReleaseAlreadyPosted(new Set(['fansub_bam25_kanojo_no_tomodachi']), candidateKeys),
+    false,
+    'a series-level key must NOT decide an episode-scoped candidate'
+  );
+
+  // The episode-scoped key of the SAME episode still decides it (no duplicate
+  // publishing).
+  assert.equal(
+    isReleaseAlreadyPosted(new Set(['fansub_bam25_kanojo_no_tomodachi_04']), candidateKeys),
+    true,
+    'the episode-scoped key must still suppress the same episode'
+  );
+
+  // The pre-P1-2 decision stays available for callers that rely on it.
+  assert.equal(
+    isReleasePostedByAnyKey(new Set(['a']), ['a', 'b']),
+    true,
+    'the unguarded decision must still be "any key matches"'
+  );
+  assert.equal(
+    isReleasePostedByAnyKey(new Set(['a']), ['b']),
+    false,
+    'the unguarded decision must still be "any key matches"'
+  );
+});
+
+test('P1-2 L2: an episode-LESS candidate is still suppressed by a series-level key (unchanged)', () => {
+  const candidateKeys = getFansubReleaseKeys('[BAM] Kanojo no Tomodachi [END]', null);
+  assert.ok(
+    candidateKeys.every(k => !isEpisodeScopedKey(k)),
+    `the fixture must be episode-less; keys=${JSON.stringify(candidateKeys)}`
+  );
+  assert.equal(
+    isReleaseAlreadyPosted(new Set(['fansub_bam25_kanojo_no_tomodachi']), candidateKeys),
+    true,
+    'an episode-less candidate must still be suppressed by a series-level key'
+  );
+});
+
+test('P1-2 L2: the same episode re-announced is still suppressed (no duplicate publishing)', () => {
+  const TITLE = '[BAM] Kanojo no Tomodachi 04 [END]';
+  // What markReleaseAsPosted stored when the episode was published.
+  const publishedFansub = new Set(getFansubReleaseKeys(TITLE, null));
+  assert.equal(
+    isReleaseAlreadyPosted(publishedFansub, getFansubReleaseKeys(TITLE, null)),
+    true,
+    'the re-announced fansub episode must be suppressed'
+  );
+  const publishedOfficial = new Set(getReleaseKeys(TITLE, true, null));
+  assert.equal(
+    isReleaseAlreadyPosted(publishedOfficial, getReleaseKeys(TITLE, true, null)),
+    true,
+    'the re-announced official episode must be suppressed'
+  );
+  // The team scoping is untouched: another team's key never suppresses it.
+  assert.equal(
+    isReleaseAlreadyPosted(new Set(['fansub_celestial_kanojo_no_tomodachi_04']), getFansubReleaseKeys(TITLE, null)),
+    false,
+    'another team must not suppress this release'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// P1-2 — THE REGRESSION, against the REAL production state
+// ---------------------------------------------------------------------------
+test('P1-2: the production state no longer swallows episode 04 of the anime', () => {
+  const posted = loadProductionState();
+  assert.ok(posted.size > 40000, `the real production state must be loaded (got ${posted.size} keys)`);
+  for (const k of KANOJO_SERIES_KEYS) {
+    assert.ok(posted.has(k), `the production state must still contain the series-level key ${k}`);
+  }
+
+  const TITLE = '[BAM] Kanojo no Tomodachi 04 [END]';
+  const RESOLVED = { romaji: 'Kanojo no Tomodachi', english: 'Kanojo no Tomodachi' };
+  const candidates = [
+    getFansubReleaseKeys(TITLE, RESOLVED),
+    getReleaseKeys(TITLE, true, RESOLVED),
+  ];
+
+  for (const keys of candidates) {
+    // The candidate must not carry a series-level key of the production state
+    // (Layer 1 fixed the root cause: the synthetic title keeps the episode).
+    const seriesHits = keys.filter(k => !isEpisodeScopedKey(k) && posted.has(k));
+    assert.deepEqual(
+      seriesHits,
+      [],
+      `a series-level key of the production state must not decide the candidate; hits=${JSON.stringify(seriesHits)}`
+    );
+    // ... and even ALL the series-level keys of the production state together
+    // must not suppress it (Layer 2, the guard).
+    const seriesOnly = new Set([...posted].filter(k => !isEpisodeScopedKey(k)));
+    assert.equal(
+      isReleaseAlreadyPosted(seriesOnly, keys),
+      false,
+      'the series-level keys of the production state must not suppress the candidate'
+    );
+  }
+
+  // THE BUG (documented): the pre-fix synthetic title dropped the episode
+  // ("… 04" -> "…"), so its key family carried the SERIES-LEVEL key and the
+  // episode-scoped candidate was classified "already posted" — never published.
+  const PRE_FIX_SYNTHETIC = '[BAM] Kanojo no Tomodachi [END]';
+  const preFixFansub = getFansubReleaseKeys(PRE_FIX_SYNTHETIC, null);
+  assert.ok(
+    preFixFansub.includes('fansub_bam25_kanojo_no_tomodachi'),
+    `the pre-fix key set must carry the series-level key; keys=${JSON.stringify(preFixFansub)}`
+  );
+  assert.equal(
+    isReleaseAlreadyPosted(posted, preFixFansub),
+    true,
+    'the pre-fix key set IS suppressed by the production state (the bug)'
+  );
+  const preFixOfficial = getReleaseKeys(PRE_FIX_SYNTHETIC, true, null);
+  assert.ok(
+    preFixOfficial.includes('official_kanojo_no_tomodachi'),
+    `the pre-fix official key set must carry the series-level key; keys=${JSON.stringify(preFixOfficial)}`
+  );
+  assert.equal(
+    isReleaseAlreadyPosted(posted, preFixOfficial),
+    true,
+    'the pre-fix official key set IS suppressed by the production state (the bug)'
+  );
 });
