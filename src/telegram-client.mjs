@@ -36,6 +36,34 @@ const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
 const HTTP_TIMEOUT_MS = 60_000;
 
+// ====================================================================
+// P0-3 typed fatal errors (F-03)
+// A fatal aborts the monitoring window. It must survive the runner's own
+// catch (runLoop demotes everything else to a cycle error) and turn into a
+// non-zero exit AFTER the teardown. `process.exit` is never called from
+// library code — the test suite must not kill the runner process.
+// The codes are fixed: no interpolated remote data ever reaches the log.
+// ====================================================================
+export const FATAL_CODES = {
+  CHANNELS_ZERO: 'CHANNELS_ZERO',
+  STATE_LOAD_FAILED: 'STATE_LOAD_FAILED',
+  AUTH_SESSION_CONFIG: 'AUTH_SESSION_CONFIG',
+  LISTENER_ERROR: 'LISTENER_ERROR',
+};
+
+export function createFatalError(code, message, summary = null) {
+  const err = new Error(message);
+  err.isFatal = true;
+  err.fatalCode = FATAL_CODES[code] || code;
+  if (summary) {
+    summary.immediateFatal = { code: err.fatalCode, message };
+    err.summary = summary;
+  }
+  // The fatal code is logged ONCE, at the runner boundary (M-05): the
+  // creator must not print it.
+  return err;
+}
+
 function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
   return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
 }
@@ -203,15 +231,76 @@ export function loadPostedIds() {
   }
 }
 
+// Size guard (P0-4a): `posted` is only ever ADDED to, never removed from —
+// the ADD-ONLY INVARIANT (P-9): the posted set may only ever grow, because a
+// release that is on the list is by definition already published. An unchanged
+// size therefore implies unchanged content — the ~2 MB file does not have to be
+// rewritten on every markReleaseAsPosted() call.
+// P-1 trade-off (durability over write amplification): every mark that adds ≥1
+// key still rewrites the whole ~2 MB file; coalescing to the end of the cycle
+// would break the on-disk durability contract. Pruning + minification is the
+// P2 mitigation.
+let lastSavedPostedSize = -1;
+
+/**
+ * The size guard's counter (M-04). Exposed so a test can observe it.
+ * (-1 = nothing was written yet.)
+ */
+export function getPostedSizeGuard() {
+  return lastSavedPostedSize;
+}
+
+/**
+ * Reset the size guard (M-04): the next mark writes again, even when the
+ * set did not change.
+ */
+export function resetPostedSizeGuard() {
+  lastSavedPostedSize = -1;
+}
+
+/**
+ * Persist the posted set.
+ * → true when the state is on disk (or was already there and unchanged),
+ *   false when the write FAILED (M-03: the caller has to see it).
+ */
 export function savePostedIds(set) {
   try {
+    const size = set instanceof Set ? set.size : (Array.isArray(set) ? set.length : -1);
+    if (size >= 0 && size === lastSavedPostedSize && fs.existsSync(POSTED_FILE)) {
+      return true; // unchanged since the last successful write
+    }
     fs.mkdirSync(path.dirname(POSTED_FILE), { recursive: true });
     const tmp = POSTED_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify([...set], null, 2));
     fs.renameSync(tmp, POSTED_FILE);
+    lastSavedPostedSize = size;
+    return true;
   } catch (e) {
     console.error('Failed to save posted IDs:', e.message);
+    return false; // the state was NOT persisted
   }
+}
+
+/**
+ * The end-of-cycle state write (M-03).
+ *
+ * A failed write is a REAL failure — not a deferral: the published keys are
+ * not on disk and the next cycle would publish them again. It is counted as
+ * a failure (so the owner's policy classifies it: red when nothing was
+ * published, warning when there were successes) and it gets its own log
+ * line.
+ *
+ * → true when the state was persisted.
+ */
+export function finalizePostedState(posted, summary) {
+  const saved = savePostedIds(posted);
+  if (!saved) {
+    if (summary && typeof summary === 'object') {
+      summary.failed = (Number(summary.failed) || 0) + 1;
+    }
+    console.error(`🔴 state write failed — this cycle's published keys may be re-published`);
+  }
+  return saved;
 }
 
 // Create a reusable Telegram client (caller is responsible for connect/disconnect)
@@ -1791,14 +1880,20 @@ function parseEraiMessage(msg) {
   return { title, source, sourceName, hasArabic, torrentUrl, nyaaUrl };
 }
 
-function hasRequiredTools() {
-  try {
-    execSync('aria2c --version', { stdio: 'ignore' });
-    execSync('mkvextract --version', { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
+// The two binaries the extractor needs. Fixed labels only — never any
+// interpolated remote data.
+const REQUIRED_MEDIA_TOOLS = ['aria2c', 'mkvextract'];
+
+function missingMediaTools() {
+  const missing = [];
+  for (const tool of REQUIRED_MEDIA_TOOLS) {
+    try {
+      execSync(`${tool} --version`, { stdio: 'ignore' });
+    } catch {
+      missing.push(tool);
+    }
   }
+  return missing;
 }
 
 // Extraction rule:
@@ -2120,19 +2215,97 @@ export async function dispatchBatchExtractor(torrentUrl, releaseTitle, chatId, l
 // ====================================================================
 // Main check function
 // ====================================================================
+
+/**
+ * The per-cycle counters (F-01).
+ *
+ * The four TERMINAL counters (published / failed / deferred / skipped) are
+ * EXCLUSIVE per message: the FIRST classification of a msgKey wins and every
+ * later classification of the same key is ignored (and is not counted again).
+ * The per-counter sets alone could not guarantee that: a CASE A failure fell
+ * through into CASE B and the same message was counted as failed AND
+ * published, and a deferred release could later be counted as a failure.
+ *
+ * The invariant: for each msgKey at most ONE of published/failed/deferred/
+ * skipped is incremented, and `attempted` counts it exactly once.
+ */
+export function createCycleCounters(summary) {
+  const attemptedKeys = new Set();
+  const publishedKeys = new Set();
+  const failedKeys = new Set();
+  const deferredKeys = new Set();
+  const skippedKeys = new Set();
+  // The shared, exclusive classification set (F-01).
+  const classifiedKeys = new Set();
+
+  const countAttempted = (key) => { if (!attemptedKeys.has(key)) { attemptedKeys.add(key); summary.attempted++; } };
+  // Claim the terminal classification of a message: the FIRST claim wins.
+  const claimClassification = (key) => {
+    if (classifiedKeys.has(key)) return false;
+    classifiedKeys.add(key);
+    return true;
+  };
+  const countPublished = (key) => { if (claimClassification(key)) { publishedKeys.add(key); summary.published++; } };
+  const countFailed = (key) => { if (claimClassification(key)) { failedKeys.add(key); summary.failed++; } };
+  const countDeferred = (key) => { if (claimClassification(key)) { deferredKeys.add(key); summary.deferred++; } };
+  const countSkipped = (key) => { if (claimClassification(key)) { skippedKeys.add(key); summary.skipped++; } };
+  // Has this message already been classified into a terminal counter?
+  const classified = (key) => classifiedKeys.has(key)
+    || publishedKeys.has(key) || failedKeys.has(key)
+    || deferredKeys.has(key) || skippedKeys.has(key);
+
+  return { countAttempted, countPublished, countFailed, countDeferred, countSkipped, classified };
+}
+
 export async function checkTelegramChannels(existingClient = null) {
+  // ------------------------------------------------------------------
+  // P0-3 success contract (F-03 / F-08 / F-10 / F-12).
+  // The summary is returned on the non-fatal path. A fatal condition
+  // throws a typed error (err.isFatal === true) that the runner rethrows,
+  // so the window aborts with a non-zero exit after the teardown.
+  // F-11: `immediateFatal` is ALWAYS null on the RETURNED path — a fatal is
+  // thrown, never returned. Its counters travel with the error (err.summary)
+  // and the runner logs them from there.
+  // ------------------------------------------------------------------
+  const summary = {
+    attempted: 0,
+    published: 0,
+    failed: 0,
+    deferred: 0,
+    skipped: 0,
+    sourceErrors: 0,
+    syncFailed: false,
+    immediateFatal: null,
+  };
+
+  // The counters are EXCLUSIVE per message (F-01): the first terminal
+  // classification of a msgKey wins and every later classification of the
+  // same key is ignored. See createCycleCounters().
+  const {
+    countAttempted, countPublished, countFailed, countDeferred, countSkipped, classified,
+  } = createCycleCounters(summary);
+
   const sessionStr = CONFIG.TELEGRAM.SESSION;
   if (!sessionStr) {
-    console.warn('No Telegram SESSION found in config.');
-    return;
+    throw createFatalError('AUTH_SESSION_CONFIG', 'No Telegram SESSION found in config.', summary);
   }
 
-  const posted = loadPostedIds();
-  resetCycleBudget(); // fresh AniList query budget for this check cycle
-  let newFound = 0;
-  const toolsAvailable = hasRequiredTools();
+  let posted;
+  try {
+    posted = loadPostedIds();
+  } catch (stateErr) {
+    throw createFatalError('STATE_LOAD_FAILED', `posted.json could not be loaded: ${stateErr.message}`, summary);
+  }
 
-  if (!toolsAvailable) console.log(`   ⚠️ aria2c/mkvextract not found in this environment – Torrent/Cloud extraction will run in GitHub Actions.`);
+  resetCycleBudget(); // fresh AniList query budget for this check cycle
+  const missingTools = missingMediaTools();
+  const toolsAvailable = missingTools.length === 0;
+
+  if (!toolsAvailable) {
+    for (const tool of missingTools) {
+      console.warn(`⚠️ required media tool missing: ${tool}`);
+    }
+  }
 
   // Reuse caller-provided client or create a local one (auto-cleaned in finally)
   const ownClient = !existingClient;
@@ -2146,7 +2319,11 @@ export async function checkTelegramChannels(existingClient = null) {
   try {
     if (!client.connected) {
       console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
-      await client.connect();
+      try {
+        await client.connect();
+      } catch (connectErr) {
+        throw createFatalError('AUTH_SESSION_CONFIG', `Telegram connect failed: ${connectErr.message}`, summary);
+      }
     } else {
       console.log(`\n📡 [Telegram MTProto Client] Reusing persistent connection...`);
     }
@@ -2191,10 +2368,21 @@ export async function checkTelegramChannels(existingClient = null) {
       }
       console.log(`   📋 Synced ${targetMsgs.length} message(s) from target channel history to prevent duplicates.`);
     } catch (targetErr) {
+      // The duplicate-safety net is OFF for this cycle — it must be visible.
+      // IMPLEMENTED POLICY (F-05): `syncFailed` is REPORTED (it is part of
+      // the cycle summary and it is printed by the runner) and it appears in
+      // the window red REASON when the window is red for another reason — it
+      // does NOT by itself make a cycle red.
+      summary.syncFailed = true;
       console.warn(`   ⚠️ Could not sync target channel history:`, targetErr.message);
     }
 
-    const dialogs = await client.getDialogs({ limit: 150 });
+    let dialogs;
+    try {
+      dialogs = await client.getDialogs({ limit: 150 });
+    } catch (dialogErr) {
+      throw createFatalError('LISTENER_ERROR', `getDialogs failed: ${dialogErr.message}`, summary);
+    }
 
     const targetSourceChats = dialogs.filter(d => {
       const idStr = String(d.id);
@@ -2227,6 +2415,12 @@ export async function checkTelegramChannels(existingClient = null) {
     console.log(`   Found ${targetSourceChats.length} targeted source channel(s) (ordered by priority):`);
     targetSourceChats.forEach(c => console.log(`   - ${c.title} (ID: ${c.id})`));
 
+    // Zero source channels means the bot would silently do nothing for the
+    // whole window while the run stays green — an immediate fatal (F-03).
+    if (targetSourceChats.length === 0) {
+      throw createFatalError('CHANNELS_ZERO', 'No target source channel found — refusing to run a silent window.', summary);
+    }
+
     fs.mkdirSync(OUT_DIR, { recursive: true });
 
     for (const chat of targetSourceChats) {
@@ -2249,17 +2443,25 @@ export async function checkTelegramChannels(existingClient = null) {
           const msgKey = `tg_${chat.id}_${msg.id}`;
           const text = msg.message || '';
           if (posted.has(msgKey)) {
+            // Already published in an earlier cycle — a non-fatal skip.
+            countSkipped(msgKey);
             continue;
           }
+          // The message passed the posted-gate and is taken for processing.
+          countAttempted(msgKey);
 
           // ==============================================================
           // SOURCE 1: Erai-Raws (Official Subtitles via Torrent - Strictly .ass)
           // ==============================================================
           if (isErai) {
             const eraiData = parseEraiMessage(msg);
-            if (!eraiData) continue;
+            if (!eraiData) {
+              countSkipped(msgKey); // unparsable message
+              continue;
+            }
 
             if (!eraiData.hasArabic) {
+              countSkipped(msgKey); // non-Arabic release
               markReleaseAsPosted(posted, msgKey);
               continue;
             }
@@ -2270,6 +2472,7 @@ export async function checkTelegramChannels(existingClient = null) {
 
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
               console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already posted as official release. Skipping.`);
+              countSkipped(msgKey); // dedup hit
               markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
             }
@@ -2283,22 +2486,31 @@ export async function checkTelegramChannels(existingClient = null) {
                 console.log(`   🚀 Dispatching batch extraction to sub-extractor workflow...`);
                 const dispatched = await dispatchBatchExtractor(eraiData.torrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
                 if (dispatched) {
+                  countSkipped(msgKey); // handed over to the extractor workflow
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
                 } else {
-                  console.warn(`   ⚠️ Dispatch failed — will retry next cycle.`);
+                  // DEFERRED — never counted as failed, and deliberately NOT
+                  // marked as posted so the release is retried next cycle.
+                  countDeferred(msgKey);
+                  console.warn(`   ⏸️ DEFERRED (batch dispatch failed): "${formattedTitle}" – NOT marked as posted`);
                 }
               } else {
+                countSkipped(msgKey); // batch extraction skipped
                 console.log(`   ⏭️ Skipping batch extraction (GH_PAT not set or no torrent URL).`);
               }
               continue;
             }
 
             if (!toolsAvailable) {
-              console.log(`   ⏭️ [Erai-Raws] Skipping "${formattedTitle}" – aria2c/mkvextract not available locally.`);
+              // DEFERRED — the work is postponed, not failed, and the release
+              // is NOT marked as posted so it is retried once the tools exist.
+              countDeferred(msgKey);
+              console.log(`   ⏸️ DEFERRED (tools missing): "${formattedTitle}" – NOT marked as posted`);
               continue;
             }
 
             if (!eraiData.torrentUrl) {
+              countSkipped(msgKey); // no torrent URL
               console.warn(`   ⚠️ [Erai-Raws] No torrent URL found for "${formattedTitle}". Skipping.`);
               continue;
             }
@@ -2326,20 +2538,25 @@ export async function checkTelegramChannels(existingClient = null) {
 
                 if (sendResult?.ok) {
                   console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
-                  newFound++;
+                  countPublished(msgKey);
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
                 } else {
+                  countFailed(msgKey);
                   console.error(`   ❌ Failed to send document:`, sendResult);
                 }
 
                 fs.rmSync(finalPath, { force: true });
               }
             } catch (e) {
+              countFailed(msgKey);
               console.error(`   ❌ Erai-Raws processing error:`, e.message);
             } finally {
               try { fs.rmSync(eraiWorkDir, { recursive: true, force: true }); } catch { }
             }
 
+            // Safety net: every message must end up in exactly one terminal
+            // counter, otherwise the stall rule could not see it.
+            if (!classified(msgKey)) countSkipped(msgKey);
             continue;
           }
 
@@ -2397,6 +2614,7 @@ export async function checkTelegramChannels(existingClient = null) {
                   : getFansubReleaseKeys(cleanTitle, cleanTitleResolved);
 
                 if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                  countSkipped(msgKey); // dedup hit
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
                   if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
                   continue;
@@ -2405,6 +2623,7 @@ export async function checkTelegramChannels(existingClient = null) {
                 console.log(`\n✨ [Subdl Direct File] "${cleanTitle}" (${originalName})`);
                 const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${safeRemoteBaseName(originalName)}`);
                 if (!isInsideDir(localFilePath, OUT_DIR)) {
+                  countSkipped(msgKey); // unsafe path
                   console.warn(`   ⚠️ Skipping "${cleanTitle}": unsafe document file name "${originalName}".`);
                   continue;
                 }
@@ -2427,6 +2646,7 @@ export async function checkTelegramChannels(existingClient = null) {
 
                         if (subFiles.length === 0) {
                           console.warn(`   ⚠️ Archive contains NO subtitles (.ass/.srt), only fonts/assets. Skipping.`);
+                          countSkipped(msgKey); // no subtitle in the archive
                           fs.rmSync(localFilePath, { force: true });
                           continue;
                         }
@@ -2507,10 +2727,11 @@ export async function checkTelegramChannels(existingClient = null) {
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
-                        newFound++;
+                        countPublished(msgKey);
                         markReleaseAsPosted(posted, msgKey, releaseKeys);
                         if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
                       } else {
+                        countFailed(msgKey);
                         console.error(`   ❌ Failed to send document:`, sendResult);
                       }
 
@@ -2520,7 +2741,13 @@ export async function checkTelegramChannels(existingClient = null) {
                     fs.rmSync(localFilePath, { force: true });
                   }
                 } catch (e) {
+                  countFailed(msgKey);
                   console.warn(`   ⚠️ Subdl direct file error:`, e.message);
+                  // F-01: a CASE A failure must NOT fall through into CASE B
+                  // for the same message — the release is not re-attempted as
+                  // a link release in the same cycle (the message is already
+                  // classified as failed).
+                  continue;
                 }
               }
             }
@@ -2538,6 +2765,7 @@ export async function checkTelegramChannels(existingClient = null) {
               : getFansubReleaseKeys(rawTitle, rawTitleResolved);
 
             if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+              countSkipped(msgKey); // dedup hit
               markReleaseAsPosted(posted, msgKey, releaseKeys);
               continue;
             }
@@ -2546,6 +2774,7 @@ export async function checkTelegramChannels(existingClient = null) {
             const coveringDoc = hasCoveringDocumentMsg(msg, msgs);
             if (coveringDoc) {
               // The attached document covers this release and will be handled directly
+              countSkipped(msgKey);
               continue;
             }
 
@@ -2565,6 +2794,7 @@ export async function checkTelegramChannels(existingClient = null) {
                   const primaryDlUrl = subdlData.batchZipLink || subdlData.individualLinks[0] || subdlData.allLinks[0];
                   if (!primaryDlUrl) {
                     console.warn(`   ⚠️ No download link found on SUBDL page: ${subdlInfoUrl}`);
+                    countSkipped(msgKey); // no download link
                     continue;
                   }
 
@@ -2671,6 +2901,7 @@ export async function checkTelegramChannels(existingClient = null) {
                   // MANDATORY CHECK: Drop if 0 subtitles found (never publish font-only releases)
                   if (subFiles.length === 0) {
                     console.warn(`   ⚠️ Release "${rawTitle}" contains NO subtitles (.ass/.srt), only fonts/assets. Dropping.`);
+                    countSkipped(msgKey); // no subtitle in the release
                     continue;
                   }
 
@@ -2720,15 +2951,17 @@ export async function checkTelegramChannels(existingClient = null) {
 
                   if (sendResult?.ok) {
                     console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
-                    newFound++;
+                    countPublished(msgKey);
                     markReleaseAsPosted(posted, msgKey, releaseKeys);
                   } else {
+                    countFailed(msgKey);
                     console.error(`   ❌ Failed to send document:`, sendResult);
                   }
 
                   try { fs.rmSync(finalFilePath, { force: true }); } catch {}
                   continue;
                 } catch (e) {
+                  countFailed(msgKey);
                   console.error(`   ❌ Error downloading/posting SUBDL release:`, e.message);
                 } finally {
                   try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
@@ -2736,6 +2969,9 @@ export async function checkTelegramChannels(existingClient = null) {
               }
             }
 
+            // Safety net: a CASE A -> CASE B fall-through must still leave the
+            // message in exactly one terminal counter.
+            if (!classified(msgKey)) countSkipped(msgKey);
             continue;
           }
 
@@ -2764,6 +3000,7 @@ export async function checkTelegramChannels(existingClient = null) {
                 const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
 
                 if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                  countSkipped(msgKey); // dedup hit
                   markReleaseAsPosted(posted, msgKey, releaseKeys);
                   continue;
                 }
@@ -2771,6 +3008,7 @@ export async function checkTelegramChannels(existingClient = null) {
                 console.log(`\n✨ [LazySano Direct File] "${titleLine}" (${originalName})`);
                 const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}`));
                 if (!isInsideDir(localFilePath, OUT_DIR)) {
+                  countSkipped(msgKey); // unsafe path
                   console.warn(`   ⚠️ Skipping LazySano direct file: unsafe document file name "${originalName}".`);
                   continue;
                 }
@@ -2790,8 +3028,14 @@ export async function checkTelegramChannels(existingClient = null) {
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted!`);
-                        newFound++;
+                        countPublished(msgKey);
                         markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      } else {
+                        // No failure branch existed here: the release was
+                        // silently lost. It is NOT marked as posted, so it is
+                        // retried on the next cycle.
+                        countFailed(msgKey);
+                        console.error(`   ❌ Failed to send document:`, sendResult);
                       }
                       fs.rmSync(finalPath, { force: true });
                       continue;
@@ -2799,7 +3043,11 @@ export async function checkTelegramChannels(existingClient = null) {
                     fs.rmSync(localFilePath, { force: true });
                   }
                 } catch (e) {
+                  countFailed(msgKey);
                   console.warn(`   ⚠️ LazySano direct file download error:`, e.message);
+                  // F-01: the same rule as the Subdl CASE A — a failed direct
+                  // file is NOT re-attempted as a post link in the same cycle.
+                  continue;
                 }
               }
             }
@@ -2815,6 +3063,7 @@ export async function checkTelegramChannels(existingClient = null) {
               const titleLineResolved = await resolveCanonicalTitle(titleLine);
               const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
               if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+                countSkipped(msgKey); // dedup hit
                 markReleaseAsPosted(posted, msgKey, releaseKeys);
                 continue;
               }
@@ -2852,8 +3101,12 @@ export async function checkTelegramChannels(existingClient = null) {
                           console.log(`   📤 Publishing LazySano post link: "${caption}"`);
                           const sendResult = await publishDocument(client, finalPath, caption);
                           if (sendResult?.ok) {
-                            newFound++;
+                            countPublished(msgKey);
                             markReleaseAsPosted(posted, msgKey, releaseKeys);
+                          } else {
+                            // No failure branch existed here (F-10).
+                            countFailed(msgKey);
+                            console.error(`   ❌ Failed to send document:`, sendResult);
                           }
                           fs.rmSync(finalPath, { force: true });
                           continue;
@@ -2877,8 +3130,12 @@ export async function checkTelegramChannels(existingClient = null) {
                         console.log(`   📤 Publishing LazySano post link: "${caption}"`);
                         const sendResult = await publishDocument(client, finalPath, caption);
                         if (sendResult?.ok) {
-                          newFound++;
+                          countPublished(msgKey);
                           markReleaseAsPosted(posted, msgKey, releaseKeys);
+                        } else {
+                          // No failure branch existed here (F-10).
+                          countFailed(msgKey);
+                          console.error(`   ❌ Failed to send document:`, sendResult);
                         }
                         fs.rmSync(finalPath, { force: true });
                         continue;
@@ -2890,6 +3147,8 @@ export async function checkTelegramChannels(existingClient = null) {
               }
             }
 
+            // Safety net: every message must end up in exactly one terminal counter.
+            if (!classified(msgKey)) countSkipped(msgKey);
             continue;
           }
 
@@ -2899,6 +3158,7 @@ export async function checkTelegramChannels(existingClient = null) {
           const hasAttachment = Boolean(msg.media && msg.media.document);
           const hasLinks = /https?:\/\/[^\s"'<>]+/i.test(text);
           if (!hasAttachment && !hasLinks) {
+            countSkipped(msgKey); // no attachment and no link
             markReleaseAsPosted(posted, msgKey);
             continue;
           }
@@ -2908,6 +3168,7 @@ export async function checkTelegramChannels(existingClient = null) {
           let releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
 
           if (isReleaseAlreadyPosted(posted, releaseKeys)) {
+            countSkipped(msgKey); // dedup hit
             markReleaseAsPosted(posted, msgKey, releaseKeys);
             continue;
           }
@@ -2922,6 +3183,7 @@ export async function checkTelegramChannels(existingClient = null) {
               console.log(`\n✨ [Fansub Attachment] "${titleLine}" (${originalName})`);
               const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}.ass`));
               if (!isInsideDir(localFilePath, OUT_DIR)) {
+                countSkipped(msgKey); // unsafe path
                 console.warn(`   ⚠️ Skipping fansub attachment: unsafe document file name "${originalName}".`);
                 continue;
               }
@@ -2946,15 +3208,33 @@ export async function checkTelegramChannels(existingClient = null) {
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);
-                      newFound++;
+                      countPublished(msgKey);
                       markReleaseAsPosted(posted, msgKey, releaseKeys);
+                    } else {
+                      // No failure branch existed here (F-10).
+                      countFailed(msgKey);
+                      console.error(`   ❌ Failed to send document:`, sendResult);
                     }
                     fs.rmSync(finalPath, { force: true });
                     continue;
                   }
+                  // F-02: the download produced something that is not a usable
+                  // subtitle file. Without this the message was attempted but
+                  // NEVER classified — the cycle could stay green with zero
+                  // publications. It is a failure: nothing publishable came
+                  // out of the download.
+                  countFailed(msgKey);
+                  console.error(`   ❌ Fansub attachment is not a usable subtitle file: "${originalName}"`);
                   fs.rmSync(localFilePath, { force: true });
+                  continue;
                 }
+                // F-02: the download produced NO file at all (missing or
+                // empty) — the message must still end in exactly one
+                // terminal classification.
+                countFailed(msgKey);
+                console.error(`   ❌ Fansub attachment download produced no usable file: "${originalName}"`);
               } catch (e) {
+                countFailed(msgKey);
                 console.warn(`   ⚠️ Fansub attachment download error:`, e.message);
               }
               continue;
@@ -3034,6 +3314,12 @@ export async function checkTelegramChannels(existingClient = null) {
                         if (!isInsideDir(tempDest, fansubWorkDir)) throw new Error(`unsafe mediafire file name: ${mfBest.name}`);
                         await downloadFileToDisk(mfBest.directUrl, tempDest, { Referer: postPageUrl });
                         if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                      } else {
+                        // DEFERRED — the media tools are missing, so the release
+                        // is postponed (never a failure) and is NOT marked as
+                        // posted, so it is retried once the tools exist.
+                        countDeferred(msgKey);
+                        console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
                       }
                     }
                   } catch (e) {
@@ -3088,6 +3374,10 @@ export async function checkTelegramChannels(existingClient = null) {
                           if (!isInsideDir(tempDest, fansubWorkDir)) throw new Error(`unsafe drive file name: ${driveBest.name}`);
                           await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
                           if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                        } else {
+                          // DEFERRED — tools missing; NOT marked as posted.
+                          countDeferred(msgKey);
+                          console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
                         }
                       }
                     }
@@ -3097,62 +3387,79 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 // 5. Buzzheavier (Direct video file via HX-Redirect or token on GitHub Actions)
-                if (!downloadedFilePath && pageData.videoLinks?.buzzheavier && toolsAvailable) {
-                  console.log(`   📥 Resolving Buzzheavier: ${pageData.videoLinks.buzzheavier}`);
-                  try {
-                    const directBuzz = await resolveBuzzheavierDownloadUrl(pageData.videoLinks.buzzheavier);
-                    if (directBuzz) {
-                      console.log(`   📥 Downloading from Buzzheavier: ${directBuzz}`);
-                      const tempDest = path.join(fansubWorkDir, `buzz_${Date.now()}.mkv`);
-                      const cmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
-                      try {
-                        execFileSync(cmd, [
-                          '-s', '-L',
-                          '--max-time', '600',
-                          '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-                          '-H', `Referer: ${pageData.videoLinks.buzzheavier}`,
-                          '-o', tempDest,
-                          directBuzz
-                        ], { timeout: 650_000 });
-                        if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
-                          downloadedFilePath = tempDest;
-                        }
-                      } catch (cErr) {
-                        await downloadFileToDisk(directBuzz, tempDest, { Referer: pageData.videoLinks.buzzheavier });
-                        if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
-                          downloadedFilePath = tempDest;
+                if (!downloadedFilePath && pageData.videoLinks?.buzzheavier) {
+                  if (!toolsAvailable) {
+                    // DEFERRED — tools missing; NOT marked as posted.
+                    countDeferred(msgKey);
+                    console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
+                  } else {
+                    console.log(`   📥 Resolving Buzzheavier: ${pageData.videoLinks.buzzheavier}`);
+                    try {
+                      const directBuzz = await resolveBuzzheavierDownloadUrl(pageData.videoLinks.buzzheavier);
+                      if (directBuzz) {
+                        console.log(`   📥 Downloading from Buzzheavier: ${directBuzz}`);
+                        const tempDest = path.join(fansubWorkDir, `buzz_${Date.now()}.mkv`);
+                        const cmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
+                        try {
+                          execFileSync(cmd, [
+                            '-s', '-L',
+                            '--max-time', '600',
+                            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+                            '-H', `Referer: ${pageData.videoLinks.buzzheavier}`,
+                            '-o', tempDest,
+                            directBuzz
+                          ], { timeout: 650_000 });
+                          if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
+                            downloadedFilePath = tempDest;
+                          }
+                        } catch (cErr) {
+                          await downloadFileToDisk(directBuzz, tempDest, { Referer: pageData.videoLinks.buzzheavier });
+                          if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
+                            downloadedFilePath = tempDest;
+                          }
                         }
                       }
+                    } catch (e) {
+                      console.warn(`   ⚠️ Buzzheavier download failed:`, e.message);
                     }
-                  } catch (e) {
-                    console.warn(`   ⚠️ Buzzheavier download failed:`, e.message);
                   }
                 }
 
                 // 6. Torrent (Prioritized for speed & reliability in GitHub Actions)
-                if (!downloadedFilePath && pageData.videoLinks?.torrent && toolsAvailable) {
-                  console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
-                  const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine);
-                  if (extractedTorrent && extractedTorrent.filePath) {
-                    if (extractedTorrent.resolvedTitle) {
-                      titleLine = extractedTorrent.resolvedTitle;
-                    }
-                    const cleanFileName = getSafeTelegramFileName(titleLine, extractedTorrent.ext);
-                    const finalPath = path.join(OUT_DIR, cleanFileName);
-                    safeMoveFile(extractedTorrent.filePath, finalPath);
+                if (!downloadedFilePath && pageData.videoLinks?.torrent) {
+                  if (!toolsAvailable) {
+                    // DEFERRED — tools missing; NOT marked as posted.
+                    countDeferred(msgKey);
+                    console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
+                  } else {
+                    console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
+                    const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine);
+                    if (extractedTorrent && extractedTorrent.filePath) {
+                      if (extractedTorrent.resolvedTitle) {
+                        titleLine = extractedTorrent.resolvedTitle;
+                      }
+                      const cleanFileName = getSafeTelegramFileName(titleLine, extractedTorrent.ext);
+                      const finalPath = path.join(OUT_DIR, cleanFileName);
+                      safeMoveFile(extractedTorrent.filePath, finalPath);
 
-                    const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
-                    console.log(`   📤 Publishing to channel: "${caption}"`);
-                    const sendResult = await publishDocument(client, finalPath, caption);
+                      const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
+                      console.log(`   📤 Publishing to channel: "${caption}"`);
+                      const sendResult = await publishDocument(client, finalPath, caption);
 
-                    if (sendResult?.ok) {
-                      console.log(`   ✅ Successfully posted!`);
-                      newFound++;
-                      markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      if (sendResult?.ok) {
+                        console.log(`   ✅ Successfully posted!`);
+                        countPublished(msgKey);
+                        markReleaseAsPosted(posted, msgKey, releaseKeys);
+                        fs.rmSync(finalPath, { force: true });
+                        break;
+                      } else {
+                        // No failure branch existed here (F-10): the release
+                        // is NOT marked as posted, so it is retried.
+                        countFailed(msgKey);
+                        console.error(`   ❌ Failed to send document:`, sendResult);
+                      }
                       fs.rmSync(finalPath, { force: true });
-                      break;
                     }
-                    fs.rmSync(finalPath, { force: true });
                   }
                 }
 
@@ -3180,36 +3487,50 @@ export async function checkTelegramChannels(existingClient = null) {
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);
-                      newFound++;
+                      countPublished(msgKey);
                       markReleaseAsPosted(posted, msgKey, releaseKeys);
                       fs.rmSync(finalPath, { force: true });
                       break;
+                    } else {
+                      // No failure branch existed here (F-10): the release is
+                      // NOT marked as posted, so it is retried.
+                      countFailed(msgKey);
+                      console.error(`   ❌ Failed to send document:`, sendResult);
                     }
 
                     fs.rmSync(finalPath, { force: true });
                   }
                 }
               } catch (e) {
+                countFailed(msgKey);
                 console.error(`   ❌ Fansub post processing error:`, e.message);
               } finally {
                 try { fs.rmSync(fansubWorkDir, { recursive: true, force: true }); } catch { }
               }
             }
           }
-          if (isReleaseAlreadyPosted(posted, releaseKeys)) continue;
+          // Safety net (F-02): every attempted message must end up in exactly
+          // one terminal counter, otherwise the stall rule could not see it.
+          if (!classified(msgKey)) countSkipped(msgKey);
         }
       } catch (chatErr) {
+        // The source could not be read — counted separately from candidate
+        // failures; it must never be able to render the cycle green (F-08).
+        summary.sourceErrors++;
         console.warn(`   ⚠️ Error reading channel "${chat.title}":`, chatErr.message);
       }
     }
   } catch (err) {
-    console.error('Telegram channel listener error:', err.message);
+    // A listener-level error is an immediate fatal: the window is aborted.
+    if (err && err.isFatal === true) throw err;
+    throw createFatalError('LISTENER_ERROR', `Telegram channel listener error: ${err.message}`, summary);
   } finally {
     if (ownClient) {
       try { await client.disconnect(); } catch { }
     }
   }
 
-  savePostedIds(posted);
-  console.log(`\n🏁 Telegram check finished. Processed ${newFound} new release(s).\n`);
+  finalizePostedState(posted, summary);
+  console.log(`\n🏁 Telegram check finished. Processed ${summary.published} new release(s).\n`);
+  return summary;
 }

@@ -25,6 +25,9 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 2
+          # Nothing is ever read from .git/config: the push credentials are
+          # supplied per-command as an extraheader inside the commit step (F9).
+          persist-credentials: false
 
       - name: Setup Node.js 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -47,8 +50,51 @@ jobs:
           npm ci --omit=dev
           npx playwright install --with-deps chromium
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip p7zip-full p7zip-rar unrar || sudo apt-get install -y --no-install-recommends p7zip-full
+          # Install ONE apt transaction first (P-5: six separate transactions
+          # per run cost an estimated +20–90 s of setup). apt aborts the WHOLE
+          # transaction when one package is missing from the archive: the
+          # `p7zip-rar` package disappeared from ubuntu-26.04 and took
+          # aria2/mkvtoolnix/megatools/unrar down with it, so every official
+          # torrent was silently skipped while the job stayed green.
+          # p7zip-rar is gone: `unrar` provides the RAR capability and the npm
+          # `7zip-bin` dependency ships the 7z binary the extraction code uses.
+          if ! sudo apt-get install -y --no-install-recommends mkvtoolnix aria2 megatools zip p7zip-full unrar; then
+            # Fallback: one package per transaction, so a single missing package can no
+            # longer poison the others (this is the P0-2 root cause).
+            for pkg in mkvtoolnix aria2 megatools zip p7zip-full unrar; do
+              if ! sudo apt-get install -y --no-install-recommends "$pkg"; then
+                echo "::warning::failed to install $pkg — continuing with the remaining packages"
+              fi
+            done
+          fi
           pip install --no-cache-dir curl_cffi
+
+      - name: Verify Multimedia Tools
+        id: verify-tools
+        # aria2c + mkvextract are what hasRequiredTools() probes. A missing
+        # tool does NOT fail the job: failing here would skip the monitor
+        # step entirely and turn a partial degradation into a total outage
+        # (and would make the `deferred` counter unreachable in CI). The
+        # consequence is decided by the P0-3 counters instead — a window that
+        # publishes nothing while candidates were deferred becomes red.
+        run: |
+          missing=""
+          echo "Multimedia tool summary:"
+          for tool in aria2c mkvextract 7z 7za unrar mega-get; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "  ✅ $tool"
+            else
+              echo "  ⚠️  $tool not found"
+            fi
+          done
+          for tool in aria2c mkvextract; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::warning::required media tool missing: $tool"
+              missing="${missing}${missing:+,}${tool}"
+            fi
+          done
+          echo "tools_missing=${missing}" >> "$GITHUB_OUTPUT"
+          echo "✅ Tool check complete (missing: ${missing:-none})."
 
       - name: Run continuous monitor loop
         id: monitor
@@ -78,34 +124,49 @@ jobs:
           # Keep monitor alive in continuous loop for 25 minutes, checking every 60 seconds
           RUN_DURATION_MINUTES: 25
           CHECK_INTERVAL_SECONDS: 60
+          # The tools the tool-check step could not find. A missing tool is
+          # the root cause of the deferrals, so the runner prints it next to
+          # the counters (M-07) — it is consumed, not just exported.
+          TOOLS_MISSING: ${{ steps.verify-tools.outputs.tools_missing }}
         run: |
           node src/action-runner.mjs
 
       - name: Commit & Push Processed State
         id: commit
         if: always()
+        env:
+          # Step-scoped credential: used only as a per-command extraheader, never
+          # stored in .git/config and never part of a URL (F9).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TERMINAL_PROMPT: '0'
         run: |
+          # Default-deny (F-07): the state is treated as CORRUPT until a
+          # verified merge AND a successful push have both happened.
+          #
+          # The SCRIPT is the sole writer of these outputs (M-08): it writes
+          # state_corrupt=true as its FIRST action, so a script that dies
+          # before the merge still leaves state_corrupt=true behind and the
+          # chain stays blocked. The workflow must NOT pre-seed the value
+          # any more — a duplicated key relies on GitHub's duplicate-key
+          # resolution, which is not a contract worth depending on.
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          node -e "const p=JSON.parse(require('fs').readFileSync('data/posted.json','utf8')); if(!Array.isArray(p)||p.length<1000){console.error('state invalid: '+(Array.isArray(p)?('shrank to '+p.length):'not an array'));process.exit(1)}" || { echo 'رفض إيداع حالة تالفة'; exit 1; }
-          git add data/posted.json data/title-map.json || true
-          if git diff --cached --quiet; then
-            echo "ℹ️ No state changes to commit."
-          else
-            git commit -m "Update posted releases list [skip ci]"
+          # The merge + guard + commit + push (with its retry loop) lives in
+          # the script so it is unit-testable; it fetches the remote tip
+          # itself and builds the commit ON TOP of it (fast-forward by
+          # construction — no rebase, no pull, no merge).
+          if ! node scripts/merge-posted-state.mjs --push --attempts 3 \
+            --local data/posted.json --title-map-local data/title-map.json \
+            --out data/posted.json --title-map-out data/title-map.json \
+            --github-output "$GITHUB_OUTPUT"; then
+            # The script already emitted the precise reason (state corrupt /
+            # push failed after 3 attempts) and wrote state_corrupt /
+            # push_failed to $GITHUB_OUTPUT.
+            exit 1
           fi
-          if ! git push origin main; then
-            echo "⚠️ First push failed – retrying after rebase..."
-            git pull --rebase origin main || true
-            if ! git push origin main; then
-              echo "❌ Failed to push data/posted.json – state may be lost; next cycle will re-sync."
-              exit 1
-            fi
-          fi
-          echo "✅ State pushed."
 
       - name: Chain next monitoring run
-        if: always() && !cancelled() && steps.commit.outcome != 'failure'
+        if: always() && !cancelled() && steps.commit.outputs.state_corrupt != 'true' && steps.commit.outcome != 'failure'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -138,8 +199,9 @@ jobs:
             exit 0
           fi
           # This step now also runs on cancellation, so the wording must fit
-          # both cases: "stopped" is true for a failure and for a cancel.
-          TEXT="🔴 Bot monitor stopped: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # both cases: the bot may still be running through the chain, so
+          # "stopped" would be wrong — the RUN failed.
+          TEXT="🔴 Bot monitor run failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${TEXT}" \

@@ -1,7 +1,10 @@
 import express from 'express';
 import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CONFIG } from './config.mjs';
 import { checkNewReleases } from './feed-monitor.mjs';
+import { classifyCycle } from './action-runner.mjs';
 
 const app = express();
 
@@ -24,6 +27,51 @@ app.get('/health', (req, res) => {
 
 let isChecking = false;
 
+/**
+ * Classify a cycle summary exactly like the Actions path (F-03).
+ *
+ * The 24/7 deployment must apply the SAME verdict as the GitHub Actions
+ * runner: the same counters, the same predicates, the same log lines. Before
+ * this, the summary was ignored completely and every error was swallowed —
+ * in this deployment NONE of the P0 contract existed.
+ *
+ * → the verdict (see classifyCycle)
+ */
+export function reportCycleVerdict(summary, { log = console.log } = {}) {
+  const verdict = classifyCycle(summary, 0);
+  const s = verdict.summary;
+  log(`📊 cycle summary: attempted=${s.attempted} published=${s.published} failed=${s.failed} deferred=${s.deferred} skipped=${s.skipped} sourceErrors=${s.sourceErrors}`);
+  if (verdict.red) {
+    log(`🔴 cycle red: ${verdict.reasons.join(',')}`);
+  } else if (verdict.stall) {
+    log(`🔴 stall: ${s.attempted} candidates attempted, none published (skipped=${s.skipped} deferred=${s.deferred})`);
+  } else {
+    log(`🟢 cycle green`);
+  }
+  return verdict;
+}
+
+/**
+ * One check cycle with the P0 verdict applied (F-03).
+ *
+ * A typed fatal is NOT swallowed here: it propagates to the caller, which
+ * logs it distinctly and fails the process.
+ *
+ * → { summary, verdict }
+ */
+export async function runCheckCycle({
+  check = checkNewReleases,
+  log = console.log,
+  setExitCode = (code) => { process.exitCode = code; },
+} = {}) {
+  const summary = await check();
+  const verdict = reportCycleVerdict(summary, { log });
+  // A red verdict (a failure OR a stall) fails the run — exactly like the
+  // Actions path, which ends the window non-zero.
+  if (verdict.red || verdict.stall) setExitCode(1);
+  return { summary: verdict.summary, verdict };
+}
+
 async function safeCheckCycle(source = 'timer') {
   if (isChecking) {
     console.log(`⏳ [${source}] A check cycle is already in progress. Skipping overlapping run.`);
@@ -31,9 +79,22 @@ async function safeCheckCycle(source = 'timer') {
   }
   isChecking = true;
   try {
-    await checkNewReleases();
+    await runCheckCycle({ check: () => checkNewReleases(), log: console.log });
   } catch (e) {
+    if (e && e.isFatal === true) {
+      // A typed fatal (CHANNELS_ZERO / STATE_LOAD_FAILED / AUTH_SESSION_CONFIG)
+      // must NEVER be swallowed silently (F-03): it is logged distinctly, it
+      // fails the process and it is not demoted to an ordinary check error.
+      if (e.fatalLogged !== true) {
+        e.fatalLogged = true;
+        console.error(`🔴 fatal: ${e.fatalCode || 'UNKNOWN'}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
     console.error(`[${source}] Check error:`, e);
+    // An unexpected error is not a green cycle either.
+    process.exitCode = 1;
   } finally {
     isChecking = false;
   }
@@ -64,7 +125,7 @@ function startScheduler() {
   if (!CONFIG.TELEGRAM.SESSION) {
     console.warn('⚠️ TELEGRAM_SESSION is missing (checked env and SESSION_STRING.txt). Telegram publishing will fail until it is set.');
   } else if (!CONFIG.TELEGRAM.API_ID || !CONFIG.TELEGRAM.API_HASH) {
-    console.warn('⚠️ TELEGRAM_API_ID / TELEGRAM_API_HASH are missing. Telegram publishing will fail until both are set.');
+    console.warn('⚠️ TELEGRAM_API_ID / TELEGRAM_API_HASH are missing. Telegram publishing will fail until they are set.');
   } else if (!CONFIG.TELEGRAM.TARGET_CHANNEL) {
     console.warn('⚠️ TELEGRAM_TARGET_CHANNEL is missing. Telegram publishing will fail until it is set.');
   }
@@ -79,17 +140,26 @@ function startScheduler() {
   }, CONFIG.POLL_INTERVAL_MINUTES * 60 * 1000);
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`🌐 Health check server listening on port ${PORT}`);
-  startScheduler();
-});
+function startServer() {
+  const server = app.listen(PORT, () => {
+    console.log(`🌐 Health check server listening on port ${PORT}`);
+    startScheduler();
+  });
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.warn(`⚠️ Port ${PORT} is in use. Web health check server disabled, but Telegram bot polling will continue running.`);
-    startScheduler();
-  } else {
-    console.error('Web server error:', err);
-    startScheduler();
-  }
-});
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`⚠️ Port ${PORT} is in use. Web health check server disabled, but Telegram bot polling will continue running.`);
+      startScheduler();
+    } else {
+      console.error('Web server error:', err);
+      startScheduler();
+    }
+  });
+}
+
+// The server (and the 24/7 loop) only start on a DIRECT run — importing the
+// module (e.g. from a test) must not open a socket or start the loop.
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  startServer();
+}
