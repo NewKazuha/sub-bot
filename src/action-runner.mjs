@@ -150,9 +150,12 @@ function toolsMissingLine(env) {
  *   'red'   — a failure predicate held (the window ends non-zero)
  *   'stall' — everything attempted was skipped or deferred and nothing was
  *             published (a silent false success). A stall is NOT a failure:
- *             it does not count toward the consecutive-failure streak, but it
- *             is still red at the end of the window. F-09: it also does not
- *             RESET the streak — it is preserved.
+ *             it does not count toward the consecutive-failure streak, and it
+ *             does NOT redden the window either - "nothing new was published"
+ *             is the normal state of a bot that polls every 60 s, and
+ *             reddening it turned every quiet window into a failed run and an
+ *             admin page. It stays loud in the log (a warning). F-09: it also
+ *             does not RESET the streak - it is preserved.
  *   'idle'  — nothing was attempted
  *   'warn'  — 1..n failures next to successes (never fails)
  *   'green' — everything fine
@@ -360,7 +363,11 @@ export async function runLoop({
       log(`⚠️ target channel history sync failed — the duplicate-safety net was disabled for this cycle`);
     }
     if (verdict.stall) {
-      log(`🔴 stall: ${s.attempted} candidates attempted, none published (skipped=${s.skipped} deferred=${s.deferred})`);
+      // A stall is a WARNING, not a failure: with a healthy bot most windows
+      // publish nothing new (every candidate was already posted), and turning
+      // that into a red run turned every quiet window into a failure + an admin
+      // page. It stays loud in the log so it is never invisible.
+      log(`⚠️ stall: ${s.attempted} candidates attempted, none published (skipped=${s.skipped} deferred=${s.deferred})`);
     }
     if (verdict.red) {
       anyCycleRed = true;
@@ -382,7 +389,12 @@ export async function runLoop({
   // The verdict is evaluated at the END of the window: a red cycle never
   // aborted the window (F-15) — only an immediate fatal does.
   const windowVerdict = classifyCycle(aggregate, consecutiveFailedCycles, { maxConsecutiveCycleFailures: maxFailures });
-  const red = windowVerdict.red || windowVerdict.stall || anyCycleRed;
+  // A STALL is not a failure (owner policy: red needs a real failure - failed>0,
+  // the failure streak, failed>published, source errors with nothing published,
+  // or an immediate fatal). "Nothing new was published" is the NORMAL state of a
+  // bot that polls every 60 s: reddening it turned every quiet window into a
+  // failed run and an admin page. The stall stays visible as a warning below.
+  const red = windowVerdict.red || anyCycleRed;
 
   log(`📊 cycle summary: attempted=${aggregate.attempted} published=${aggregate.published} failed=${aggregate.failed} deferred=${aggregate.deferred} skipped=${aggregate.skipped} sourceErrors=${aggregate.sourceErrors}`);
   // A missing tool is the root cause of the deferrals: it has to be visible
@@ -392,7 +404,7 @@ export async function runLoop({
   if (red) {
     const reasons = windowVerdict.reasons.length
       ? windowVerdict.reasons.slice()
-      : (windowVerdict.stall ? ['stall'] : []);
+      : [];
     // The per-cycle causes travel with the window verdict: a window that is
     // red because of an earlier red cycle must NOT degrade to a generic
     // 'cycle-red' label (M-09).
@@ -401,6 +413,9 @@ export async function runLoop({
     if (aggregate.syncFailed && !reasons.includes('sync-failed')) reasons.push('sync-failed');
     log(`🔴 window red: ${reasons.join(',')}`);
   } else {
+    if (windowVerdict.stall) {
+      log(`⚠️ window: nothing published this window (no new releases) - not a failure`);
+    }
     log(`🟢 window green`);
   }
 
@@ -463,14 +478,14 @@ export async function runSinglePass({
   if (verdict.red) {
     log(`🔴 cycle red: ${verdict.reasons.join(',')}`);
   } else if (verdict.stall) {
-    log(`🔴 stall: ${s.attempted} candidates attempted, none published (skipped=${s.skipped} deferred=${s.deferred})`);
+    log(`⚠️ stall: ${s.attempted} candidates attempted, none published (skipped=${s.skipped} deferred=${s.deferred})`);
   } else {
     log(`🟢 cycle green`);
   }
 
-  // A red pass (a failure OR a stall) is a red pass — exactly like the
-  // window path, which ends red for both.
-  const failed = verdict.red || verdict.stall;
+  // A stall is a WARNING, not a failure - exactly like the window path, which
+  // ends green for "nothing new was published".
+  const failed = verdict.red;
   if (failed && typeof setExitCode === 'function') setExitCode(1);
 
   return { summary: s, verdict, failed };

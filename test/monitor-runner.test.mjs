@@ -470,6 +470,49 @@ test('single-pass mode: a missing summary is a failed pass, not a green one (M-0
 });
 
 // ===========================================================================
+// HOTFIX: a window in which nothing NEW was published must NOT be a failure.
+//
+// Regression: the stall verdict (everything attempted was already published or
+// deferred, nothing published) was treated as RED at the window level. With a
+// bot that polls every 60 s, "nothing new to publish" is the NORMAL state of
+// every quiet window, so every such window became a FAILED run + an admin page
+// - 8 consecutive failed runs on production on 2026-11-12. The stall must stay
+// visible (a warning), but it must not fail the run.
+// ===========================================================================
+test('HOTFIX: a quiet window (nothing new to publish) is GREEN, not a failed run', async () => {
+  const logs = [];
+  const clock = virtualClock();
+  const QUIET = { attempted: 30, published: 0, failed: 0, deferred: 0, skipped: 90, sourceErrors: 0 };
+  const result = await runLoop({
+    windowMs: 20 * 60 * 1000,
+    cycleBudgetMs: CYCLE_BUDGET_MS,
+    checkIntervalMs: 60 * 1000,
+    check: async () => { clock.tick(CYCLE_MS); return QUIET; },
+    now: clock.now,
+    sleep: clock.sleep,
+    log: (m) => logs.push(String(m)),
+  });
+  assert.equal(result.red, false, 'a quiet window must NOT be a failed run');
+  assert.ok(logs.some(l => l.includes('⚠️ stall:')), 'the stall must stay visible as a warning');
+  assert.ok(logs.some(l => l.includes('🟢 window green')), 'a quiet window must be green');
+  assert.ok(!logs.some(l => l.includes('🔴 window red')), 'a quiet window must never print the red line');
+  assert.equal(result.consecutiveFailedCycles, 0, 'a quiet window must not count toward the failure streak');
+});
+
+test('HOTFIX: a one-shot pass in which nothing was published is not a failed pass', async () => {
+  const logs = [];
+  let exitCode = null;
+  await runSinglePass({
+    check: async () => ({ attempted: 30, published: 0, failed: 0, deferred: 0, skipped: 90, sourceErrors: 0 }),
+    log: (m) => logs.push(String(m)),
+    env: {},
+    setExitCode: (code) => { exitCode = code; },
+  });
+  assert.equal(exitCode, null, 'a quiet pass must not fail the run');
+  assert.ok(logs.some(l => l.includes('⚠️ stall:')), 'the stall must stay visible as a warning');
+});
+
+// ===========================================================================
 // FIX ROUND 2 — P-5: one apt transaction first, per-package fallback
 // ===========================================================================
 
