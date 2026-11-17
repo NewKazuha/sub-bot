@@ -4,7 +4,14 @@ import { CONFIG } from './config.mjs';
 
 const getApiBase = () => `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}`;
 
-function escapeHtml(text) {
+// The HTML escaping of a Telegram caption (M8).
+//
+// It is EXPORTED because the MTProto transport (telegram-client.mjs) has to
+// escape its own copy of the caption: the Bot API transport escapes it here
+// (sendDocument), the MTProto transport escapes it at the sendFile call — each
+// transport escapes EXACTLY ONCE (the caption that reaches publishDocument is
+// always the raw one).
+export function escapeHtml(text) {
   return String(text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')

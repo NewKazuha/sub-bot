@@ -560,5 +560,133 @@ test('S01E03 and "- 03" are one episode; S02E03 is a different one', () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Live defect 2026-11-12 (P1 tranche 3, F1): a batch package was published
+// as "[Aurora Team] Aikatsu! - 001 [+Fonts]" although the package holds
+// 001-004. The title resolver only saw the SUBTITLE files, so a Blu-ray
+// batch (one .mkv per episode + fonts + usually ONE loose .ass) looked like
+// a single episode. The whole package must now be described by its range.
+// ---------------------------------------------------------------------------
+const F1_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'p1t3-batch-title-'));
+const F1_ARABIC_POST = '[Aurora Team] الدفعة الأولى من سلسلة آيكاتسو مترجمة بلوراي';
+
+/** A real package on disk: the file names are what the resolver reads. */
+function f1Package(names) {
+  const dir = fs.mkdtempSync(path.join(F1_ROOT, 'pkg-'));
+  return names.map((n) => {
+    const p = path.join(dir, n.replace(/[\\/:*?"<>|]/g, '_'));
+    fs.writeFileSync(p, '[Script Info]\nTitle: ' + n.replace(/\.(ass|srt)$/i, '') + '\n');
+    return p;
+  });
+}
+
+test('F1.1/F1.2: a Blu-ray batch (one .ass + four .mkv) resolves to the episode RANGE, not to a lone episode', () => {
+  const files = f1Package([
+    '[Aurora Team] Aikatsu! - 001.ass',
+    '[Aurora Team] Aikatsu! - 001.mkv',
+    '[Aurora Team] Aikatsu! - 002.mkv',
+    '[Aurora Team] Aikatsu! - 003.mkv',
+    '[Aurora Team] Aikatsu! - 004.mkv',
+  ]);
+  const subFiles = files.filter(f => /\.(ass|srt)$/i.test(f));
+
+  // BEFORE the fix the resolver only saw the ONE .ass -> a single episode ->
+  // the title promised "001" for a package that holds 001-004.
+  const resolved = tc.resolveEnglishTitleIfArabic(F1_ARABIC_POST, files, subFiles);
+
+  assert.match(resolved, /\[01~04\]/, `the batch title must carry the range: "${resolved}"`);
+  assert.doesNotMatch(resolved, /\b001\b/, `the batch title must not promise one episode: "${resolved}"`);
+  assert.match(resolved, /^\[Aurora Team\] Aikatsu!/, `unexpected title: "${resolved}"`);
+});
+
+test('F1.2: a single-episode package keeps its own episode number (no range)', () => {
+  const files = f1Package([
+    '[Aurora Team] Aikatsu! - 001.ass',
+    '[Aurora Team] Aikatsu! - 001.mkv',
+  ]);
+  const subFiles = files.filter(f => /\.(ass|srt)$/i.test(f));
+
+  const resolved = tc.resolveEnglishTitleIfArabic(F1_ARABIC_POST, files, subFiles);
+
+  assert.equal(resolved, '[Aurora Team] Aikatsu! - 001');
+  assert.doesNotMatch(resolved, /\[\d+\s*~\s*\d+\]/, 'a single episode must not get a range');
+});
+
+test('F1.2: an English post title of a multi-episode package also drops its own episode token', () => {
+  const files = f1Package([
+    '[Aurora Team] Aikatsu! - 001.ass',
+    '[Aurora Team] Aikatsu! - 001.mkv',
+    '[Aurora Team] Aikatsu! - 002.mkv',
+    '[Aurora Team] Aikatsu! - 003.mkv',
+    '[Aurora Team] Aikatsu! - 004.mkv',
+  ]);
+  const subFiles = files.filter(f => /\.(ass|srt)$/i.test(f));
+
+  const resolved = tc.resolveEnglishTitleIfArabic('[Aurora Team] Aikatsu! - 001', files, subFiles);
+
+  assert.equal(resolved, '[Aurora Team] Aikatsu! [01~04]');
+});
+
+test('F1.2 guard: a number that is not an episode token survives the batch strip', () => {
+  const files = f1Package([
+    '5 Cent-per-Second - 03.ass',
+    '5 Cent-per-Second - 04.ass',
+    '5 Cent-per-Second - 05.ass',
+  ]);
+  const subFiles = files.filter(f => /\.(ass|srt)$/i.test(f));
+
+  const resolved = tc.resolveEnglishTitleIfArabic(F1_ARABIC_POST, files, subFiles);
+
+  assert.match(resolved, /5 Cent-per-Second/, `the "5" must survive: "${resolved}"`);
+  assert.match(resolved, /\[03~05\]/, `unexpected title: "${resolved}"`);
+  assert.doesNotMatch(resolved, /-\s*03\b/, `the episode token must be gone: "${resolved}"`);
+});
+
+test('F1.1: a resolution token ("1080p") is not an episode number', () => {
+  const files = f1Package([
+    '[Aurora Team] Aikatsu! - 001.ass',
+    '[Aurora Team] Aikatsu! 1080 [1080p].mkv',
+  ]);
+  const subFiles = files.filter(f => /\.(ass|srt)$/i.test(f));
+
+  const resolved = tc.resolveEnglishTitleIfArabic(F1_ARABIC_POST, files, subFiles);
+
+  assert.equal(resolved, '[Aurora Team] Aikatsu! - 001');
+  assert.doesNotMatch(resolved, /\[\d+\s*~\s*\d+\]/, 'a resolution must not create a range');
+});
+
+// ---------------------------------------------------------------------------
+// Live defect 2026-11-12 (F2b): "الدفعة الأولى" ("the first BATCH") was read
+// as episode "01", so the cloud-folder download was narrowed to episode 001
+// and the other four episodes of the folder were never published.
+// ---------------------------------------------------------------------------
+test('F2b: an Arabic ordinal is an episode only when the title is about an episode', () => {
+  assert.equal(
+    tc.extractEpisodeNumber('[Aurora Team] الدفعة الأولى من سلسلة آيكاتسو مترجمة بلوراي'),
+    '',
+    'a collection title must not resolve to an episode number'
+  );
+  assert.equal(
+    tc.extractEpisodeNumber('الحلقة الأولى من آيكاتسو'),
+    '01',
+    '"the first EPISODE" keeps working'
+  );
+  assert.equal(
+    tc.extractEpisodeNumber('[Team] Aikatsu! - 004'),
+    '4',
+    'the numeric forms are unaffected'
+  );
+  assert.equal(
+    tc.extractEpisodeNumber('الدفعة الأولى - 004'),
+    '4',
+    'a numeric form next to a collection word still counts'
+  );
+  assert.equal(
+    tc.extractEpisodeNumber('الجزء الثاني من آيكاتسو'),
+    '',
+    'a part is a collection, not an episode'
+  );
+});
+
 
 

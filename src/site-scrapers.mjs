@@ -2,11 +2,35 @@ import * as cheerio from 'cheerio';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { matchesEpisode } from './cloud-folders.mjs';
+import { matchesEpisode, logSafe } from './cloud-folders.mjs';
 import { fetchRenderedHtml, isRocksDdlHost, isRocksHost } from './browser-fetch.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
+
+// X3 — the HOSTNAME of a link decides its provider (guarded for a malformed
+// href). A link that merely mentions "mediafire.com" in its query or in its
+// path is NOT a mediafire link: it would otherwise be fetched server-side.
+function linkHost(href) {
+  try {
+    return new URL(String(href)).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isHostOf(href, domain) {
+  const host = linkHost(href);
+  if (!host) return false;
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+function isAnyHostOf(href, domains) {
+  return domains.some(d => isHostOf(href, d));
+}
+
+// M4: the host helpers are exported so the classification can be tested.
+export { isHostOf, isAnyHostOf };
 
 // Mugi-Subs publishes its subtitle folders through a public Cloudflare Worker
 // (a GoIndex-style browser over a shared Drive). The main site (mugi-subs.com)
@@ -775,7 +799,12 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
   }
 }
 
-export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null) {
+// m7 — the DDL directory of a BATCH post ("الدفعة الأولى", "[01~05]") holds one
+// archive PER EPISODE. When no episode is asked for, the archive that carries
+// NO episode token is the whole batch and must be preferred; when the
+// directory holds only per-episode archives, the first one is used and the
+// limitation is logged.
+export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null, { batch = false } = {}) {
   // Rocks-Team DDL is Cloudflare-protected: the listing only exists in a
   // browser, so it is rendered with headless Chromium instead of fetched.
   const isRocks = isRocksDdlHost(directoryUrl);
@@ -828,6 +857,25 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
       if (match) return match;
     }
 
+    // m7: a BATCH directory without an episode — prefer the archive that
+    // carries NO episode token (the whole batch in one archive).
+    if (batch && !targetEp) {
+      const archives = candidates.filter(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url));
+      const decodedName = (url) => {
+        let decoded = url;
+        try { decoded = decodeURIComponent(url); } catch { }
+        const clean = decoded.split(/[?#]/)[0];
+        return clean.split('/').pop() || clean;
+      };
+      const wholeBatch = archives.find(url => !/\d/.test(decodedName(url)));
+      if (wholeBatch) return wholeBatch;
+      if (archives.length > 0) {
+        // X6: the name is a scraped href — it must never forge a log line.
+        console.warn(`⚠️ batch directory has only per-episode archives — using ${logSafe(decodedName(archives[0]))}`);
+        return archives[0];
+      }
+    }
+
     // Prefer an archive because fansub releases commonly bundle fonts with it.
     return candidates.find(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url)) || candidates[0] || null;
   } catch (e) {
@@ -836,7 +884,7 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
   }
 }
 
-export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null, releaseTitle = null) {
+export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null, releaseTitle = null, options = {}) {
   // P1-1b: a URL that was already fetched and found to have NO download link
   // is answered from the negative cache — with NO network request at all —
   // until its entry expires. This is what stops the same pages from being
@@ -1045,9 +1093,9 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
       const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
       if (!isRoot && l.containerHeading && subHeadingRegex.test(l.containerHeading) &&
           (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) ||
-           l.href.includes('top4top.io') || l.href.includes('mediafire.com') ||
-           l.href.includes('urls.mugi-subs.com') || l.href.includes('tinyurl.com') ||
-           l.href.includes('drive.google.com') || l.href.includes('mega.nz'))) {
+           isHostOf(l.href, 'top4top.io') || isHostOf(l.href, 'mediafire.com') ||
+           isHostOf(l.href, 'urls.mugi-subs.com') || isHostOf(l.href, 'tinyurl.com') ||
+           isAnyHostOf(l.href, ['drive.google.com', 'mega.nz']))) {
         directSubLink = l.href;
         break;
       }
@@ -1058,7 +1106,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   if (!directSubLink) {
     for (const l of allLinks) {
       const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
-      if (!isRoot && subHeadingRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) || l.href.includes('top4top.io') || l.href.includes('mediafire.com'))) {
+      if (!isRoot && subHeadingRegex.test(l.parentContext) && (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) || isHostOf(l.href, 'top4top.io') || isHostOf(l.href, 'mediafire.com'))) {
         directSubLink = l.href;
         break;
       }
@@ -1095,14 +1143,14 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
       fontsLink = l.href;
     }
 
-    if (hrefLower.includes('top4top.io') && !top4top) top4top = l.href;
-    if (hrefLower.includes('mediafire.com') && isSoft && !mediafire) mediafire = l.href;
-    if (hrefLower.includes('mega.nz') && isSoft && !mega) mega = l.href;
-    if ((hrefLower.includes('drive.google.com') || hrefLower.includes('docs.google.com')) && isSoft && !drive) drive = l.href;
-    if (hrefLower.includes('proton.me') && isSoft && !proton) proton = l.href;
-    if (hrefLower.includes('pixeldrain.com') && isSoft && !pixeldrain) pixeldrain = l.href;
+    if (isHostOf(l.href, 'top4top.io') && !top4top) top4top = l.href;
+    if (isHostOf(l.href, 'mediafire.com') && isSoft && !mediafire) mediafire = l.href;
+    if (isAnyHostOf(l.href, ['mega.nz', 'mega.co.nz']) && isSoft && !mega) mega = l.href;
+    if (isAnyHostOf(l.href, ['drive.google.com', 'docs.google.com']) && isSoft && !drive) drive = l.href;
+    if (isHostOf(l.href, 'proton.me') && isSoft && !proton) proton = l.href;
+    if (isHostOf(l.href, 'pixeldrain.com') && isSoft && !pixeldrain) pixeldrain = l.href;
     if ((hrefLower.includes('.torrent') || hrefLower.includes('nyaa.si')) && !torrent) torrent = l.href;
-    if (hrefLower.includes('buzzheavier.com') && isSoft && !buzzheavier) buzzheavier = l.href;
+    if (isHostOf(l.href, 'buzzheavier.com') && isSoft && !buzzheavier) buzzheavier = l.href;
 
     if ((textLower.includes('hevc') || textLower.includes('x265')) && isSoft && !hevcLink) hevcLink = l.href;
     if ((textLower.includes('h264') || textLower.includes('h.264') || textLower.includes('x264')) && isSoft && !h264Link) h264Link = l.href;
@@ -1118,7 +1166,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   // Pick the actual subtitle/archive from that listing.
   if (directSubLink && /(?:workers\.dev|ddl\.[^/]+\/0:|\/0:|(?:subtitle|subtitles|ملفات(?:%20|\s)*الترجمة))/i.test(directSubLink) &&
       !/\.(?:ass|srt|zip|rar|7z)(?:$|[?#])/i.test(directSubLink)) {
-    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink, effectiveEp);
+    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink, effectiveEp, { batch: Boolean(options.batch) });
     if (resolvedFile) directSubLink = resolvedFile;
   }
 
@@ -1126,14 +1174,14 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   // underlying provider as well so the caller can use its folder/file resolver
   // after a plain HTTP download is unsuitable (notably Drive and MediaFire).
   const resolvedLower = (directSubLink || '').toLowerCase();
-  if (resolvedLower.includes('top4top.io') && !top4top) top4top = directSubLink;
-  if (resolvedLower.includes('mediafire.com') && !mediafire) mediafire = directSubLink;
-  if (resolvedLower.includes('drive.google.com') || resolvedLower.includes('docs.google.com')) drive = directSubLink;
-  if (resolvedLower.includes('mega.nz') && !mega) mega = directSubLink;
-  if (resolvedLower.includes('proton.me') && !proton) proton = directSubLink;
-  if (resolvedLower.includes('pixeldrain.com') && !pixeldrain) pixeldrain = directSubLink;
+  if (isHostOf(directSubLink, 'top4top.io') && !top4top) top4top = directSubLink;
+  if (isHostOf(directSubLink, 'mediafire.com') && !mediafire) mediafire = directSubLink;
+  if (isAnyHostOf(directSubLink, ['drive.google.com', 'docs.google.com'])) drive = directSubLink;
+  if (isAnyHostOf(directSubLink, ['mega.nz', 'mega.co.nz']) && !mega) mega = directSubLink;
+  if (isHostOf(directSubLink, 'proton.me') && !proton) proton = directSubLink;
+  if (isHostOf(directSubLink, 'pixeldrain.com') && !pixeldrain) pixeldrain = directSubLink;
   if ((resolvedLower.includes('.torrent') || resolvedLower.includes('nyaa.si')) && !torrent) torrent = directSubLink;
-  if (resolvedLower.includes('buzzheavier.com') && !buzzheavier) buzzheavier = directSubLink;
+  if (isHostOf(directSubLink, 'buzzheavier.com') && !buzzheavier) buzzheavier = directSubLink;
 
   const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || buzzheavier || null);
 
@@ -1168,8 +1216,38 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   return result;
 }
 
+// S1 — the hosts a Buzzheavier download may come from. The code only ever
+// references buzzheavier.com, so that is the ONLY known host: an unknown
+// host is NEVER fetched (fail closed).
+const BUZZHEAVIER_HOSTS = ['buzzheavier.com'];
+
+export function isBuzzheavierHost(url) {
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase();
+  return BUZZHEAVIER_HOSTS.some(d => host === d || host.endsWith(`.${d}`));
+}
+
+// The absolute form of a Buzzheavier path (the page uses relative paths).
+function buzzheavierAbsolute(pathOrUrl) {
+  if (!pathOrUrl) return null;
+  const raw = String(pathOrUrl).trim();
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith('//')) return `https:${raw}`;
+  return `https://buzzheavier.com${raw.startsWith('/') ? '' : '/'}${raw}`;
+}
+
 export async function resolveBuzzheavierDownloadUrl(buzzUrl) {
-  if (!buzzUrl || !buzzUrl.includes('buzzheavier.com')) return null;
+  // S1: the page url itself must be an https url of a known host.
+  if (!buzzUrl || !isBuzzheavierHost(buzzUrl)) {
+    console.warn(`   ⚠️ Buzzheavier link ignored: it is not hosted by buzzheavier.com (${logSafe(String(buzzUrl || ''))})`);
+    return null;
+  }
 
   try {
     const idMatch = buzzUrl.match(/buzzheavier\.com\/([a-zA-Z0-9_-]+)/i);
@@ -1210,9 +1288,12 @@ export async function resolveBuzzheavierDownloadUrl(buzzUrl) {
       downloadPath = `/${fileId}/download`;
     }
 
-    const fullDlUrl = downloadPath.startsWith('http')
-      ? downloadPath
-      : `https://buzzheavier.com${downloadPath.startsWith('/') ? '' : '/'}${downloadPath}`;
+    const fullDlUrl = buzzheavierAbsolute(downloadPath);
+    // S1: the download endpoint must be an https url of a known host.
+    if (!isBuzzheavierHost(fullDlUrl)) {
+      console.warn(`   ⚠️ Buzzheavier download endpoint ignored: unknown host (${logSafe(String(fullDlUrl || ''))})`);
+      return null;
+    }
 
     // 2. Request the download endpoint with HX-Request: true to obtain the direct CDN URL
     let headerText = '';
@@ -1232,7 +1313,13 @@ export async function resolveBuzzheavierDownloadUrl(buzzUrl) {
     if (headerText) {
       const hxRedirectMatch = headerText.match(/^hx-redirect:\s*(.+)$/im);
       if (hxRedirectMatch) {
-        const redirectUrl = hxRedirectMatch[1].trim();
+        const redirectUrl = buzzheavierAbsolute(hxRedirectMatch[1]);
+        // S1: the redirect target must be an https url of a known host — an
+        // unknown host is NEVER fetched.
+        if (redirectUrl && !isBuzzheavierHost(redirectUrl)) {
+          console.warn(`   ⚠️ Buzzheavier redirect ignored: unknown host (${logSafe(redirectUrl)})`);
+          return null;
+        }
         if (redirectUrl && !redirectUrl.endsWith(`/${fileId}`) && !redirectUrl.endsWith(`/${fileId}/`) && redirectUrl !== buzzUrl) {
           return redirectUrl;
         }
@@ -1240,7 +1327,11 @@ export async function resolveBuzzheavierDownloadUrl(buzzUrl) {
 
       const locationMatch = headerText.match(/^location:\s*(.+)$/im);
       if (locationMatch) {
-        const locUrl = locationMatch[1].trim();
+        const locUrl = buzzheavierAbsolute(locationMatch[1]);
+        if (locUrl && !isBuzzheavierHost(locUrl)) {
+          console.warn(`   ⚠️ Buzzheavier redirect ignored: unknown host (${logSafe(locUrl)})`);
+          return null;
+        }
         if (locUrl && !locUrl.endsWith(`/${fileId}`) && !locUrl.endsWith(`/${fileId}/`) && locUrl !== buzzUrl) {
           return locUrl;
         }

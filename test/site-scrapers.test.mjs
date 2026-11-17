@@ -13,6 +13,9 @@ process.chdir(tempDir);
 // Namespace import (NOT named): a missing export must fail per-test at call time
 // (TypeError) instead of failing the whole file at link time.
 const ss = await import('../src/site-scrapers.mjs');
+// The cloud-folder helpers (the Drive/Mega folder handlers) — namespace import
+// for the same reason.
+const cf = await import('../src/cloud-folders.mjs');
 
 const {
   resolveMugiSubtitleFromWorker,
@@ -465,4 +468,169 @@ test('P1-1b: the negative cache is bounded — it never exceeds its cap and evic
     restore();
     __resetNegativeCache();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Live defect 2026-11-12 (F2a): the Google Drive folder of the Aikatsu batch
+// holds FIVE subtitle files (001-005), but the download was narrowed to the
+// episode the post asked for ("01") — four episodes were never published.
+// A folder that holds several episodes is a BATCH: all of it is downloaded.
+// ---------------------------------------------------------------------------
+const DRIVE_BATCH_FILES = ['001', '002', '003', '004', '005'].map((e) => ({
+  name: `[Aurora Team] Aikatsu! - ${e} [BD 1080p]_v1.ass`,
+  id: `drive_id_${e}`,
+  isFolder: false,
+}));
+
+test('F2a: a Drive folder with several episodes is a BATCH — every episode is downloaded', () => {
+  // Even with a target episode (the value the Arabic batch title used to
+  // produce), the multi-episode folder is NOT narrowed.
+  const withTarget = cf.selectFolderTargets(DRIVE_BATCH_FILES, { targetEpisode: '01', extractedEps: [] });
+  assert.equal(withTarget.length, 5, 'the whole folder must be downloaded');
+  assert.deepEqual(
+    withTarget.map(f => f.name),
+    DRIVE_BATCH_FILES.map(f => f.name)
+  );
+
+  // With no target episode at all (the title after the F2b guard).
+  const noTarget = cf.selectFolderTargets(DRIVE_BATCH_FILES, { targetEpisode: '', extractedEps: [] });
+  assert.equal(noTarget.length, 5, 'the whole folder must be downloaded');
+
+  // The Mega folder path has no title range — the same rule applies.
+  const noRange = cf.selectFolderTargets(DRIVE_BATCH_FILES, { targetEpisode: '01' });
+  assert.equal(noRange.length, 5, 'the whole folder must be downloaded');
+
+  // An explicit episode range in the title keeps its meaning.
+  const ranged = cf.selectFolderTargets(DRIVE_BATCH_FILES, { targetEpisode: '01', extractedEps: ['2', '3'] });
+  assert.equal(ranged.length, 2, 'an explicit range selects exactly its episodes');
+  assert.deepEqual(ranged.map(f => f.name), [DRIVE_BATCH_FILES[1].name, DRIVE_BATCH_FILES[2].name]);
+});
+
+test('F2a: a folder with a SINGLE episode is still narrowed to the requested episode', () => {
+  const single = [{ name: '[Aurora Team] Aikatsu! - 004 [BD 1080p]_v1.ass', id: 'drive_id_4', isFolder: false }];
+  const selected = cf.selectFolderTargets(single, { targetEpisode: '4', extractedEps: [] });
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].name, single[0].name);
+});
+
+test('F2a: the batch package holds every episode of the folder plus the fonts', async () => {
+  // The packing the Drive batch branch uses: five subtitles + Fonts/ in ONE zip.
+  const unpackDir = fs.mkdtempSync(path.join(tempDir, 'drive-batch-'));
+  for (const f of DRIVE_BATCH_FILES) {
+    fs.writeFileSync(path.join(unpackDir, f.name.replace(/[\\/:*?"<>|]/g, '_')), '[Script Info]\n');
+  }
+  const fontsDir = path.join(unpackDir, 'Fonts');
+  fs.mkdirSync(fontsDir, { recursive: true });
+  fs.writeFileSync(path.join(fontsDir, 'font.ttf'), 'x'.repeat(64));
+
+  const zipPath = path.join(tempDir, 'drive_batch.zip');
+  cf.packToZip(unpackDir, zipPath);
+
+  const AdmZip = (await import('adm-zip')).default;
+  const entries = new AdmZip(zipPath).getEntries().filter(e => !e.isDirectory);
+  const subs = entries.filter(e => /\.(ass|srt)$/i.test(e.entryName));
+  const fonts = entries.filter(e => /\.(ttf|otf|woff2?|ttc)$/i.test(e.entryName));
+  assert.equal(subs.length, 5, 'every episode of the folder must be in the package');
+  assert.equal(fonts.length, 1, 'the fonts must be in the package');
+  assert.ok(fonts[0].entryName.startsWith('Fonts/'), `the fonts belong in Fonts/: ${fonts[0].entryName}`);
+});
+
+// ---------------------------------------------------------------------------
+// Live defect 2026-11-12 (F2c/F2d): the post offered a Mega folder of MKVs
+// and a folder of five .ass subtitles. The video source won, so only episode
+// 001 was published. A SUBTITLE source must be preferred, and a folder of
+// subtitles must be published WHOLE (one package), not one episode at a time.
+// ---------------------------------------------------------------------------
+const SUBS_ONLY_FOLDER = ['001', '002', '003', '004', '005'].map((e) => ({
+  name: `[Aurora Team] Aikatsu! - ${e} [BD 1080p]_v1.ass`,
+  id: `drive_id_${e}`,
+  node: { id: `mega_node_${e}` },
+  directUrl: `https://mediafire.test/file_${e}`,
+  size: 1024,
+  isFolder: false,
+}));
+const VIDEOS_ONLY_FOLDER = ['001', '002', '003', '004', '005'].map((e) => ({
+  name: `[Aurora Team] Aikatsu! - ${e} [BD 1080p HEVC FLAC].mkv`,
+  id: `drive_mkv_${e}`,
+  node: { id: `mega_mkv_${e}` },
+  directUrl: `https://mediafire.test/mkv_${e}`,
+  size: 1024 * 1024 * 1024,
+  isFolder: false,
+}));
+
+test('F2c: a SUBTITLE-bearing cloud source is chosen before a video source', () => {
+  const listing = SUBS_ONLY_FOLDER;
+  assert.equal(cf.listingOffersSubtitles(listing), true, 'the .ass folder offers subtitles');
+  assert.equal(cf.listingOffersSubtitles(VIDEOS_ONLY_FOLDER), false, 'the MKV folder offers no subtitles');
+
+  // The post offers both: the subtitle source must come FIRST.
+  const ordered = cf.orderCloudSources([
+    { kind: 'mega', url: 'https://mega.nz/folder/videos', offersSubtitles: false },
+    { kind: 'drive', url: 'https://drive.google.com/drive/folders/subs', offersSubtitles: true },
+  ]);
+  assert.equal(ordered[0].kind, 'drive', 'the subtitle source must be tried first');
+  assert.equal(ordered[0].url, 'https://drive.google.com/drive/folders/subs');
+  assert.equal(ordered[1].kind, 'mega', 'the video source stays as the fallback');
+
+  // Without a subtitle source the order is unchanged (stable).
+  const videoOnly = cf.orderCloudSources([
+    { kind: 'mediafire', url: 'https://mediafire.test/folder/a', offersSubtitles: false },
+    { kind: 'mega', url: 'https://mega.nz/folder/b', offersSubtitles: false },
+  ]);
+  assert.deepEqual(videoOnly.map(s => s.kind), ['mediafire', 'mega']);
+});
+
+test('F2d: the subtitle branch of every findBestFileIn* returns ALL the subtitles of a multi-episode folder', async () => {
+  // The Mediafire helper resolves the direct URL of every selected file —
+  // stub the fetch so the test never touches the network.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    url: 'https://mediafire.test/file_1',
+    headers: { get: () => null },
+    text: async () => '<a id="downloadButton" href="https://mediafire.test/direct_1">Download</a>',
+  });
+  try {
+    // Mega
+    const mega = await cf.findBestFileInMegaFolder('https://mega.nz/folder/x', '01', [], SUBS_ONLY_FOLDER);
+    assert.equal(mega.type, 'subtitles');
+    assert.equal(mega.files.length, 5, 'every episode of the folder must be selected');
+    assert.equal(mega.subNames.length, 5);
+
+    // Drive
+    const drive = await cf.findBestFileInDrive('https://drive.google.com/drive/folders/x', '01', [], SUBS_ONLY_FOLDER);
+    assert.equal(drive.type, 'subtitles');
+    assert.equal(drive.files.length, 5);
+    assert.ok(drive.files.every(f => f.directUrl), 'every selected file must carry its download URL');
+
+    // Mediafire
+    const mediafire = await cf.findBestFileInMediafire('https://mediafire.test/folder/x', '01', [], SUBS_ONLY_FOLDER);
+    assert.equal(mediafire.type, 'subtitles');
+    assert.equal(mediafire.files.length, 5);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('F2d: a single-episode folder is still narrowed to one file, and the video branch stays single-file', async () => {
+  const singleSub = [SUBS_ONLY_FOLDER[0]];
+  const megaSingle = await cf.findBestFileInMegaFolder('https://mega.nz/folder/x', '1', [], singleSub);
+  assert.equal(megaSingle.type, 'subtitle', 'a one-episode folder stays a single subtitle');
+  assert.equal(megaSingle.name, singleSub[0].name);
+
+  const driveSingle = await cf.findBestFileInDrive('https://drive.google.com/drive/folders/x', '1', [], singleSub);
+  assert.equal(driveSingle.type, 'subtitle');
+  assert.equal(driveSingle.name, singleSub[0].name);
+
+  // The VIDEO branch is unchanged: one file (the owner has not decided the
+  // multi-episode video case yet).
+  const megaVideo = await cf.findBestFileInMegaFolder('https://mega.nz/folder/y', '01', [], VIDEOS_ONLY_FOLDER);
+  assert.equal(megaVideo.type, 'mkv');
+  assert.ok(megaVideo.node, 'the video branch still returns ONE file');
+  assert.equal(megaVideo.files, undefined);
+
+  const driveVideo = await cf.findBestFileInDrive('https://drive.google.com/drive/folders/y', '01', [], VIDEOS_ONLY_FOLDER);
+  assert.equal(driveVideo.type, 'mkv');
+  assert.equal(driveVideo.files, undefined);
 });

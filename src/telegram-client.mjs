@@ -4,13 +4,13 @@ import * as cheerio from 'cheerio';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, execFileSync, spawn } from 'node:child_process';
-import { Readable } from 'node:stream';
-import { finished } from 'node:stream/promises';
+import { Readable, Transform } from 'node:stream';
+import { finished, pipeline } from 'node:stream/promises';
 import AdmZip from 'adm-zip';
 import SevenZip from '7zip-bin';
 import { CONFIG } from './config.mjs';
 import { scrapePostPage, resolveSubtitleFromDirectory, resolveBuzzheavierDownloadUrl } from './site-scrapers.mjs';
-import { sendDocument } from './telegram.mjs';
+import { sendDocument, escapeHtml } from './telegram.mjs';
 import {
   findBestFileInMegaFolder,
   downloadMegaNode,
@@ -19,7 +19,26 @@ import {
   isDriveFolderUrl,
   findBestFileInMediafire,
   findBestFileInDrive,
-  resolveMediafireDirectDownload
+  resolveMediafireDirectDownload,
+  extractExplicitEpisodeRange,
+  orderCloudSources,
+  listingOffersSubtitles,
+  listCloudFolderFiles,
+  cloudKindOfUrl,
+  isProviderHostUrl,
+  SUBTITLE_FILE_RE,
+  logSafe,
+  redactUrl,
+  uniqueFileName,
+  nextTempTag,
+  unpackDirBytes,
+  mapWithConcurrency,
+  assertCloudBatchCaps,
+  cloudCapError,
+  isCloudCapError,
+  isCloudCapCooldownActive,
+  markCloudCapCooldown,
+  CLOUD_CAP_LIMITS
 } from './cloud-folders.mjs';
 import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
 import { downloadViaBrowser, isRocksDdlHost } from './browser-fetch.mjs';
@@ -341,6 +360,78 @@ const ARABIC_EPISODE_WORDS = [
   { p: /العاشرة/i, ep: '10' }
 ];
 
+// F2b — the Arabic ordinal word is an episode ONLY when the title is about an
+// episode. "الدفعة الأولى من ..." means "the first BATCH of ...", not "episode
+// 1": the collection word cancels the ordinal. "الحلقة الأولى ..." ("the first
+// EPISODE") is not a collection and keeps working. The numeric forms ("- 04",
+// "[04]", "S01E04") are never affected by this guard.
+const ARABIC_COLLECTION_WORDS = /(?:الدفعة|الدفعات|الجزء|الأجزاء|المجموعة|المجموعات|الباقة|الباقات|الحزمة|الرزمة)/;
+
+// M5 — the collection word and its ordinal are ADJACENT only when nothing
+// separates them: the ordinal is blanked ONLY when the collection word ends
+// at most 25 characters earlier AND the gap holds no separator
+// (":", "،", ",", ".", ";", "؛", "!", "?", a newline).
+//
+//   "الدفعة الأولى: الحلقة الأولى"  -> the first ordinal is blanked, the
+//                                      SECOND one ("الحلقة الأولى") survives
+//   "الجزء الثاني: الحلقة الثالثة"  -> the second ordinal survives
+//   "الدفعة الأولى - 004"            -> the ordinal is blanked, the number
+//                                      "004" stays the episode
+//   "الدفعة الأولى من سلسلة ..."     -> the ordinal is blanked
+//
+// The blanket suppression (ANY collection word kills EVERY ordinal) was
+// wrong: it dropped the episode of "الدفعة الأولى: الحلقة الأولى".
+const COLLECTION_GAP_MAX_CHARS = 25;
+const COLLECTION_ORDINAL_SEPARATOR = /[:،,.;؛!?\n]/;
+// X10: a genuine episode word between the collection word and the ordinal
+// breaks the adjacency too ("الجزء الثاني الحلقة الثالثة" — the second
+// ordinal belongs to the episode, not to the collection).
+const EPISODE_WORD_BREAK = /الحلق(?:ة|ات)/;
+
+export function stripCollectionAdjacentOrdinals(text) {
+  const raw = String(text ?? '');
+  if (!raw) return '';
+
+  let out = raw;
+  for (const item of ARABIC_EPISODE_WORDS) {
+    const re = new RegExp(item.p.source, 'gi');
+    let m;
+    while ((m = re.exec(out)) !== null) {
+      const ordinalStart = m.index;
+      const before = out.slice(0, ordinalStart);
+
+      // The nearest collection word that ENDS before the ordinal.
+      const cre = new RegExp(ARABIC_COLLECTION_WORDS.source, 'gi');
+      let cm;
+      let collectionEnd = -1;
+      while ((cm = cre.exec(before)) !== null) {
+        collectionEnd = cm.index + cm[0].length;
+      }
+      if (collectionEnd < 0) continue;
+
+      const gap = before.slice(collectionEnd);
+      if (gap.length > COLLECTION_GAP_MAX_CHARS) continue;   // too far away
+      if (COLLECTION_ORDINAL_SEPARATOR.test(gap)) continue;  // a separator breaks the adjacency
+      if (EPISODE_WORD_BREAK.test(gap)) continue;            // X10: an episode word breaks it too
+
+      // Blank the ordinal (the length is kept, so the other offsets stay valid).
+      out = out.slice(0, ordinalStart) + ' '.repeat(m[0].length) + out.slice(ordinalStart + m[0].length);
+      re.lastIndex = ordinalStart + m[0].length;
+    }
+  }
+  return out;
+}
+
+// m7 — is this title a COLLECTION (a batch) instead of a single episode?
+// An Arabic collection word ("الدفعة الأولى") or an explicit episode range
+// ("[01~05]") means the post asks for a BATCH: the DDL directory then holds
+// one archive per episode and the whole-batch archive must be preferred.
+export function isCollectionTitle(title) {
+  const text = String(title || '');
+  if (ARABIC_COLLECTION_WORDS.test(text)) return true;
+  return extractExplicitEpisodeRange(text).length > 1;
+}
+
 export function extractEpisodeNumber(text) {
   if (!text) return '';
   const cleaned = text.replace(/\[\+fonts?\]|\.ass|\.srt|\.zip|\.rar|\.7z/gi, '');
@@ -363,8 +454,13 @@ export function extractEpisodeNumber(text) {
     if (!isNaN(n) && n > 0) return String(n);
   }
 
+  // F2b/M5: an Arabic ordinal is an episode only when it is NOT glued to a
+  // collection word — "الدفعة الأولى من ..." ("the first BATCH of ...") is a
+  // collection, so its ordinal must not become an episode number, while
+  // "الدفعة الأولى: الحلقة الأولى" keeps the episode of the SECOND ordinal.
+  const ordinalText = stripCollectionAdjacentOrdinals(cleaned);
   for (const item of ARABIC_EPISODE_WORDS) {
-    if (item.p.test(cleaned)) return item.ep;
+    if (item.p.test(ordinalText)) return item.ep;
   }
 
   // 1. Explicit dash or episode prefixes: " - 46", " - 02", " ep 04", " episode 12", " e04", " #46"
@@ -1218,7 +1314,56 @@ export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
   return null;
 }
 
-export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContentPaths = []) {
+// F1.2 — the positions in a release file name where a number IS an episode
+// token: " - 001", "_001", " E01", " EP01", "#01". A number anywhere else
+// ("5 Cent-per-Second", "S2") belongs to the title and must survive.
+const EPISODE_TOKEN_PATTERNS = [
+  /(\s+-\s*)(\d{1,4})(?=\s|$|[\[\]().])/g,                       // " - 001"
+  /(_)(\d{1,4})(?=\s|$|[\[\]().])/g,                             // "_001"
+  /(\s+[eE][pP]?(?:isode)?\.?\s*)(\d{1,4})(?=\s|$|[\[\]().])/g,  // " E01" / " EP01"
+  /(\s*#\s*)(\d{1,4})(?=\s|$|[\[\]().])/g,                       // "#01"
+];
+
+// F1.2 — remove ONE episode token (the source file's OWN episode number)
+// from a resolved name, wherever it appears, so that a multi-episode package
+// does not promise a single episode:
+//   "Aikatsu! - 001 [1080p]" -> "Aikatsu! [1080p]"
+// Only a number in an episode-token position is touched — a number that is
+// not the file's own episode token ("5 Cent-per-Second", "S2") survives.
+function stripEpisodeTokenFromName(name, episodeNumber) {
+  if (!name || !episodeNumber) return name;
+  const target = parseInt(String(episodeNumber).replace(/^0+/, ''), 10);
+  if (!Number.isFinite(target) || target <= 0) return name;
+  let out = String(name);
+  for (const re of EPISODE_TOKEN_PATTERNS) {
+    out = out.replace(re, (match, prefix, digits) => (
+      parseInt(digits, 10) === target ? '' : match
+    ));
+  }
+  return out.replace(/\s{2,}/g, ' ').trim();
+}
+
+// m10 — the numbers that are a RESOLUTION, not an episode number. A number of
+// this list is skipped ONLY when it is not in an explicit episode-token
+// position (" - 1080" IS an episode, "Show 1080.mkv" is a resolution).
+const RESOLUTION_NUMBERS = [480, 540, 576, 720, 1080, 1440, 2160, 4320];
+
+// Is this number in an episode-token position (" - 001", "_001", " E01", "#01")?
+function isEpisodeTokenNumber(name, epNum) {
+  const target = Number(epNum);
+  if (!Number.isFinite(target)) return false;
+  for (const re of EPISODE_TOKEN_PATTERNS) {
+    const rx = new RegExp(re.source, 'gi');
+    let m;
+    while ((m = rx.exec(name)) !== null) {
+      if (m[2] !== undefined && parseInt(m[2], 10) === target) return true;
+      if (rx.lastIndex === m.index) rx.lastIndex += 1;
+    }
+  }
+  return false;
+}
+
+export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContentPaths = [], { episodeNames = fileNames } = {}) {
   const teamMatch = rawTitle.match(/^\[([^\]]+)\]/);
   let team = teamMatch ? teamMatch[1] : '';
   if (/^hoshizora(?:[-_\s]*subs?)?$/i.test(team)) team = 'ReDEJA';
@@ -1250,12 +1395,28 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
     }
   }
 
-  // Detect batch episodes from candidate subtitle files
-  const candidateSubs = candidateNames.filter(f => /\.(ass|srt)$/i.test(f));
+  // Detect the batch episodes from EVERY media file of the package (F1.1).
+  // A Blu-ray batch holds one .mkv per episode (Arabic track embedded) plus
+  // usually only ONE loose .ass — the subtitle files alone would describe a
+  // single episode, and the caption would promise "001" for a 001-004 set.
+  // m6: the episode numbers come from `episodeNames` (the caller decides
+  // WHICH files carry them) while the NAME candidates stay the caller's
+  // choice — the official/Subdl title derivation is restored.
   const epNumbers = new Set();
-  for (const sub of candidateSubs) {
-    const ep = extractEpisodeNumber(path.basename(sub));
-    if (ep) epNumbers.add(parseInt(ep, 10));
+  for (const media of (Array.isArray(episodeNames) ? episodeNames : [])) {
+    if (!media || typeof media !== 'string') continue;
+    if (!/\.(?:ass|srt|mkv|mp4|m4v)$/i.test(media)) continue;
+    const mediaBase = path.basename(media);
+    const ep = extractEpisodeNumber(mediaBase);
+    if (!ep) continue;
+    const epNum = parseInt(ep, 10);
+    if (!(epNum > 0)) continue;
+    // m10: a number of four digits is not an episode ("1080.mkv"), but a
+    // KNOWN resolution is skipped only when it is not in an episode-token
+    // position (" - 1080" IS an episode).
+    if (epNum > 9999) continue;
+    if (RESOLUTION_NUMBERS.includes(epNum) && !isEpisodeTokenNumber(mediaBase, epNum)) continue;
+    epNumbers.add(epNum);
   }
   const uniqueEps = Array.from(epNumbers).sort((a, b) => a - b);
   const isMultiEpBatch = uniqueEps.length > 1;
@@ -1296,8 +1457,13 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
 
   if (!isArabic) {
     let baseEnglish = team ? `[${team}] ${titleNoTeam}` : rawTitle;
-    if (isMultiEpBatch && !/(?:\[\s*\d+\s*[~-]\s*\d+\s*\]|\d+\s*[~-]\s*\d+)/.test(baseEnglish)) {
-      baseEnglish = `${baseEnglish} ${batchRangeStr}`;
+    if (isMultiEpBatch) {
+      // F1.2: the name comes from the post, so its OWN episode token is the
+      // one that must not survive in the title of a multi-episode package.
+      baseEnglish = stripEpisodeTokenFromName(baseEnglish, origEp);
+      if (!/(?:\[\s*\d+\s*[~-]\s*\d+\s*\]|\d+\s*[~-]\s*\d+)/.test(baseEnglish)) {
+        baseEnglish = `${baseEnglish} ${batchRangeStr}`;
+      }
     }
     return baseEnglish;
   }
@@ -1308,6 +1474,9 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
     let resolved = cleanEnglishTitleFromFilename(fn, team);
     if (resolved) {
       if (isMultiEpBatch) {
+        // F1.2: remove the episode token of the file the name came from
+        // (wherever it appears), then the range describes the whole set.
+        resolved = stripEpisodeTokenFromName(resolved, extractEpisodeNumber(path.basename(fn)));
         resolved = resolved.replace(/\s*-\s*\d{1,4}$/, '').trim();
         resolved = `${resolved} ${batchRangeStr}`;
       } else if (origEp) {
@@ -1335,6 +1504,9 @@ export function resolveEnglishTitleIfArabic(rawTitle, fileNames = [], assContent
             let resolved = cleanEnglishTitleFromFilename(t, team);
             if (resolved) {
               if (isMultiEpBatch) {
+                // F1.2: same rule as the file-name branch — the episode token
+                // of the ASS file the name came from is removed.
+                resolved = stripEpisodeTokenFromName(resolved, extractEpisodeNumber(path.basename(p)));
                 resolved = resolved.replace(/\s*-\s*\d{1,4}$/, '').trim();
                 resolved = `${resolved} ${batchRangeStr}`;
               } else if (origEp) {
@@ -1464,7 +1636,13 @@ export function formatCleanCaption(title, isZip = false, isOfficial = false, has
 }
 
 export function getSafeTelegramFileName(name, ext = '.ass') {
-  let clean = name.replace(/[\\/:*?"<>|,]+/g, ' ').replace(/\s+/g, ' ').trim();
+  let clean = String(name ?? '')
+    // M2: the C0 control characters (NUL, ESC, …) can never reach a
+    // published document name.
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/[\\/:*?"<>|,]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   const maxBaseLen = 55 - ext.length;
 
   if (clean.length > maxBaseLen) {
@@ -1663,6 +1841,59 @@ function verifyExtractedTree(destDir) {
   return true;
 }
 
+// S2 — the UNCOMPRESSED size of an archive, checked BEFORE the extraction.
+//
+// A zip bomb (a tiny archive that expands to gigabytes) must never be
+// extracted: the entry sizes are summed first and the archive is refused
+// when the total is over the cap. A listing that cannot be read is refused
+// as well (fail-closed).
+export function assertArchiveUncompressedCapped(archivePath, maxBytes = CLOUD_CAP_LIMITS.CLOUD_EXTRACT_MAX_BYTES) {
+  const ext = path.extname(archivePath).toLowerCase();
+  let total = 0;
+
+  if (ext === '.zip') {
+    const zip = new AdmZip(archivePath);
+    for (const entry of zip.getEntries()) {
+      const size = Number(entry.header && entry.header.size);
+      if (!Number.isFinite(size) || size < 0) {
+        throw cloudCapError('ARCHIVE_TOO_LARGE', 'archive listing is unreadable (fail-closed)');
+      }
+      total += size;
+      if (total > maxBytes) {
+        throw cloudCapError('ARCHIVE_TOO_LARGE', `archive refused: more than ${maxBytes} bytes uncompressed`);
+      }
+    }
+    return total;
+  }
+
+  // 7z / rar: the technical listing carries the uncompressed "Size =" of
+  // every entry.
+  let listing = null;
+  for (const tool of ['7z', SevenZip.path7za]) {
+    try {
+      listing = execFileSync(tool, ['l', '-slt', archivePath], {
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024
+      });
+      break;
+    } catch { /* try the next tool */ }
+  }
+  if (listing == null) {
+    throw cloudCapError('ARCHIVE_TOO_LARGE', 'archive listing failed (fail-closed)');
+  }
+  // The archive properties come first; the entries follow the separator.
+  const separator = listing.indexOf('----------');
+  const entriesText = separator >= 0 ? listing.slice(separator) : listing;
+  const sizes = [...entriesText.matchAll(/^Size = (\d+)\s*$/gm)].map(m => Number(m[1]));
+  if (sizes.length === 0) {
+    throw cloudCapError('ARCHIVE_TOO_LARGE', 'archive listing is unreadable (fail-closed)');
+  }
+  total = sizes.reduce((a, b) => a + b, 0);
+  if (total > maxBytes) {
+    throw cloudCapError('ARCHIVE_TOO_LARGE', `archive refused: ${total} bytes uncompressed > ${maxBytes} bytes`);
+  }
+  return total;
+}
+
 export function extractArchive(archivePath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
   const magic = validateFileMagic(archivePath);
@@ -1718,6 +1949,16 @@ export function extractArchive(archivePath, destDir) {
     console.warn(`   ⚠️ Refusing to extract ${path.basename(archivePath)}: listing error (fail-closed): ${e.message}`);
     return false;
   }
+  // S2: the UNCOMPRESSED size of the archive is checked BEFORE anything is
+  // extracted (a zip bomb is refused here). The temp extraction dir is
+  // removed on the refusal.
+  try {
+    assertArchiveUncompressedCapped(archivePath);
+  } catch (e) {
+    console.warn(`   ⚠️ Refusing to extract ${logSafe(path.basename(archivePath))}: ${logSafe(e && e.message)}`);
+    try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { }
+    return false;
+  }
   if (ext === '.zip') {
     try {
       const zip = new AdmZip(archivePath);
@@ -1767,14 +2008,18 @@ export function packFolderToZip(folderPath, destZipPath) {
   function addRecursive(dir, zipSubDir = '') {
     const items = fs.readdirSync(dir, { withFileTypes: true });
     for (const item of items) {
+      // m3: the ENTRY name is sanitized again (defense-in-depth, like
+      // packToZip): the file itself is still read under its REAL name.
+      const safeName = safeRemoteBaseName(item.name, 'entry');
       const fullPath = path.join(dir, item.name);
+      if (!isInsideDir(fullPath, folderPath)) throw new Error('unsafe cloud file name: ' + item.name);
       if (item.isDirectory()) {
-        addRecursive(fullPath, zipSubDir ? `${zipSubDir}/${item.name}` : item.name);
+        addRecursive(fullPath, zipSubDir ? `${zipSubDir}/${safeName}` : safeName);
       } else if (/\.(ass|srt)$/i.test(item.name)) {
-        zip.addLocalFile(fullPath, zipSubDir);
+        zip.addLocalFile(fullPath, zipSubDir, safeName);
       } else if (/\.(ttf|otf|woff2?|ttc)$/i.test(item.name)) {
         const targetFontDir = zipSubDir || 'Fonts';
-        zip.addLocalFile(fullPath, targetFontDir);
+        zip.addLocalFile(fullPath, targetFontDir, safeName);
       }
     }
   }
@@ -1793,6 +2038,9 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
     }
   };
   const expectedHost = options.expectedHost ? String(options.expectedHost).toLowerCase() : null;
+  // The per-file cap (M6/C7b/C10): a hostile server must not be able to fill
+  // the disk with ONE file.
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : null;
   const assertHost = res => {
     if (!expectedHost) return;
     const actualHost = new URL(res.url).hostname.toLowerCase();
@@ -1826,7 +2074,7 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
       const confirmedUrl = new URL(action, res.url);
       confirmedUrl.search = params.toString();
       console.log('   ↪️ Confirming public Google Drive download.');
-      res = await fetch(confirmedUrl, requestOptions);
+      res = await fetch(confirmedUrl.toString(), requestOptions);
       assertHost(res);
       if (!res.ok) throw new Error(`Google Drive confirmation returned HTTP ${res.status}`);
     }
@@ -1836,9 +2084,50 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
     throw new Error('Download returned HTML instead of a file');
   }
 
+  // The declared size is checked BEFORE the first byte is written.
+  if (maxBytes) {
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw cloudCapError('FILE_TOO_LARGE', `download refused: ${declared} bytes > ${maxBytes} bytes`);
+    }
+  }
+
   const fileStream = fs.createWriteStream(destPath, { flags: 'w' });
-  await finished(Readable.fromWeb(res.body).pipe(fileStream));
+  try {
+    // The bytes are counted WHILE they arrive (a lying Content-Length does
+    // not help: the counter aborts the download and the partial file is
+    // removed).
+    const source = Readable.fromWeb(res.body);
+    await (maxBytes
+      ? pipeline(source, byteCounter(maxBytes), fileStream)
+      : pipeline(source, fileStream));
+  } catch (e) {
+    // The partial file NEVER survives a refused/failed download (M7).
+    try {
+      if (!fileStream.closed) {
+        fileStream.destroy();
+        await new Promise(resolve => fileStream.once('close', resolve));
+      }
+    } catch { }
+    try { fs.rmSync(destPath, { force: true }); } catch { }
+    throw e;
+  }
   return destPath;
+}
+
+// A stream transform that refuses a body larger than `maxBytes` (M6).
+function byteCounter(maxBytes) {
+  let received = 0;
+  return new Transform({
+    transform(chunk, _enc, callback) {
+      received += chunk.length;
+      if (received > maxBytes) {
+        callback(cloudCapError('FILE_TOO_LARGE', `download refused: more than ${maxBytes} bytes`));
+        return;
+      }
+      callback(null, chunk);
+    }
+  });
 }
 
 // ====================================================================
@@ -2361,15 +2650,30 @@ export async function publishDocument(client, filePath, caption, options = {}) {
       const uploadTimeoutMs = Math.max(180_000, Math.ceil(fileSize / (40 * 1024)) * 1000); // at least 3m, or calculated from size
       const uploadPromise = client.sendFile(channel, {
         file: filePath,
-        caption: caption,
+        // M8: the MTProto transport sends with parseMode 'html', so the
+        // caption MUST be escaped here. The Bot API transport escapes its
+        // own copy inside sendDocument (telegram.mjs) — each transport
+        // escapes EXACTLY ONCE, the caption that reaches publishDocument is
+        // always the raw one (the Bot API failure falls through to this
+        // path with the same raw caption).
+        caption: escapeHtml(caption),
         parseMode: 'html',
         forceDocument: true,
         workers: 4
       });
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`MTProto upload timed out after ${Math.round(uploadTimeoutMs / 1000)}s`)), uploadTimeoutMs)
-      );
-      const sent = await Promise.race([uploadPromise, timeoutPromise]);
+      // The upload timeout timer must be RELEASED when the race is over:
+      // an uncleared timer keeps the process alive for minutes after the
+      // document was published (it also blocks the test runner from exiting).
+      let uploadTimer = null;
+      const timeoutPromise = new Promise((_, reject) => {
+        uploadTimer = setTimeout(() => reject(new Error(`MTProto upload timed out after ${Math.round(uploadTimeoutMs / 1000)}s`)), uploadTimeoutMs);
+      });
+      let sent;
+      try {
+        sent = await Promise.race([uploadPromise, timeoutPromise]);
+      } finally {
+        if (uploadTimer) clearTimeout(uploadTimer);
+      }
       if (sent) {
         console.log(`   ✅ Successfully posted via MTProto! (Message ID: ${sent.id})`);
         return { ok: true, result: { message_id: sent.id } };
@@ -2418,6 +2722,200 @@ export async function dispatchBatchExtractor(torrentUrl, releaseTitle, chatId, l
   } catch (e) {
     console.warn(`   ⚠️ sub-extractor dispatch network error:`, e.message);
     return false;
+  }
+}
+
+// ====================================================================
+// Cloud source selection (F2c) and cloud subtitle packages (F2d)
+// ====================================================================
+
+/**
+ * F2c — the cloud sources of a post page, ordered so that a SUBTITLE-bearing
+ * source is tried BEFORE a video source.
+ *
+ * A post can offer the same batch twice: as a folder of .ass subtitles (light,
+ * publishable whole as ONE package) and as a folder of .mkv videos (heavy,
+ * publishable one episode at a time). The production log showed the video
+ * folder winning, and only episode 001 being published.
+ *
+ * The post's SUBTITLE button (`videoLinks.directSub`) is the subtitle source
+ * BY CONSTRUCTION — the scraper only puts a link there when the post presents
+ * it as the subtitle/archive link — and it may be a cloud FOLDER, which the
+ * plain direct download skips. The other cloud links are inspected with a
+ * folder LISTING (no file is downloaded for that).
+ *
+ * M1 — the listing of every candidate is CARRIED by the candidate
+ * (`source.listing`), so the download path does NOT list the folder a second
+ * time. The lister is injectable (`options.listFolder`) for the tests; it is
+ * called AT MOST ONCE per candidate and NEVER for a `directSub` candidate
+ * (that one is a subtitle source by construction).
+ */
+export async function buildPostCloudSources(videoLinks = {}, options = {}) {
+  const { listFolder = listCloudFolderFiles } = options || {};
+  const vl = videoLinks || {};
+
+  // m12: a post without any cloud link is not inspected at all.
+  if (!vl.mediafire && !vl.mega && !vl.drive && !vl.directSub) return [];
+
+  const candidates = [];
+  const add = (kind, url, offersSubtitles = false) => {
+    if (!url) return;
+    const existing = candidates.find(c => c.kind === kind && c.url === url);
+    if (existing) {
+      if (offersSubtitles) existing.offersSubtitles = true;
+      return;
+    }
+    candidates.push({ kind, url, offersSubtitles });
+  };
+
+  // The subtitle button of the post (may be a cloud FOLDER of .ass files).
+  // m5: the provider is decided by the HOSTNAME, never by a substring of the
+  // whole url (a hostile link can carry "mega.nz" anywhere).
+  const directSub = vl.directSub;
+  if (directSub) {
+    const directKind = cloudKindOfUrl(directSub);
+    if (directKind) add(directKind, directSub, true);
+  }
+
+  // The softsub providers (usually the videos).
+  // X3: the provider of a field is decided by its HOSTNAME — a field that
+  // points somewhere else (a hostile link that merely mentions
+  // "mediafire.com") is DROPPED instead of being fetched server-side.
+  for (const [kind, value] of [['mediafire', vl.mediafire], ['mega', vl.mega], ['drive', vl.drive]]) {
+    if (!value) continue;
+    if (!isProviderHostUrl(value, kind)) {
+      console.warn(`   ⚠️ ${kind} link ignored: it is not hosted by ${kind} (${redactUrl(value)})`);
+      continue;
+    }
+    add(kind, value);
+  }
+
+  // A source that holds subtitle files is detected from its folder LISTING.
+  let listedSources = 0;
+  let listedFiles = 0;
+  let listingErrors = 0;
+  for (const c of candidates) {
+    if (c.offersSubtitles) continue;
+    const listing = await listFolder(c.kind, c.url);
+    listedSources += 1;
+    if (listing == null) {
+      // m11: a FAILED listing is not an empty folder — it is remembered so
+      // the caller can tell them apart.
+      c.listingError = true;
+      c.listing = [];
+      listingErrors += 1;
+      continue;
+    }
+    c.listing = Array.isArray(listing) ? listing : [];
+    listedFiles += c.listing.length;
+    if (listingOffersSubtitles(c.listing)) c.offersSubtitles = true;
+  }
+  console.log(`   ℹ️ Cloud listings: ${listedSources} source(s), ${listedFiles} file(s), ${listingErrors} failure(s).`);
+
+  return orderCloudSources(candidates);
+}
+
+/**
+ * F2d — download a cloud SUBTITLE selection. One file is downloaded as it is;
+ * several files are downloaded and packed into ONE package (the file names are
+ * kept, the fonts are not touched here — that is the release path's job).
+ *
+ * M6 — the batch is refused BEFORE the first download when it holds too many
+ * files or too many bytes; M7 — the unpack directory never survives the call
+ * (not on success and not on a failure) and a failed single download leaves
+ * no partial file behind.
+ */
+export async function downloadCloudSubtitleSelection(selection, destDir, referer, options = {}) {
+  const {
+    downloadNode = downloadMegaNode,
+    downloadFile = downloadFileToDisk,
+    packFolder = packFolderToZip,
+  } = options || {};
+
+  if (!selection) return null;
+
+  const files = selection.type === 'subtitles' && Array.isArray(selection.files) ? selection.files : [];
+  const single = files.length === 1 ? files[0] : (files.length === 0 ? selection : null);
+
+  if (single) {
+    // X5: the cap depends on the TYPE of the selection — a subtitle file is
+    // bounded by SUB_MAX_FILE_BYTES (64 MiB), a video/archive by
+    // CLOUD_FILE_MAX_BYTES (4 GiB, the Telegram ceiling). A real MKV must
+    // NOT be aborted by the subtitle cap.
+    const isSubtitle = single.type !== 'mkv' && SUBTITLE_FILE_RE.test(String(single.name || ''));
+    const maxBytes = isSubtitle
+      ? CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES
+      : CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES;
+    if (isSubtitle) {
+      // The per-file cap of a single subtitle (C7b/C10).
+      assertCloudBatchCaps([single]);
+    } else {
+      // The listed size of a video/archive is checked against the video cap.
+      const listedSize = Number(single.size);
+      if (Number.isFinite(listedSize) && listedSize > maxBytes) {
+        throw cloudCapError('FILE_TOO_LARGE', `cloud file refused: ${listedSize} bytes > ${maxBytes} bytes`);
+      }
+    }
+    const dest = path.join(destDir, uniqueFileName(safeRemoteBaseName(single.name, nextTempTag('cloud_file'))));
+    if (!isInsideDir(dest, destDir)) throw new Error('unsafe cloud file name: ' + single.name);
+    try {
+      if (single.node) await downloadNode(single.node, dest, destDir, { maxBytes });
+      else if (single.directUrl) await downloadFile(single.directUrl, dest, { Referer: referer }, { maxBytes });
+      else return null;
+    } catch (e) {
+      // The partial file NEVER survives a failed download (M7).
+      try { fs.rmSync(dest, { force: true }); } catch { }
+      throw e;
+    }
+    return fs.existsSync(dest) ? dest : null;
+  }
+
+  // Several subtitles: ONE package (the same pattern as the Drive release).
+  // The cap is checked BEFORE the first download and BEFORE the unpack
+  // directory exists (M6).
+  assertCloudBatchCaps(files);
+
+  const unpackDir = path.join(destDir, nextTempTag('cloud_unpack'));
+  fs.mkdirSync(unpackDir, { recursive: true });
+  const usedNames = new Set();
+  try {
+    // P2: the destination names are computed FIRST (sequentially, so the
+    // unique names can never race), then the downloads run with a BOUNDED
+    // parallelism.
+    const targets = files.map(f => ({
+      file: f,
+      dest: path.join(unpackDir, uniqueFileName(safeRemoteBaseName(f.name, nextTempTag('cloud_file')), usedNames)),
+    }));
+    for (const t of targets) {
+      if (!isInsideDir(t.dest, unpackDir)) throw new Error('unsafe cloud file name: ' + t.file.name);
+    }
+    await mapWithConcurrency(targets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
+      const f = t.file;
+      if (f.node) await downloadNode(f.node, t.dest, unpackDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+      else await downloadFile(f.directUrl, t.dest, { Referer: referer }, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+    });
+    // C7c: the listing of a direct-URL source carries no reliable size, so
+    // the batch total is checked AFTER the download (a stat of the files).
+    const totalBytes = unpackDirBytes(unpackDir);
+    if (totalBytes > CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES) {
+      throw cloudCapError(
+        'BATCH_TOO_LARGE',
+        `cloud batch refused: ${Math.round(totalBytes / 1024 / 1024)} MiB > ${Math.round(CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES / 1024 / 1024)} MiB`
+      );
+    }
+    const zipPath = path.join(destDir, `${nextTempTag('cloud_bundle')}.zip`);
+    // X11: a failed pack leaves no partial zip behind.
+    try {
+      packFolder(unpackDir, zipPath);
+    } catch (e) {
+      try { fs.rmSync(zipPath, { force: true }); } catch { }
+      throw e;
+    }
+    return fs.existsSync(zipPath) ? zipPath : null;
+  } finally {
+    // The unpack directory NEVER survives the call (M7) — not on success and
+    // not on a failure in the middle of the loop.
+    try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch { }
   }
 }
 
@@ -2760,7 +3258,7 @@ export async function checkTelegramChannels(existingClient = null) {
                 safeMoveFile(extracted.filePath, finalPath);
 
                 const caption = formatCleanCaption(effectiveTitle, false, true);
-                console.log(`   📤 Publishing official sub: "${caption}" (filename: ${cleanFileName})`);
+                console.log(`   📤 Publishing official sub: "${logSafe(caption)}" (filename: ${logSafe(cleanFileName)})`);
                 const sendResult = await publishDocument(client, finalPath, caption);
 
                 if (sendResult?.ok) {
@@ -2847,11 +3345,11 @@ export async function checkTelegramChannels(existingClient = null) {
                   continue;
                 }
 
-                console.log(`\n✨ [Subdl Direct File] "${cleanTitle}" (${originalName})`);
+                console.log(`\n✨ [Subdl Direct File] "${logSafe(cleanTitle)}" (${logSafe(originalName)})`);
                 const localFilePath = path.join(OUT_DIR, `doc_${msg.id}_${safeRemoteBaseName(originalName)}`);
                 if (!isInsideDir(localFilePath, OUT_DIR)) {
                   countSkipped(msgKey); // unsafe path
-                  console.warn(`   ⚠️ Skipping "${cleanTitle}": unsafe document file name "${originalName}".`);
+                  console.warn(`   ⚠️ Skipping "${logSafe(cleanTitle)}": unsafe document file name "${logSafe(originalName)}".`);
                   continue;
                 }
 
@@ -2903,16 +3401,32 @@ export async function checkTelegramChannels(existingClient = null) {
                           const extractDir = path.join(OUT_DIR, `unpack_batch_${msg.id}`);
                           if (extractArchive(localFilePath, extractDir)) {
                             const allExt = [];
+                            const allExtracted = [];
                             function scanSubdlA(dir) {
                               for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
                                 const full = path.join(dir, f.name);
                                 if (f.isDirectory()) scanSubdlA(full);
-                                else if (/\.(ass|srt)$/i.test(f.name)) allExt.push(full);
+                                else {
+                                  // F1.3: EVERY extracted file is kept — the video names
+                                  // carry the episode numbers of the package.
+                                  allExtracted.push(full);
+                                  if (/\.(ass|srt)$/i.test(f.name)) allExt.push(full);
+                                }
                               }
                             }
                             scanSubdlA(extractDir);
                             if (allExt.length === 1) {
-                              cleanTitle = resolveEnglishTitleIfArabic(cleanTitle, [path.basename(allExt[0]), originalName], [allExt[0]]);
+                              // F1.3: the whole package contributes its episode
+                              // numbers (the videos) — but the NAME still comes
+                              // from the .ass chain (m6): the pre-patch name
+                              // candidates are kept, the episode detection runs
+                              // over `allExtracted`.
+                              cleanTitle = resolveEnglishTitleIfArabic(
+                                cleanTitle,
+                                [path.basename(allExt[0]), originalName],
+                                [allExt[0]],
+                                { episodeNames: allExtracted }
+                              );
                               const sExt = path.extname(allExt[0]).toLowerCase();
                               const properSubName = getSafeTelegramFileName(cleanTitle, sExt);
                               const renamedSub = path.join(path.dirname(allExt[0]), properSubName);
@@ -2949,7 +3463,7 @@ export async function checkTelegramChannels(existingClient = null) {
                       }
 
                       const caption = formatCleanCaption(cleanTitle, validated.isArchive, isOfficialPlatformRelease(cleanTitle), hasArchiveFonts);
-                      console.log(`   📤 Publishing Subdl direct file: "${caption}" (filename: ${cleanFileName})`);
+                      console.log(`   📤 Publishing Subdl direct file: "${logSafe(caption)}" (filename: ${logSafe(cleanFileName)})`);
                       const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
@@ -3132,8 +3646,15 @@ export async function checkTelegramChannels(existingClient = null) {
                     continue;
                   }
 
-                  // Resolve English title from extracted subtitle filenames and ASS headers if rawTitle is Arabic
-                  rawTitle = resolveEnglishTitleIfArabic(rawTitle, subFiles, subFiles);
+                  // Resolve English title from the extracted files and the ASS headers if rawTitle is Arabic.
+                  // F1.1: the WHOLE package takes part in the episode detection — a Blu-ray
+                  // batch holds one .mkv per episode and usually only ONE loose .ass, so
+                  // the subtitle files alone would describe a single episode ("001") for a
+                  // 001-004 set.
+                  // m6: the NAME candidates are the pre-patch ones (the subtitle files
+                  // only — a stray video must never hijack the release name), the
+                  // episode detection runs over `allExtractedFiles`.
+                  rawTitle = resolveEnglishTitleIfArabic(rawTitle, subFiles, subFiles, { episodeNames: allExtractedFiles });
 
                   // If single subtitle file in unpackDir, rename it to rawTitle if it has a generic or arabic name
                   if (subFiles.length === 1) {
@@ -3173,7 +3694,7 @@ export async function checkTelegramChannels(existingClient = null) {
                   }
 
                   const caption = formatCleanCaption(rawTitle, isArchiveRelease, isOfficialSubdl, hasFonts);
-                  console.log(`   📤 Publishing to channel: "${caption}" (filename: ${path.basename(finalFilePath)})`);
+                  console.log(`   📤 Publishing to channel: "${logSafe(caption)}" (filename: ${logSafe(path.basename(finalFilePath))})`);
                   const sendResult = await publishDocument(client, finalFilePath, caption);
 
                   if (sendResult?.ok) {
@@ -3232,11 +3753,11 @@ export async function checkTelegramChannels(existingClient = null) {
                   continue;
                 }
 
-                console.log(`\n✨ [LazySano Direct File] "${titleLine}" (${originalName})`);
+                console.log(`\n✨ [LazySano Direct File] "${logSafe(titleLine)}" (${logSafe(originalName)})`);
                 const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}`));
                 if (!isInsideDir(localFilePath, OUT_DIR)) {
                   countSkipped(msgKey); // unsafe path
-                  console.warn(`   ⚠️ Skipping LazySano direct file: unsafe document file name "${originalName}".`);
+                  console.warn(`   ⚠️ Skipping LazySano direct file: unsafe document file name "${logSafe(originalName)}".`);
                   continue;
                 }
 
@@ -3250,7 +3771,7 @@ export async function checkTelegramChannels(existingClient = null) {
                       safeMoveFile(localFilePath, finalPath);
 
                       const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                      console.log(`   📤 Publishing LazySano release: "${caption}"`);
+                      console.log(`   📤 Publishing LazySano release: "${logSafe(caption)}"`);
                       const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
@@ -3298,7 +3819,10 @@ export async function checkTelegramChannels(existingClient = null) {
               const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
               const postPageUrl = urlMatches.find(u => !u.includes('t.me') && !u.includes('twitter'));
               if (postPageUrl) {
-                const pageData = await scrapePostPage(postPageUrl, null, extractEpisodeNumber(titleLine) || null, titleLine);
+                // m7: a collection title ("الدفعة الأولى", "[01~05]") asks for
+                // the WHOLE batch — the DDL directory then holds one archive
+                // per episode and the whole-batch archive must be preferred.
+                const pageData = await scrapePostPage(postPageUrl, null, extractEpisodeNumber(titleLine) || null, titleLine, { batch: isCollectionTitle(titleLine) });
                 // P1-1b: a negative-cached candidate was already fetched and
                 // found to have NO link — the request was not made again. It
                 // is logged distinctly and left unclassified on purpose: the
@@ -3324,40 +3848,58 @@ export async function checkTelegramChannels(existingClient = null) {
                     if (mfBest?.directUrl && mfBest.type === 'subtitle') directUrl = mfBest.directUrl;
                   }
                   if (!directUrl && pageData.videoLinks?.mega) {
-                    const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega);
-                    if (megaBest?.node && megaBest.type === 'subtitle') {
-                      try {
-                        const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}_${safeRemoteBaseName(megaBest.name)}`);
-                        if (!isInsideDir(tempDest, OUT_DIR)) throw new Error(`unsafe mega file name: ${megaBest.name}`);
-                        await downloadMegaNode(megaBest.node, tempDest, OUT_DIR);
-                        const validated = validateFileMagic(tempDest);
-                        if (validated) {
-                          const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
-                          const finalPath = path.join(OUT_DIR, cleanFileName);
-                          safeMoveFile(tempDest, finalPath);
+                    // M6/C11: a Mega source that already refused a cap is in
+                    // cooldown (6 h) — it is not retried on every cycle.
+                    if (isCloudCapCooldownActive('mega', pageData.videoLinks.mega)) {
+                      console.warn(`   ⏳ Mega skipped: a cap refusal is in cooldown for ${redactUrl(pageData.videoLinks.mega)}`);
+                    } else {
+                      const megaBest = await findBestFileInMegaFolder(pageData.videoLinks.mega);
+                      // F2d: a multi-episode Mega folder of subtitles is ONE
+                      // package (the selection is packed by the shared helper).
+                      if (megaBest && (megaBest.node || megaBest.type === 'subtitles') && megaBest.type !== 'mkv') {
+                        let tempDest = null;
+                        try {
+                          tempDest = await downloadCloudSubtitleSelection(megaBest, OUT_DIR, postPageUrl);
+                          if (tempDest) {
+                            const validated = validateFileMagic(tempDest);
+                            if (validated) {
+                              const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
+                              const finalPath = path.join(OUT_DIR, cleanFileName);
+                              safeMoveFile(tempDest, finalPath);
 
-                          const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                          console.log(`   📤 Publishing LazySano post link: "${caption}"`);
-                          const sendResult = await publishDocument(client, finalPath, caption);
-                          if (sendResult?.ok) {
-                            countPublished(msgKey);
-                            markReleaseAsPosted(posted, msgKey, releaseKeys);
-                          } else {
-                            // No failure branch existed here (F-10).
-                            countFailed(msgKey);
-                            console.error(`   ❌ Failed to send document:`, sendResult);
+                              const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                              console.log(`   📤 Publishing LazySano post link: "${logSafe(caption)}"`);
+                              const sendResult = await publishDocument(client, finalPath, caption);
+                              if (sendResult?.ok) {
+                                countPublished(msgKey);
+                                markReleaseAsPosted(posted, msgKey, releaseKeys);
+                              } else {
+                                // No failure branch existed here (F-10).
+                                countFailed(msgKey);
+                                console.error(`   ❌ Failed to send document:`, sendResult);
+                              }
+                              fs.rmSync(finalPath, { force: true });
+                              continue;
+                            }
+                            fs.rmSync(tempDest, { force: true });
                           }
-                          fs.rmSync(finalPath, { force: true });
-                          continue;
+                        } catch (e) {
+                          // M7/C13: the failure is NOT swallowed silently any
+                          // more and the partial file is removed.
+                          console.warn('   ⚠️ LazySano cloud download failed: ' + logSafe(e && e.message));
+                          if (tempDest) { try { fs.rmSync(tempDest, { force: true }); } catch { } }
                         }
-                        fs.rmSync(tempDest, { force: true });
-                      } catch { }
+                      }
                     }
                   }
                   if (directUrl) {
+                    let tempDest = null;
                     try {
-                      const tempDest = path.join(OUT_DIR, `lazy_${Date.now()}`);
+                      tempDest = path.join(OUT_DIR, nextTempTag('lazy'));
                       const dlOptions = pageData?.source === 'mugi-worker' ? { expectedHost: new URL(directUrl).hostname } : {};
+                      // X4: a direct (non-subtitle) payload is bounded by the
+                      // 4 GiB ceiling.
+                      dlOptions.maxBytes = CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES;
                       await downloadFileToDisk(directUrl, tempDest, {}, dlOptions);
                       const validated = validateFileMagic(tempDest);
                       if (validated) {
@@ -3366,7 +3908,7 @@ export async function checkTelegramChannels(existingClient = null) {
                         safeMoveFile(tempDest, finalPath);
 
                         const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                        console.log(`   📤 Publishing LazySano post link: "${caption}"`);
+                        console.log(`   📤 Publishing LazySano post link: "${logSafe(caption)}"`);
                         const sendResult = await publishDocument(client, finalPath, caption);
                         if (sendResult?.ok) {
                           countPublished(msgKey);
@@ -3380,7 +3922,12 @@ export async function checkTelegramChannels(existingClient = null) {
                         continue;
                       }
                       fs.rmSync(tempDest, { force: true });
-                    } catch { }
+                    } catch (e) {
+                      // M7/C13: the failure is NOT swallowed silently any more
+                      // and the partial file is removed.
+                      console.warn('   ⚠️ LazySano cloud download failed: ' + logSafe(e && e.message));
+                      if (tempDest) { try { fs.rmSync(tempDest, { force: true }); } catch { } }
+                    }
                   }
                 }
               }
@@ -3419,11 +3966,11 @@ export async function checkTelegramChannels(existingClient = null) {
             const ext = path.extname(originalName).toLowerCase();
 
             if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
-              console.log(`\n✨ [Fansub Attachment] "${titleLine}" (${originalName})`);
+              console.log(`\n✨ [Fansub Attachment] "${logSafe(titleLine)}" (${logSafe(originalName)})`);
               const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}.ass`));
               if (!isInsideDir(localFilePath, OUT_DIR)) {
                 countSkipped(msgKey); // unsafe path
-                console.warn(`   ⚠️ Skipping fansub attachment: unsafe document file name "${originalName}".`);
+                console.warn(`   ⚠️ Skipping fansub attachment: unsafe document file name "${logSafe(originalName)}".`);
                 continue;
               }
 
@@ -3442,7 +3989,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     safeMoveFile(localFilePath, finalPath);
 
                     const caption = formatCleanCaption(titleLine, validated.isArchive, false);
-                    console.log(`   📤 Publishing to channel: "${caption}"`);
+                    console.log(`   📤 Publishing to channel: "${logSafe(caption)}"`);
                     const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
@@ -3463,7 +4010,7 @@ export async function checkTelegramChannels(existingClient = null) {
                   // publications. It is a failure: nothing publishable came
                   // out of the download.
                   countFailed(msgKey);
-                  console.error(`   ❌ Fansub attachment is not a usable subtitle file: "${originalName}"`);
+                  console.error(`   ❌ Fansub attachment is not a usable subtitle file: "${logSafe(originalName)}"`);
                   fs.rmSync(localFilePath, { force: true });
                   continue;
                 }
@@ -3471,7 +4018,7 @@ export async function checkTelegramChannels(existingClient = null) {
                 // empty) — the message must still end in exactly one
                 // terminal classification.
                 countFailed(msgKey);
-                console.error(`   ❌ Fansub attachment download produced no usable file: "${originalName}"`);
+                console.error(`   ❌ Fansub attachment download produced no usable file: "${logSafe(originalName)}"`);
               } catch (e) {
                 countFailed(msgKey);
                 console.warn(`   ⚠️ Fansub attachment download error:`, e.message);
@@ -3496,7 +4043,7 @@ export async function checkTelegramChannels(existingClient = null) {
             .sort((a, b) => a.priority - b.priority);
 
           for (const { url: postPageUrl, site: matchingSite } of postPageCandidates) {
-            console.log(`\n✨ [Fansub Post] "${titleLine}"`);
+            console.log(`\n✨ [Fansub Post] "${logSafe(titleLine)}"`);
             console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
             const targetEp = extractEpisodeNumber(titleLine);
             const pageData = await scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine);
@@ -3530,16 +4077,21 @@ export async function checkTelegramChannels(existingClient = null) {
                   if (resolved) directUrl = resolved;
                 }
                 if (directUrl && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directUrl) && !/\.(ass|srt|zip|rar|7z)$/i.test(directUrl)) {
-                  const resolved = await resolveSubtitleFromDirectory(directUrl, targetEp);
+                  // X7: the same batch option as the LazySano caller — a
+                  // collection title asks for the whole batch.
+                  const resolved = await resolveSubtitleFromDirectory(directUrl, targetEp, { batch: isCollectionTitle(titleLine) });
                   if (resolved) directUrl = resolved;
                 }
 
                 // Skip folder URLs from direct single-file HTTP download
                 if (directUrl && !isDriveFolderUrl(directUrl) && !directUrl.includes('mega.nz')) {
                   try {
-                    console.log(`   📥 Direct download: ${directUrl}`);
+                    console.log(`   📥 Direct download: ${redactUrl(directUrl)}`);
                     const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
                     const dlOptions = pageData?.source === 'mugi-worker' ? { expectedHost: new URL(directUrl).hostname } : {};
+                    // X4: a direct (non-subtitle) payload is bounded by the
+                    // 4 GiB ceiling.
+                    dlOptions.maxBytes = CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES;
                     if (isRocksDdlHost(directUrl)) {
                       // Rocks-Team DDL needs the browser's Cloudflare cookie.
                       const ok = await downloadViaBrowser(directUrl, tempDest);
@@ -3553,125 +4105,158 @@ export async function checkTelegramChannels(existingClient = null) {
                   }
                 }
 
-                // 2. Mediafire (Direct file or Folder)
-                if (!downloadedFilePath && pageData.videoLinks?.mediafire) {
-                  console.log(`   📥 Resolving Mediafire: ${pageData.videoLinks.mediafire}`);
-                  try {
-                    const mfBest = await findBestFileInMediafire(pageData.videoLinks.mediafire, targetEp);
-                    if (mfBest && mfBest.directUrl) {
-                      if (mfBest.type === 'subtitle' || toolsAvailable) {
-                        console.log(`   📥 Downloading from Mediafire (${mfBest.type}): ${mfBest.name}`);
-                        const tempDest = path.join(fansubWorkDir, `mf_${Date.now()}_${safeRemoteBaseName(mfBest.name)}`);
-                        if (!isInsideDir(tempDest, fansubWorkDir)) throw new Error(`unsafe mediafire file name: ${mfBest.name}`);
-                        await downloadFileToDisk(mfBest.directUrl, tempDest, { Referer: postPageUrl });
-                        if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
-                      } else {
-                        // DEFERRED — the media tools are missing, so the release
-                        // is postponed (never a failure) and is NOT marked as
-                        // posted, so it is retried once the tools exist.
-                        countDeferred(msgKey);
-                        console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
-                      }
-                    }
-                  } catch (e) {
-                    console.warn(`   ⚠️ Mediafire download failed:`, e.message);
+                // 2-4. Cloud sources (Mediafire / Mega / Google Drive).
+                //      F2c: a SUBTITLE-bearing source is tried BEFORE a video
+                //      source — the subtitles are ~100x lighter and a folder of
+                //      them can be published whole as ONE package, while a
+                //      folder of videos can only be published one episode at a
+                //      time (the production log picked the Mega MKV folder and
+                //      published episode 001 only).
+                //      F2d: a multi-subtitle selection is packed into ONE release.
+                //      M1: the listing of every source is carried by the source
+                //      (the folder is NOT listed a second time) — and the cloud
+                //      resolution is skipped entirely when the file is already
+                //      downloaded.
+                const cloudSources = downloadedFilePath ? [] : await buildPostCloudSources(pageData.videoLinks);
+                // M4: only an EXPLICIT episode range narrows a cloud folder — a
+                // title with a single episode number never narrows a
+                // multi-episode folder (m9).
+                const titleEps = extractExplicitEpisodeRange(titleLine || '');
+                const CLOUD_LABEL = { mediafire: 'Mediafire', mega: 'Mega', drive: 'Google Drive' };
+                for (const source of cloudSources) {
+                  if (downloadedFilePath) break;
+                  const sourceLabel = CLOUD_LABEL[source.kind] || source.kind;
+                  // M6: a source that already refused a cap is in cooldown
+                  // (6 h) — it is not retried on every cycle.
+                  if (isCloudCapCooldownActive(source.kind, source.url)) {
+                    console.warn(`   ⏳ ${sourceLabel} skipped: a cap refusal is in cooldown for ${redactUrl(source.url)}`);
+                    continue;
                   }
-                }
-
-                // 3. Mega (Direct file or Folder via pure JS megajs)
-                const megaCandidate = (pageData.videoLinks?.directSub && pageData.videoLinks.directSub.includes('mega.nz'))
-                  ? pageData.videoLinks.directSub
-                  : pageData.videoLinks?.mega;
-
-                if (!downloadedFilePath && megaCandidate) {
-                  console.log(`   📥 Resolving Mega: ${megaCandidate}`);
+                  // The listing of the source (M1) — it is passed to the
+                  // downloader so the folder is listed ONCE per post.
+                  const listing = (Array.isArray(source.listing) && source.listing.length > 0) ? source.listing : null;
+                  console.log(`   📥 Resolving ${sourceLabel}: ${redactUrl(source.url)}`);
                   try {
-                    const megaRelease = await downloadMegaFolderRelease(megaCandidate, fansubWorkDir, targetEp);
-                    if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
-                      downloadedFilePath = megaRelease.filePath;
-                    }
-                  } catch (e) {
-                    console.warn(`   ⚠️ Mega JS download failed:`, e.message);
-                  }
-                }
-
-                // 4. Google Drive (Direct file or Folder release with fonts)
-                const driveCandidate = (pageData.videoLinks?.directSub && isDriveFolderUrl(pageData.videoLinks.directSub))
-                  ? pageData.videoLinks.directSub
-                  : pageData.videoLinks?.drive;
-
-                if (!downloadedFilePath && driveCandidate) {
-                  console.log(`   📥 Resolving Google Drive: ${driveCandidate}`);
-                  try {
-                    if (isDriveFolderUrl(driveCandidate)) {
-                      const driveRelease = await downloadDriveFolderRelease(
-                        driveCandidate,
-                        fansubWorkDir,
-                        targetEp,
-                        pageData.videoLinks?.fonts,
-                        titleLine
-                      );
-                      if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
-                        downloadedFilePath = driveRelease.filePath;
-                      }
-                    }
-
-                    if (!downloadedFilePath) {
-                      const driveBest = await findBestFileInDrive(driveCandidate, targetEp);
-                      if (driveBest && driveBest.directUrl) {
-                        if (driveBest.type === 'subtitle' || toolsAvailable) {
-                          console.log(`   📥 Downloading from Drive (${driveBest.type}): ${driveBest.name}`);
-                          const tempDest = path.join(fansubWorkDir, safeRemoteBaseName(driveBest.name, `drive_${Date.now()}`));
-                          if (!isInsideDir(tempDest, fansubWorkDir)) throw new Error(`unsafe drive file name: ${driveBest.name}`);
-                          await downloadFileToDisk(driveBest.directUrl, tempDest, { Referer: postPageUrl });
-                          if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                    if (source.kind === 'mediafire') {
+                      const mfBest = await findBestFileInMediafire(source.url, targetEp, titleEps, listing);
+                      if (mfBest && (mfBest.directUrl || mfBest.type === 'subtitles')) {
+                        if (mfBest.type === 'subtitle' || mfBest.type === 'subtitles' || toolsAvailable) {
+                          const mfLabel = mfBest.name || `${mfBest.files.length} subtitle(s)`;
+                          console.log(`   📥 Downloading from Mediafire (${mfBest.type}): ${logSafe(mfLabel)}`);
+                          downloadedFilePath = await downloadCloudSubtitleSelection(mfBest, fansubWorkDir, postPageUrl);
                         } else {
-                          // DEFERRED — tools missing; NOT marked as posted.
+                          // DEFERRED — the media tools are missing, so the release
+                          // is postponed (never a failure) and is NOT marked as
+                          // posted, so it is retried once the tools exist.
                           countDeferred(msgKey);
-                          console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
+                          console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
+                        }
+                      }
+                    } else if (source.kind === 'mega') {
+                      const megaRelease = await downloadMegaFolderRelease(source.url, fansubWorkDir, targetEp, { rawTitle: titleLine, listedFiles: listing });
+                      if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
+                        downloadedFilePath = megaRelease.filePath;
+                      }
+                    } else if (source.kind === 'drive') {
+                      if (isDriveFolderUrl(source.url)) {
+                        const driveRelease = await downloadDriveFolderRelease(
+                          source.url,
+                          fansubWorkDir,
+                          targetEp,
+                          pageData.videoLinks?.fonts,
+                          titleLine,
+                          { listedFiles: listing }
+                        );
+                        if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
+                          downloadedFilePath = driveRelease.filePath;
+                        }
+                      }
+
+                      if (!downloadedFilePath) {
+                        const driveBest = await findBestFileInDrive(source.url, targetEp, titleEps, listing);
+                        if (driveBest && (driveBest.directUrl || driveBest.type === 'subtitles')) {
+                          if (driveBest.type === 'subtitle' || driveBest.type === 'subtitles' || toolsAvailable) {
+                            const driveLabel = driveBest.name || `${driveBest.files.length} subtitle(s)`;
+                            console.log(`   📥 Downloading from Drive (${driveBest.type}): ${logSafe(driveLabel)}`);
+                            downloadedFilePath = await downloadCloudSubtitleSelection(driveBest, fansubWorkDir, postPageUrl);
+                          } else {
+                            // DEFERRED — tools missing; NOT marked as posted.
+                            countDeferred(msgKey);
+                            console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
+                          }
                         }
                       }
                     }
                   } catch (e) {
-                    console.warn(`   ⚠️ Google Drive download failed:`, e.message);
+                    if (isCloudCapError(e)) {
+                      // M6: a cap refusal is a REFUSAL, not a soft failure: the
+                      // source goes into a 6 h cooldown (the key carries the
+                      // REDACTED url — a Mega key never ends up in a log).
+                      // The refusal is NOT added to the P0 per-message summary
+                      // counters: the message itself ends up as `skipped`
+                      // through the safety net further down.
+                      markCloudCapCooldown(source.kind, source.url);
+                      console.warn(`   ⚠️ ${sourceLabel} REFUSED (${e.code}): ${logSafe(e.message)} — cooldown ${Math.round(CLOUD_CAP_LIMITS.CAP_COOLDOWN_MS / 60000)} min`);
+                    } else {
+                      console.warn(`   ⚠️ ${sourceLabel} download failed:`, logSafe(e && e.message));
+                    }
                   }
                 }
+
+                // 3. Mega (Direct file or Folder via pure JS megajs) and
+                // 4. Google Drive (Direct file or Folder release with fonts)
+                //    are part of the cloud loop above (F2c): the SUBTITLE
+                //    bearing source is always tried before a video source.
 
                 // 5. Buzzheavier (Direct video file via HX-Redirect or token on GitHub Actions)
                 if (!downloadedFilePath && pageData.videoLinks?.buzzheavier) {
                   if (!toolsAvailable) {
                     // DEFERRED — tools missing; NOT marked as posted.
                     countDeferred(msgKey);
-                    console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
+                    console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
                   } else {
-                    console.log(`   📥 Resolving Buzzheavier: ${pageData.videoLinks.buzzheavier}`);
+                    console.log(`   📥 Resolving Buzzheavier: ${redactUrl(pageData.videoLinks.buzzheavier)}`);
                     try {
                       const directBuzz = await resolveBuzzheavierDownloadUrl(pageData.videoLinks.buzzheavier);
                       if (directBuzz) {
-                        console.log(`   📥 Downloading from Buzzheavier: ${directBuzz}`);
+                        console.log(`   📥 Downloading from Buzzheavier: ${redactUrl(directBuzz)}`);
                         const tempDest = path.join(fansubWorkDir, `buzz_${Date.now()}.mkv`);
                         const cmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
                         try {
                           execFileSync(cmd, [
                             '-s', '-L',
                             '--max-time', '600',
+                            // S1: the download is bounded (4 GiB) and a
+                            // redirect may not downgrade to http.
+                            '--max-filesize', String(CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES),
+                            '--proto-redir', '=https',
                             '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
                             '-H', `Referer: ${pageData.videoLinks.buzzheavier}`,
                             '-o', tempDest,
                             directBuzz
                           ], { timeout: 650_000 });
-                          if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
-                            downloadedFilePath = tempDest;
-                          }
                         } catch (cErr) {
-                          await downloadFileToDisk(directBuzz, tempDest, { Referer: pageData.videoLinks.buzzheavier });
-                          if (fs.existsSync(tempDest) && fs.statSync(tempDest).size > 1024) {
-                            downloadedFilePath = tempDest;
-                          }
+                          // S1: the fallback download is bounded too (and it
+                          // may not end up on another host).
+                          await downloadFileToDisk(directBuzz, tempDest, { Referer: pageData.videoLinks.buzzheavier }, {
+                            maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES,
+                            expectedHost: new URL(directBuzz).hostname,
+                          });
+                        }
+                        // S1: the size is verified AFTER the download (curl
+                        // only refuses a KNOWN content-length): an oversize
+                        // file is removed and refused.
+                        const size = fs.existsSync(tempDest) ? fs.statSync(tempDest).size : 0;
+                        if (size > CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES) {
+                          try { fs.rmSync(tempDest, { force: true }); } catch { }
+                          throw cloudCapError('FILE_TOO_LARGE', `Buzzheavier download refused: ${size} bytes > ${CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES} bytes`);
+                        }
+                        if (size > 1024) {
+                          downloadedFilePath = tempDest;
                         }
                       }
                     } catch (e) {
-                      console.warn(`   ⚠️ Buzzheavier download failed:`, e.message);
+                      console.warn(`   ⚠️ Buzzheavier download failed:`, logSafe(e && e.message));
                     }
                   }
                 }
@@ -3681,9 +4266,9 @@ export async function checkTelegramChannels(existingClient = null) {
                   if (!toolsAvailable) {
                     // DEFERRED — tools missing; NOT marked as posted.
                     countDeferred(msgKey);
-                    console.warn(`   ⏸️ DEFERRED (tools missing): "${titleLine}" – NOT marked as posted`);
+                    console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
                   } else {
-                    console.log(`   📥 Fansub torrent found: ${pageData.videoLinks.torrent}`);
+                    console.log(`   📥 Fansub torrent found: ${redactUrl(pageData.videoLinks.torrent)}`);
                     const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine);
                     if (extractedTorrent && extractedTorrent.filePath) {
                       if (extractedTorrent.resolvedTitle) {
@@ -3694,7 +4279,7 @@ export async function checkTelegramChannels(existingClient = null) {
                       safeMoveFile(extractedTorrent.filePath, finalPath);
 
                       const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
-                      console.log(`   📤 Publishing to channel: "${caption}"`);
+                      console.log(`   📤 Publishing to channel: "${logSafe(caption)}"`);
                       const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
@@ -3733,7 +4318,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     safeMoveFile(extracted.filePath, finalPath);
 
                     const caption = formatCleanCaption(titleLine, extracted.isArchive, false);
-                    console.log(`   📤 Publishing to channel: "${caption}"`);
+                    console.log(`   📤 Publishing to channel: "${logSafe(caption)}"`);
                     const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
