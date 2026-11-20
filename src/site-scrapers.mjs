@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { matchesEpisode, logSafe } from './cloud-folders.mjs';
 import { fetchRenderedHtml, isRocksDdlHost, isRocksHost } from './browser-fetch.mjs';
+import {
+  RECOVERY_CODES, RECOVERY_REDIRECT_MODE, isRecoveryRedirectOption, recoveryFatalCodeFor
+} from './recovery.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -446,8 +449,29 @@ export async function resolveMugiSubtitleFromWorker(releaseTitle, targetEp = nul
   }
 }
 
+// F4: the `recovery` marker is set ONLY by recovery-mode fetches. Login POSTs
+// in ensureSiteSession also use redirect:'manual' but carry no marker, so this
+// typed-3xx check can never change normal cron behaviour.
+function recoveryFetchExtras(recoveryMode) {
+  return recoveryMode ? { redirect: RECOVERY_REDIRECT_MODE, recovery: true } : {};
+}
+
+function typedRecoveryError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
 function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
-  return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+  return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) })
+    .then((res) => {
+      // F4: a 3xx on the recovery path must fail LOUDLY — never publish from a
+      // page we were redirected to (an SSRF second hop).
+      if (options.recovery === true && res.status >= 300 && res.status < 400) {
+        throw typedRecoveryError(RECOVERY_CODES.REDIRECT, 'redirect refused on recovery path');
+      }
+      return res;
+    });
 }
 
 function isCertificateValidationError(error) {
@@ -521,7 +545,8 @@ class SessionJar {
 const siteSessions = new Map();
 const SESSION_TTL = 2 * 60 * 60 * 1000; // Refresh session cookie every 2 hours
 
-async function ensureSiteSession(siteConfig) {
+// G1: on the recovery path login GETs must not follow redirects — SessionJar.absorb is not domain-scoped, so a 3xx target's cookies would be absorbed and sent as Cookie to the page. Normal callers (undefined redirect) are byte-identical.
+async function ensureSiteSession(siteConfig, { redirect } = {}) {
   if (!siteConfig) return null;
   const now = Date.now();
   const cached = siteSessions.get(siteConfig.id);
@@ -563,7 +588,8 @@ async function ensureSiteSession(siteConfig) {
   if (siteConfig.id === 'revive' || (siteConfig.base && siteConfig.base.includes('revivesubs'))) {
     try {
       const getRes = await fetchWithTimeout(`${siteConfig.base}/login`, {
-        headers: { 'User-Agent': UA }
+        headers: { 'User-Agent': UA },
+        ...(redirect ? { redirect } : {})
       });
       jar.absorb(getRes);
       const html = await getRes.text();
@@ -608,7 +634,8 @@ async function ensureSiteSession(siteConfig) {
   // 2. Standard WordPress Authentication (Rhythm, LazySano, Anime-San, Celestial)
   try {
     const wpInit = await fetchWithTimeout(`${siteConfig.base}/wp-login.php`, {
-      headers: { 'User-Agent': UA }
+      headers: { 'User-Agent': UA },
+      ...(redirect ? { redirect } : {})
     });
     jar.absorb(wpInit);
 
@@ -717,7 +744,9 @@ function getLinkTarget($, el, pageUrl) {
   return normaliseLinkUrl(match?.[1], pageUrl);
 }
 
-export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
+export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { redirect } = {}) {
+  const recoveryMode = isRecoveryRedirectOption(redirect);
+  const extras = recoveryFetchExtras(recoveryMode);
   try {
     const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
 
@@ -728,13 +757,17 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
       const resJson = await fetchWithTimeout(directoryUrl, {
         method: 'POST',
         headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page_token: null, page_index: 0 })
+        body: JSON.stringify({ page_token: null, page_index: 0 }),
+        ...extras
       });
       if (resJson.ok) {
         const json = await resJson.json().catch(() => null);
         if (json?.data?.files) files = json.data.files;
       }
-    } catch {}
+    } catch (e) {
+      // F3/F4: a typed recovery refusal must never be swallowed by a fallback.
+      if (recoveryFatalCodeFor(e)) throw e;
+    }
 
     // 2. Try application/x-www-form-urlencoded (Rocks-Team / HashHackers GDI workers)
     if (!files.length) {
@@ -750,7 +783,8 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
             'User-Agent': UA,
             'Content-Type': 'application/x-www-form-urlencoded'
           },
-          body: formParams.toString()
+          body: formParams.toString(),
+          ...extras
         });
 
         if (resForm.ok) {
@@ -775,7 +809,10 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
           }
           if (json?.data?.files) files = json.data.files;
         }
-      } catch {}
+      } catch (e) {
+        // F3/F4: a typed recovery refusal must never be swallowed by a fallback.
+        if (recoveryFatalCodeFor(e)) throw e;
+      }
     }
 
     if (!files.length) return null;
@@ -794,7 +831,9 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
     }
 
     return `${base}${encodeURIComponent(chosen.name)}`;
-  } catch {
+  } catch (e) {
+    // F3/F4: a typed recovery refusal must never be turned into a null result.
+    if (recoveryFatalCodeFor(e)) throw e;
     return null;
   }
 }
@@ -804,13 +843,20 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null) {
 // NO episode token is the whole batch and must be preferred; when the
 // directory holds only per-episode archives, the first one is used and the
 // limitation is logged.
-export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null, { batch = false } = {}) {
+export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null, { batch = false, redirect } = {}) {
   // Rocks-Team DDL is Cloudflare-protected: the listing only exists in a
   // browser, so it is rendered with headless Chromium instead of fetched.
   const isRocks = isRocksDdlHost(directoryUrl);
+  const recoveryMode = isRecoveryRedirectOption(redirect);
+
+  // F3: a browser follows redirects internally — fail closed on the recovery
+  // path instead of calling it (no publish from a second hop).
+  if (recoveryMode && isRocks) {
+    throw typedRecoveryError(RECOVERY_CODES.FETCH_UNSAFE, 'browser render refused on recovery path');
+  }
 
   if (!isRocks && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) {
-    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp);
+    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp, { redirect });
     if (goIndexFile) return goIndexFile;
   }
 
@@ -820,7 +866,10 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
       html = await fetchRenderedHtml(directoryUrl);
       if (!html) return null;
     } else {
-      const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
+      const res = await fetchWithTimeout(directoryUrl, {
+        headers: { 'User-Agent': UA },
+        ...recoveryFetchExtras(recoveryMode)
+      });
       if (!res.ok) return null;
       const contentType = res.headers.get('content-type') || '';
       if (!/html|text\//i.test(contentType)) return null;
@@ -879,12 +928,18 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
     // Prefer an archive because fansub releases commonly bundle fonts with it.
     return candidates.find(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url)) || candidates[0] || null;
   } catch (e) {
+    // F3/F4: never convert a typed recovery refusal into a link/no-link result.
+    if (recoveryFatalCodeFor(e)) throw e;
     console.warn(`Could not inspect subtitle directory ${directoryUrl}:`, e.message);
     return null;
   }
 }
 
 export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null, releaseTitle = null, options = {}) {
+  // F2/F4: single mode decision for the whole page-scrape path. Normal callers
+  // (no redirect option) are byte-identical to before.
+  const recoveryMode = isRecoveryRedirectOption(options.redirect);
+
   // P1-1b: a URL that was already fetched and found to have NO download link
   // is answered from the negative cache — with NO network request at all —
   // until its entry expires. This is what stops the same pages from being
@@ -957,7 +1012,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
 
   let cookieHeader = '';
   if (siteConfig && (siteConfig.user || process.env.REVIVE_COOKIE || process.env.CELESTIAL_COOKIE)) {
-    const jar = await ensureSiteSession(siteConfig);
+    const jar = await ensureSiteSession(siteConfig, { redirect: options.redirect });
     if (jar) cookieHeader = jar.header();
   }
 
@@ -966,7 +1021,9 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   let html = '';
   // Revive Subs is behind Cloudflare which blocks datacenter IPs.
   // Use curl_cffi with Chrome impersonation if available.
-  if (siteConfig?.id === 'revive' || (siteConfig?.base && siteConfig.base.includes('revivesubs'))) {
+  // C1/F2: the recovery path forbids redirects; these alternate fetchers follow
+  // them internally, so they are skipped entirely in recovery mode.
+  if (!recoveryMode && (siteConfig?.id === 'revive' || (siteConfig?.base && siteConfig.base.includes('revivesubs')))) {
     const cfHtml = fetchHtmlWithImpersonation(pageUrl, cookieHeader);
     if (cfHtml) {
       console.log(`   🛡️ Successfully bypassed Cloudflare for ${siteConfig.name} via curl_cffi!`);
@@ -976,7 +1033,8 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
 
   // Rocks-Team blog is Cloudflare-403 for datacenter IPs; curl_cffi wins only
   // ~29% of the time. Render it in the same browser used for its DDL index.
-  if (!html && isRocksHost(pageUrl)) {
+  // C1: a browser follows redirects — never use it on the recovery path.
+  if (!html && !recoveryMode && isRocksHost(pageUrl)) {
     html = await fetchRenderedHtml(pageUrl);
     if (html) console.log(`   🛡️ Rendered ${siteConfig?.name || 'Rocks-Team'} via headless Chromium.`);
   }
@@ -984,26 +1042,42 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   if (!html) {
     try {
       const res = await fetchWithTimeout(pageUrl, {
-        headers: { 'User-Agent': UA, 'Cookie': cookieHeader }
+        headers: { 'User-Agent': UA, 'Cookie': cookieHeader },
+        // C1/F4: default callers are unchanged (undefined → fetch's own
+        // 'follow' behaviour). Recovery callers get 'manual' + an internal
+        // marker so a 3xx is thrown as a typed RECOVERY_REDIRECT.
+        ...(options.redirect ? { redirect: options.redirect } : {}),
+        ...recoveryFetchExtras(recoveryMode)
       });
       html = await res.text();
       // If Cloudflare challenge returned (challenge page / 403 / 503), try impersonation fallback
       if (html.includes('Just a moment...') || html.includes('cf-chl-') || res.status === 403 || res.status === 503) {
+        // F2: curl_cffi follows redirects internally — fail closed on the
+        // recovery path instead of bypassing the no-redirect policy.
+        if (recoveryMode) {
+          throw typedRecoveryError(RECOVERY_CODES.FETCH_UNSAFE, 'impersonation fallback refused on recovery path');
+        }
         console.log(`   🛡️ Cloudflare challenge detected (${res.status}), attempting curl_cffi fallback...`);
         const cfHtml = fetchHtmlWithImpersonation(pageUrl, cookieHeader);
         if (cfHtml) html = cfHtml;
       }
     } catch (e) {
+      // C1: on the recovery path NO fallback may follow a redirect or bypass
+      // the check (curl uses a different redirect policy). Propagate so the
+      // caller turns it into a fatal — a redirect must never publish.
+      if (recoveryMode) throw e;
       if (siteConfig && isCertificateValidationError(e)) {
         try {
           console.warn(`Node TLS validation failed for ${siteConfig.name}; using the system CA bundle.`);
           html = fetchHtmlWithCurl(pageUrl, cookieHeader);
         } catch (curlError) {
-          console.error(`Failed to fetch ${siteConfig.name} page with system CA bundle: ${pageUrl}`, curlError.message);
+          // F8: never log the full pageUrl (it may carry tokens) — host only.
+          console.error(`Failed to fetch ${siteConfig.name} page with system CA bundle (host ${linkHost(pageUrl) || 'unknown'}):`, curlError.message);
           return null;
         }
       } else {
-        console.error(`Failed to fetch page: ${pageUrl}`, e.message);
+        // F8: host only here too (same non-recovery failure path).
+        console.error(`Failed to fetch page (host ${linkHost(pageUrl) || 'unknown'}):`, e.message);
         return null;
       }
     }
@@ -1166,7 +1240,11 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   // Pick the actual subtitle/archive from that listing.
   if (directSubLink && /(?:workers\.dev|ddl\.[^/]+\/0:|\/0:|(?:subtitle|subtitles|ملفات(?:%20|\s)*الترجمة))/i.test(directSubLink) &&
       !/\.(?:ass|srt|zip|rar|7z)(?:$|[?#])/i.test(directSubLink)) {
-    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink, effectiveEp, { batch: Boolean(options.batch) });
+    // F3: thread the no-redirect mode into the DDL/GoIndex resolver. The batch
+    // options object stays verbatim so normal (non-recovery) callers are unchanged.
+    const directoryOptions = { batch: Boolean(options.batch) };
+    directoryOptions.redirect = options.redirect;
+    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink, effectiveEp, directoryOptions);
     if (resolvedFile) directSubLink = resolvedFile;
   }
 

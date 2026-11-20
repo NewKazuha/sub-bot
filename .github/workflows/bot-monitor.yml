@@ -5,6 +5,11 @@ on:
     # One independent monitor cycle every 15 minutes.
     - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
+    inputs:
+      recovery:
+        description: 'Optional recovery spec (JSON). Leave blank for a normal monitoring window. The spec title becomes the public caption and feeds release/dedup keys — a wrong title can suppress a legitimate episode and is never retried; operator-only (repo write required).'
+        required: false
+        default: ''
 
 concurrency:
   group: anime-sub-monitor
@@ -121,8 +126,12 @@ jobs:
           REVIVE_COOKIE: ${{ secrets.REVIVE_COOKIE }}
           ANIMESAN_USER: ${{ secrets.ANIMESAN_USER }}
           ANIMESAN_PASS: ${{ secrets.ANIMESAN_PASS }}
-          # Keep monitor alive in continuous loop for 25 minutes, checking every 60 seconds
-          RUN_DURATION_MINUTES: 25
+          # A recovery spec is a one-shot pass (0); a normal dispatch/cron is
+          # the 25-minute continuous window. The value is read ONLY from
+          # process.env by the app — never interpolated inside a run: block.
+          RUN_DURATION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.recovery != '' && '0' || '25' }}
+          # Step-scoped: the spec never appears in a run: script or in logs.
+          RECOVERY_SPEC: ${{ github.event_name == 'workflow_dispatch' && inputs.recovery || '' }}
           CHECK_INTERVAL_SECONDS: 60
           # The tools the tool-check step could not find. A missing tool is
           # the root cause of the deferrals, so the runner prints it next to

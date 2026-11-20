@@ -990,6 +990,10 @@ test('T38 — the call sites pass the new options (m6, m7)', () => {
   assert.ok(client.includes('{ episodeNames: allExtracted }'), 'the Subdl package call site passes the episode names');
   assert.ok(client.includes('{ episodeNames: allExtractedFiles }'), 'the archive package call site passes the episode names');
   assert.ok(client.includes('{ batch: isCollectionTitle(titleLine) }'), 'the post scrape passes the batch option');
+  assert.ok(
+    client.includes('{ rawTitle: titleLine, listedFiles: listing, batch: isCollectionTitle(titleLine) }'),
+    'the Mega cloud call site passes the batch option'
+  );
   assert.ok(scrapers.includes('{ batch: Boolean(options.batch) }'), 'scrapePostPage forwards the batch option');
   assert.ok(client.includes('extractExplicitEpisodeRange(titleLine || \'\')'), 'the cloud title range uses the explicit range');
   // X7: BOTH call sites of the DDL directory resolution pass the batch option.
@@ -1422,4 +1426,199 @@ test('T56 — the residual log interpolations are redacted / log-safe (M3)', () 
   assert.ok(!client.includes('"${titleLine}"'), 'the title is log-safe');
   assert.ok(!client.includes('"${caption}"'), 'the caption is log-safe');
   assert.ok(!client.includes('"${originalName}"'), 'the original file name is log-safe');
+});
+
+// ---------------------------------------------------------------------------
+// Horemajo — a SINGLE-episode post in a series-wide Mega subtitle folder
+// (the batch:false narrowing, its cap refusal and its log hygiene)
+// ---------------------------------------------------------------------------
+
+// A folder that actually holds episodes 01..07 (the reported case).
+function seriesSubs(count = 7) {
+  return Array.from({ length: count }, (_, i) => ({
+    name: `Horemajo - ${String(i + 1).padStart(2, '0')}.ass`,
+    size: 2048,
+    node: { id: i }
+  }));
+}
+
+test('T57 — batch:false narrows a 7-sub series folder to exactly the requested episode', () => {
+  const sel = cf.selectFolderTargets(seriesSubs(7), { targetEpisode: '7', batch: false });
+  assert.equal(sel.length, 1, 'only episode 07 is selected');
+  assert.equal(sel[0].name, 'Horemajo - 07.ass');
+});
+
+test('T58 — the m9 invariant: batch:true (and omitted) still selects all 7 episodes', () => {
+  const files = seriesSubs(7);
+  assert.equal(cf.selectFolderTargets(files, { targetEpisode: '7', batch: true }).length, 7);
+  assert.equal(cf.selectFolderTargets(files, { targetEpisode: '7' }).length, 7, 'the default is batch:true');
+  assert.equal(cf.selectFolderSubtitleBatch(files, { targetEpisode: '7' }).length, 7, 'the listing path keeps the default');
+});
+
+test('T59 — a 21-file folder still throws TOO_MANY_FILES when the selection was NOT narrowed', async () => {
+  const dest = tmpDir('cloud-t59-');
+  // Episodes 10..30: nothing matches target "7", so batch:false falls THROUGH
+  // to the whole folder and the generic cap applies (not SERIES_FOLDER_BATCH).
+  const listed = Array.from({ length: 21 }, (_, i) => ({
+    name: `Horemajo - ${String(i + 10).padStart(2, '0')}.ass`,
+    size: 2048,
+    node: { id: i }
+  }));
+
+  let calls = 0;
+  await rejectsWithCode(
+    cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+      listedFiles: listed,
+      batch: false,
+      downloadNode: async () => { calls += 1; }
+    }),
+    'TOO_MANY_FILES'
+  );
+  assert.equal(calls, 0, 'nothing is downloaded');
+  assert.deepEqual(entriesOf(dest), []);
+});
+
+test('T60 — a narrowed 1-sub + 20-fonts series folder throws SERIES_FOLDER_BATCH', async () => {
+  const dest = tmpDir('cloud-t60-');
+  const listed = [
+    ...seriesSubs(7),
+    ...Array.from({ length: 20 }, (_, i) => ({ name: `Font${i + 1}.ttf`, size: 2048, node: { id: 100 + i } }))
+  ];
+
+  let calls = 0;
+  await rejectsWithCode(
+    cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+      listedFiles: listed,
+      batch: false,
+      downloadNode: async () => { calls += 1; }
+    }),
+    'SERIES_FOLDER_BATCH'
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(entriesOf(dest), []);
+});
+
+test('T61 — the narrowed release still packs its fonts under Fonts/', async () => {
+  const dest = tmpDir('cloud-t61-');
+  const fonts = [
+    { name: 'Base.ttf', size: 2048, node: { id: 100 } },
+    { name: 'Bold.otf', size: 2048, node: { id: 101 } }
+  ];
+  const listed = [...seriesSubs(7), ...fonts];
+
+  const release = await cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+    rawTitle: 'Horemajo - 07',
+    listedFiles: listed,
+    batch: false,
+    downloadNode: async (_node, destPath) => { fs.writeFileSync(destPath, 'fake'); return destPath; }
+  });
+  assert.ok(release && release.filePath.endsWith('.zip'));
+  assert.equal(release.hasFonts, true);
+
+  const names = new AdmZip(release.filePath).getEntries()
+    .filter(e => !e.isDirectory)
+    .map(e => e.entryName);
+  assert.deepEqual(names.filter(n => /\.ass$/i.test(n)), ['Horemajo - 07.ass'], 'only ep 07 travels');
+  assert.deepEqual(
+    names.filter(n => n.startsWith('Fonts/')).sort(),
+    ['Fonts/Base.ttf', 'Fonts/Bold.otf'],
+    'fonts are still packed under Fonts/'
+  );
+});
+
+test('T62 — a narrowed cap refusal logs its reason only, with no cooldown and no state key', () => {
+  const repoRoot = path.resolve(import.meta.dirname, '..');
+  const client = fs.readFileSync(path.join(repoRoot, 'src', 'telegram-client.mjs'), 'utf8');
+  const before = cf.__getCloudCapStats().byCode.SERIES_FOLDER_BATCH || 0;
+
+  cf.__resetCloudCapCooldowns();
+  const logs = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { logs.push(args.map(String).join(' ')); };
+  try {
+    tc.handleCloudCapRefusal(
+      cf.cloudCapError('SERIES_FOLDER_BATCH', '1 sub(s) + 20 font(s) > 20'),
+      { kind: 'mega', url: 'https://mega.nz/folder/SECRETKEY#FRAGMENTKEY', label: 'Mega' }
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const line = logs.join('\n');
+  assert.match(
+    line,
+    /⚠️ Mega single-episode refused \(SERIES_FOLDER_BATCH\): 1 sub\(s\) \+ 20 font\(s\) > 20 — not a batch title/,
+    'the dedicated reason is logged'
+  );
+  assert.ok(!/SECRETKEY|FRAGMENTKEY|mega\.nz/.test(line), 'no url / Mega key is printed');
+  assert.equal(
+    (cf.__getCloudCapStats().byCode.SERIES_FOLDER_BATCH || 0), before + 1,
+    'the refusal is counted once under its code'
+  );
+  assert.equal(cf.__getCloudCapCooldowns().length, 0, 'SERIES_FOLDER_BATCH does NOT set a cooldown');
+  assert.ok(
+    client.includes('if (!classified(msgKey)) countSkipped(msgKey);'),
+    'with no downloaded file the message ends skipped (no state key written)'
+  );
+
+  // Every OTHER cap code keeps the existing 6 h cooldown.
+  tc.handleCloudCapRefusal(
+    cf.cloudCapError('TOO_MANY_FILES', 'cloud batch refused: 21 files > 20'),
+    { kind: 'mega', url: 'https://mega.nz/folder/OTHERKEY', label: 'Mega' }
+  );
+  assert.equal(cf.__getCloudCapCooldowns().length, 1, 'other cap codes still get a cooldown');
+  cf.__resetCloudCapCooldowns();
+});
+
+test('T63 — 1 sub + 20 fonts is SERIES_FOLDER_BATCH and is counted in byCode', async () => {
+  const dest = tmpDir('cloud-t63-');
+  const listed = [
+    { name: 'Horemajo - 07.ass', size: 2048, node: { id: 1 } },
+    ...Array.from({ length: 20 }, (_, i) => ({ name: `Font${i + 1}.ttf`, size: 2048, node: { id: 100 + i } }))
+  ];
+  const before = cf.__getCloudCapStats().byCode.SERIES_FOLDER_BATCH || 0;
+  let calls = 0;
+
+  await rejectsWithCode(
+    cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+      listedFiles: listed,
+      batch: false,
+      downloadNode: async () => { calls += 1; }
+    }),
+    'SERIES_FOLDER_BATCH'
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(entriesOf(dest), []);
+  assert.equal(cf.__getCloudCapStats().byCode.SERIES_FOLDER_BATCH, before + 1);
+});
+
+test('T64 — a non-parsable filename never makes a narrowed release vanish', () => {
+  const files = [
+    { name: 'Horemajo.ass', node: { id: 1 } },
+    { name: 'Horemajo Extra.ass', node: { id: 2 } }
+  ];
+  const sel = cf.selectFolderTargets(files, { targetEpisode: '7', batch: false });
+  assert.ok(sel.length > 0, 'never returns []');
+  assert.deepEqual(sel, files, 'falls through to the whole folder');
+});
+
+test('T65 — matchesEpisode normalizes leading zeros in both directions', () => {
+  assert.equal(cf.matchesEpisode('Horemajo - 07.ass', '7'), true);
+  assert.equal(cf.matchesEpisode('Horemajo - 7.ass', '07'), true);
+});
+
+test('T66 — a fonts-only (0-subtitle) Mega folder keeps the existing path', async () => {
+  const dest = tmpDir('cloud-t66-');
+  let calls = 0;
+  const release = await cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+    listedFiles: [
+      { name: 'Font1.ttf', size: 2048, node: { id: 1 } },
+      { name: 'Font2.ttf', size: 2048, node: { id: 2 } }
+    ],
+    batch: false,
+    downloadNode: async () => { calls += 1; }
+  });
+  assert.equal(release, null, 'no subtitle / archive / mkv means no release');
+  assert.equal(calls, 0);
+  assert.deepEqual(entriesOf(dest), []);
 });

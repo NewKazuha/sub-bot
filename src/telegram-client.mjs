@@ -3,13 +3,14 @@ import { StringSession } from 'telegram/sessions/index.js';
 import * as cheerio from 'cheerio';
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { execSync, execFileSync, spawn } from 'node:child_process';
 import { Readable, Transform } from 'node:stream';
 import { finished, pipeline } from 'node:stream/promises';
 import AdmZip from 'adm-zip';
 import SevenZip from '7zip-bin';
 import { CONFIG } from './config.mjs';
-import { scrapePostPage, resolveSubtitleFromDirectory, resolveBuzzheavierDownloadUrl } from './site-scrapers.mjs';
+import { scrapePostPage as baseScrapePostPage, resolveSubtitleFromDirectory as baseResolveSubtitleFromDirectory, resolveBuzzheavierDownloadUrl } from './site-scrapers.mjs';
 import { sendDocument, escapeHtml } from './telegram.mjs';
 import {
   findBestFileInMegaFolder,
@@ -43,6 +44,11 @@ import {
 import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
 import { downloadViaBrowser, isRocksDdlHost } from './browser-fetch.mjs';
 import {
+  parseRecoverySpec, withRecoveryMessages, recordPendingAttempt, unknownRecoveryChatIds,
+  isRecoveryMessage, recoveryFatalCodeFor, recoveryScrapeOptions, withRecoveryMode,
+  scrapeOptionsForState, RECOVERY_CODES, RECOVERY_REDIRECT_MODE, siteHosts
+} from './recovery.mjs';
+import {
   resolveCanonicalTitle,
   resolveCanonicalTitlesBatch,
   getCachedCanonical,
@@ -50,6 +56,27 @@ import {
   normalizeTeamName,
   buildSyntheticTitle
 } from './title-identity.mjs';
+
+// F1/F4: the recovery path must forbid redirects. The call sites stay exactly
+// as they were (audited by T38); a thin wrapper injects the single no-redirect
+// mode constant only while a MARKED recovery message is being scraped (id and
+// pending retries included). The main loop is sequential, so no leak.
+// G4: the toggle and the option injection are the pure helpers in recovery.mjs
+// (withRecoveryMode / scrapeOptionsForState) so they are directly unit-testable.
+const recoveryState = { active: false, msg: null };
+function scrapePostPage(pageUrl, siteConfig, targetEp, releaseTitle, options = {}) {
+  const effective = scrapeOptionsForState(options, recoveryState);
+  return baseScrapePostPage(pageUrl, siteConfig, targetEp, releaseTitle, effective);
+}
+// G2: the second directory call site keeps its exact batch-options shape (the
+// T38 source contract). The no-redirect mode is injected here from the same
+// guard state as the page scrape, via recoveryScrapeOptions — so a marked
+// recovery message never renders a Rocks DDL directory in Chromium nor lets a
+// GoIndex POST follow a redirect. Normal callers get no extra options.
+function resolveSubtitleFromDirectory(directoryUrl, targetEp, options = {}) {
+  const effective = { ...options, ...recoveryScrapeOptions(recoveryState.msg) };
+  return baseResolveSubtitleFromDirectory(directoryUrl, targetEp, effective);
+}
 
 const POSTED_FILE = path.resolve('data', 'posted.json');
 const OUT_DIR = path.resolve('temp_extracted');
@@ -68,6 +95,11 @@ export const FATAL_CODES = {
   STATE_LOAD_FAILED: 'STATE_LOAD_FAILED',
   AUTH_SESSION_CONFIG: 'AUTH_SESSION_CONFIG',
   LISTENER_ERROR: 'LISTENER_ERROR',
+  RECOVERY_SPEC_INVALID: RECOVERY_CODES.SPEC_INVALID,
+  RECOVERY_CHAT_UNKNOWN: RECOVERY_CODES.CHAT_UNKNOWN,
+  RECOVERY_MSG_MISSING: RECOVERY_CODES.MSG_MISSING,
+  RECOVERY_REDIRECT: RECOVERY_CODES.REDIRECT,
+  RECOVERY_FETCH_UNSAFE: RECOVERY_CODES.FETCH_UNSAFE,
 };
 
 export function createFatalError(code, message, summary = null) {
@@ -430,6 +462,25 @@ export function isCollectionTitle(title) {
   const text = String(title || '');
   if (ARABIC_COLLECTION_WORDS.test(text)) return true;
   return extractExplicitEpisodeRange(text).length > 1;
+}
+
+// A cap refusal is a per-SOURCE event: the message keeps looping over the
+// remaining cloud sources. SERIES_FOLDER_BATCH is the one refusal that does
+// NOT get a 6 h cooldown — a single-episode title was narrowed out of a
+// series-wide folder, so a different source may still carry that episode.
+// The log carries only the cap counts (via logSafe): never source.url, never
+// a Mega fragment/key or a raw title.
+export function handleCloudCapRefusal(e, { kind, url, label }) {
+  if (!isCloudCapError(e)) {
+    console.warn(`   ⚠️ ${label} download failed:`, logSafe(e && e.message));
+    return;
+  }
+  if (e.code === 'SERIES_FOLDER_BATCH') {
+    console.warn(`   ⚠️ ${label} single-episode refused (SERIES_FOLDER_BATCH): ${logSafe(e.message)} — not a batch title`);
+    return;
+  }
+  markCloudCapCooldown(kind, url);
+  console.warn(`   ⚠️ ${label} REFUSED (${e.code}): ${logSafe(e.message)} — cooldown ${Math.round(CLOUD_CAP_LIMITS.CAP_COOLDOWN_MS / 60000)} min`);
 }
 
 export function extractEpisodeNumber(text) {
@@ -1132,8 +1183,12 @@ export function isReleaseDispatched(posted, keys) {
  * P1-2 (Layer 2) guard — a series-level key never decides an episode-scoped
  * candidate. The dispatch-ledger half is UNCHANGED by P1-2.
  */
-export function isReleaseAlreadyPostedOrDispatched(posted, keys) {
-  return isReleaseAlreadyPosted(posted, keys) || isReleaseDispatched(posted, keys);
+export function isReleaseAlreadyPostedOrDispatched(posted, keys, { season = null } = {}) {
+  // BUG A: apply the additive season qualification ONCE, before BOTH halves
+  // (the posted set and the `dispatched:` ledger). A season-2 candidate must
+  // not be suppressed by a season-1 key sitting in either half.
+  const decisionKeys = qualifyKeysBySeason(keys, season);
+  return isReleaseAlreadyPosted(posted, decisionKeys) || isReleaseDispatched(posted, decisionKeys);
 }
 
 /**
@@ -1166,12 +1221,136 @@ export function markReleaseAsDispatched(posted, msgKey, keys = []) {
  * ledger — never as a plain posted key (the state must not claim a
  * publication that this bot did not make).
  */
-export function markReleaseAsKnown(posted, msgKey, keys = []) {
-  if (isReleaseAlreadyPosted(posted, keys)) {
+export function markReleaseAsKnown(posted, msgKey, keys = [], { season = null } = {}) {
+  // BUG A: the CHECK is season-qualified, but the STORED keys are the full
+  // list — that is how the season-qualified key is persisted so a re-arrival
+  // is suppressed on the next cycle.
+  const decisionKeys = qualifyKeysBySeason(keys, season);
+  if (isReleaseAlreadyPosted(posted, decisionKeys)) {
     markReleaseAsPosted(posted, msgKey, keys);
   } else {
     markReleaseAsDispatched(posted, msgKey, keys);
   }
+}
+
+// ---------------------------------------------------------------------------
+// BUG A (season isolation) + BUG B (two-phase dedup) — shared helpers.
+//
+// seasonOfReleaseTitle derives ONE root season from a title (null for S1 /
+// unmarked). qualifyKeysBySeason is ADDITIVE: it narrows a candidate's keys to
+// the season-qualified ones ONLY when season>=2 AND at least one such key
+// exists; otherwise it returns the list unchanged (today's guard). No key
+// generator takes a season argument — the guard is purely string based.
+// ---------------------------------------------------------------------------
+
+const ROMAN_SEASON = Object.freeze({ ii: 2, iii: 3, iv: 4, v: 5, vi: 6 });
+const ORDINAL_SUFFIX = Object.freeze({ 1: 'st', 2: 'nd', 3: 'rd' });
+
+export function seasonOfReleaseTitle(title) {
+  const s = String(title ?? '');
+  if (!s) return null;
+  const patterns = [
+    /\b(?:season|سيزون)\s*(\d{1,2})\b/i,
+    /\b(\d{1,2})(?:st|nd|rd|th)\s+season\b/i,
+    /\bs(\d{1,2})e\d{1,3}\b/i,
+    /\bs(\d{1,2})\b/i,
+    /\bseason\s+(ii|iii|iv|v|vi)\b/i,
+    /\b(ii|iii|iv|v|vi)\s+season\b/i,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (!m) continue;
+    const raw = m[1];
+    const n = /^\d+$/.test(raw) ? Number(raw) : ROMAN_SEASON[String(raw).toLowerCase()];
+    if (!Number.isFinite(n)) continue;
+    // Season 1 / unmarked keeps today's behaviour (no qualification).
+    return n >= 2 ? n : null;
+  }
+  return null;
+}
+
+// Is a stored/candidate key explicitly tied to `season` (>=2)? Accepts the
+// spellings the key generators actually emit: "2nd_season", "season_2",
+// "s02e03"/"s2e03", "s2", ASCII roman numerals, and the condensed no-separator
+// form ("2ndseason"). Kept local — the key generators stay untouched.
+function isSeasonQualifiedKey(key, season) {
+  const k = String(key ?? '').toLowerCase();
+  if (!k) return false;
+  const n = Number(season);
+  if (!Number.isFinite(n) || n < 2) return false;
+  const d = String(n);
+  const pad = String(n).padStart(2, '0');
+  const roman = ROMAN_SEASON[d] || '';
+  const reSeasonThenN = new RegExp(`season[_\\s-]*(?:0*${d}${roman ? `|${roman}` : ''})(?:[_\\s-]|\\d|$)`);
+  const reNThenSeason = new RegExp(`0*${d}(?:st|nd|rd|th)?[_\\s-]*season`);
+  const reSxE = new RegExp(`(?:^|[_\\s-])s(?:${d}|${pad})e\\d`);
+  const reS = new RegExp(`(?:^|[_\\s-])s(?:0*${d}|${pad})(?:[_\\s-]|$)`);
+  return reSeasonThenN.test(k) || reNThenSeason.test(k) || reSxE.test(k) || reS.test(k);
+}
+
+export function qualifyKeysBySeason(keys, season) {
+  const list = Array.isArray(keys) ? keys : [];
+  const n = Number(season);
+  if (!Number.isFinite(n) || n < 2) return list;
+  const qualified = list.filter(k => isSeasonQualifiedKey(k, n));
+  return qualified.length ? qualified : list;
+}
+
+// Build the pre-download key union ONCE per gate: the raw title plus each
+// resolved dictionary title. Fansub resolved names carry the raw title's
+// leading [team] (never pass a bare dictionary name — that would emit
+// `fansub_unknown_*`). No AniList query here: the caller passes `resolved`.
+export function computeReleaseKeySet(title, { isOfficial = false, resolved = null } = {}) {
+  const raw = String(title ?? '').trim();
+  const r = (resolved && typeof resolved === 'object') ? resolved : null;
+
+  let season = seasonOfReleaseTitle(raw);
+  if (season == null && r) {
+    season = seasonOfReleaseTitle(r.romaji) ?? seasonOfReleaseTitle(r.english);
+  }
+
+  const teamMatch = raw.match(/^\[\s*([^\]]+)\]\s*/);
+  const teamPrefix = teamMatch ? `[${teamMatch[1]}] ` : '';
+  const withTeam = (name) => teamPrefix ? `${teamPrefix}${name}` : String(name);
+
+  const keys = [];
+  const addFor = (candidate) => {
+    if (!candidate) return;
+    if (isOfficial) keys.push(...getReleaseKeys(candidate, true, r));
+    else keys.push(...getFansubReleaseKeys(candidate, r));
+  };
+  addFor(raw);
+  if (r?.romaji) addFor(withTeam(r.romaji));
+  if (r?.english) addFor(withTeam(r.english));
+
+  return { keys: Array.from(new Set(keys.filter(Boolean))), season: season ?? null };
+}
+
+// Shared phase-2 gate used immediately before every publish. It merges the
+// phase-1 keys with a fresh union on the post-resolver effective title, keeps
+// the phase-1 season, re-gates, and (on a hit) records the release as known —
+// including the linked poster message — before returning proceed:false.
+export function gateReleaseBeforePublish(posted, msgKey, phase1, {
+  effectiveTitle = null, resolved = null, isOfficial = false, extraTitles = [], linkedMsgKey = null,
+} = {}) {
+  const p1 = (phase1 && Array.isArray(phase1.keys))
+    ? phase1
+    : { keys: Array.isArray(phase1) ? phase1 : [], season: null };
+  const season = p1.season;
+
+  const phase2 = computeReleaseKeySet(effectiveTitle || '', { isOfficial, resolved });
+  const extraKeys = [];
+  for (const t of (Array.isArray(extraTitles) ? extraTitles : [])) {
+    extraKeys.push(...computeReleaseKeySet(t, { isOfficial, resolved }).keys);
+  }
+  const mergedKeys = Array.from(new Set([...p1.keys, ...phase2.keys, ...extraKeys]));
+
+  if (isReleaseAlreadyPostedOrDispatched(posted, mergedKeys, { season })) {
+    markReleaseAsKnown(posted, msgKey, mergedKeys, { season });
+    if (linkedMsgKey) markReleaseAsKnown(posted, linkedMsgKey, mergedKeys, { season });
+    return { proceed: false, mergedKeys, season };
+  }
+  return { proceed: true, mergedKeys, season };
 }
 
 /**
@@ -1203,6 +1382,76 @@ export function sourceHostOf(url) {
 }
 
 /**
+ * S1b — the ONE validator for a `.torrent` URL before it reaches the download
+ * sink. Returns the normalised hostname (use it as `expectedHost`) or throws.
+ * No raw URL is ever echoed in a thrown message.
+ *
+ *   * https only; no userinfo; no trailing dot; no `xn--` (punycode) labels;
+ *   * NO IP literals at all (bracketed IPv6, dotted IPv4 and Node-normalised
+ *     decimal/octal/hex forms such as `https://2130706433/` → `127.0.0.1`);
+ *   * loopback / private / link-local ranges are rejected explicitly;
+ *   * recovery messages additionally require a dot-anchored `siteHosts()` match.
+ */
+export function validateTorrentUrl(raw, { recovery = false } = {}) {
+  let url;
+  try {
+    url = new URL(String(raw));
+  } catch {
+    throw new Error('Torrent URL rejected: invalid URL');
+  }
+  if (url.protocol !== 'https:') {
+    throw new Error('Torrent URL rejected: https required');
+  }
+  if (url.username !== '' || url.password !== '') {
+    throw new Error('Torrent URL rejected: userinfo not allowed');
+  }
+  const host = url.hostname.toLowerCase();
+  if (!host || host.endsWith('.') || host.includes('..')) {
+    throw new Error('Torrent URL rejected: host rejected');
+  }
+  if (host.split('.').some(label => label.startsWith('xn--'))) {
+    throw new Error('Torrent URL rejected: host rejected');
+  }
+  // Deny by default: ONLY a plausible DNS name is a torrent host. Node already
+  // normalises decimal/octal/hex IP forms to a dotted quad (or bracketed IPv6)
+  // at URL-parse time, so net.isIP + the DNS grammar below reject them all —
+  // including `0x7f000001`, `2130706433`, `0177.0.0.1` and `[::1]`.
+  // NOTE: DNS resolution is NOT pinned to the validated name — a DNS rebound
+  // after this check is a documented limitation (out of scope here).
+  const DNS_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+  const dnsNameRe = new RegExp(`^${DNS_LABEL}(?:\\.${DNS_LABEL})*$`);
+  const tld = host.split('.').pop() || '';
+  if (host.includes('0x') || net.isIP(host) !== 0 || host.length > 253 ||
+      !dnsNameRe.test(host) || /(?:^|\.)0\d/.test(host) ||
+      !/^[a-z][a-z0-9-]*$/.test(tld)) {
+    throw new Error('Torrent URL rejected: host rejected');
+  }
+  // Bracketed IPv6 and any residual IP forms are refused as defence-in-depth.
+  if (host.startsWith('[') || /^\d+$/.test(host) || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) ||
+      host === 'localhost' || host.endsWith('.localhost')) {
+    throw new Error('Torrent URL rejected: host rejected');
+  }
+  // Folded private/special IPv4 ranges (unreachable after net.isIP above, kept
+  // explicit for intent): loopback, private, link-local, 0/8, multicast,
+  // CGNAT 100.64/10 and benchmarking 198.18/15.
+  const ranges = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ranges) {
+    const a = Number(ranges[1]);
+    const b = Number(ranges[2]);
+    if (a === 0 || a >= 224 || a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) || (a === 169 && b === 254) ||
+        (a === 100 && b >= 64 && b <= 127) || (a === 198 && b >= 18 && b <= 19)) {
+      throw new Error('Torrent URL rejected: host rejected');
+    }
+  }
+  if (recovery) {
+    const ok = [...siteHosts()].some(d => host === d || host.endsWith(`.${d}`));
+    if (!ok) throw new Error('Torrent URL rejected: recovery host not allowlisted');
+  }
+  return host;
+}
+
+/**
  * The per-source no-links counter as ONE operator-facing line.
  * Returns null when nothing was counted (an empty line is noise).
  */
@@ -1213,6 +1462,42 @@ export function formatNoLinksBySource(counts) {
     .sort((a, b) => (Number(b[1]) - Number(a[1])) || String(a[0]).localeCompare(String(b[0])));
   if (!entries.length) return null;
   return `ℹ️ sources with no links this cycle: ${entries.map(([host, n]) => `${host}=${n}`).join(', ')}`;
+}
+
+/**
+ * Classify a scraped post page for the two CONFIRMED "no links" outcomes:
+ * a negative-cached candidate and a FRESH scrape that yielded no usable link.
+ * BOTH are recorded in the pending ledger with the SAME bounds:
+ * max 3 attempts/msg, 200 pending keys (oldest pruned), 7d TTL skips on read
+ * only. A scrape failure (!pageData) is NOT a confirmed no-links page and is
+ * deliberately left to the caller's unchanged warning branch.
+ *
+ * `countNoLinks` is the caller's per-source observability counter and `log`
+ * emits the branch's exact warning line (level + text), so the two call sites
+ * keep their original wording and behaviour. Returns true when an attempt was
+ * recorded here (used only by tests/observability, not by the publish policy).
+ */
+export function noteNoLinksOutcome(pageData, posted, msgKey, postPageUrl, countNoLinks, log) {
+  // S4: make a refused write visible. The message carries NO url/query/token —
+  // only the reason code. This is observability; the publish policy is unchanged.
+  const notePendingRefusal = () => {
+    if (typeof log === 'function') {
+      log('warn', '   ⚠️ pending-ledger: attempt not recorded (invalid msg key or 3-attempt cap reached)');
+    }
+  };
+  if (pageData?.negativeCached) {
+    countNoLinks(postPageUrl);
+    if (!recordPendingAttempt(posted, msgKey)) notePendingRefusal();
+    log('log', `   ⏭️ Negative cache: no links for ${sourceHostOf(postPageUrl)} — skipped this cycle (no fetch).`);
+    return true;
+  }
+  if (pageData && !pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) {
+    countNoLinks(postPageUrl);
+    if (!recordPendingAttempt(posted, msgKey)) notePendingRefusal();
+    log('warn', `   ⚠️ No download links found in ${sourceHostOf(postPageUrl)}`);
+    return true;
+  }
+  return false;
 }
 
 export function formatCleanTitle(raw) {
@@ -1254,6 +1539,51 @@ export function isOfficialPlatformRelease(title) {
     || /\b(?:CR|NF|Netflix|DSNP|Disney\+?|AMZN|Amazon|Prime|HIDIVE)\s*(?:\.|\s+)?(?:WEB-?DL|WEBRip)\b/i.test(title);
 }
 
+// BUG C — temporary downloader artefacts are never a release title.
+// Two ANCHORED forms (no loose "contains a number" matching, so a legitimate
+// "Direct 10" / "Ep 12" is not refused):
+//   * file form:   <prefix>_<digits>[_<digits>]…   (prefix needs a separator)
+//   * caption form: <direct|buzz|font> <10+-digit-ms>[ - <seq>]…
+export function isTempDownloadName(base) {
+  // S3: NFKC + zero-width stripping + trim. The separator collapse is a CHECK
+  // normaliser ONLY (never used for display), and is applied to the file form
+  // only so a spaced "Ep 12" can never be rewritten into "ep_12".
+  let s = String(base ?? '').normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').trim();
+  if (!s) return false;
+  // Strip only KNOWN archive suffixes (.tar.gz, .tgz, .zip, .rar, .7z, .gz),
+  // including repeats — never an arbitrary `\.[a-z0-9]{1,5}` (F10).
+  const bare = s.replace(/(?:\.tar\.gz|\.tgz|\.zip|\.rar|\.7z|\.gz)+$/i, '');
+
+  // Caption form: <direct|buzz|font><sep><10+-digit-ms>[<sep><seq>]…
+  if (/^(?:direct|buzz|font)[ _-]\d{10,}(?:[ _-]+\d+)*$/i.test(bare)) return true;
+  // Episode-temp form (kept deliberately short; matched WITHOUT space collapse
+  // so "Ep 12" is a legitimate title and is not refused).
+  if (/^ep_\d+$/i.test(bare)) return true;
+
+  const collapsed = bare.replace(/[\s_-]+/g, '_');
+  // File form: timestamped tokens require 10+ digits. Compound extensions were
+  // removed above, so `direct_1795059597549.tar.gz` is caught.
+  if (/^(?:direct|buzz|font|cloud_file)_\d{10,}(?:_\d+)*$/i.test(collapsed)) return true;
+  // Legacy short downloader prefixes (no `direct`/`buzz`/`font` here — those
+  // now require 10+ digits, which kills `direct-12345` / `Direct 10`). Kept for
+  // backward compatibility with the existing regression fixtures.
+  if (/^(?:lazy|mega|drive|doc|work|temp|sub|down|download|cloud_file)_\d+(?:_\d+)*$/i.test(collapsed)) return true;
+  return false;
+}
+
+// The ONE helper used by publishDocument to reduce a caption / file name to the
+// bare candidate token before the temp-name test. It strips a leading [team]
+// block, a trailing file extension and trailing [tags]/(tags). It is a CHECK
+// normalizer only — it never derives a release title.
+function stripTeamAndTrailingTags(name) {
+  let s = String(name ?? '').trim();
+  s = s.replace(/^[📍📌🎬\s]*\[[^\]]+\]\s*/, '');
+  s = s.replace(/\.(?:mkv|mp4|m4v|ass|srt|zip|rar|7z)\s*$/i, '');
+  s = s.replace(/\s*\[[^\]]*\]\s*$/g, '').trim();
+  s = s.replace(/\s*\([^\)]*\)\s*$/g, '').trim();
+  return s.trim();
+}
+
 export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
   // Reject font files, images, text/info files, or anything inside a fonts folder
   if (/\.(?:ttf|otf|woff2?|ttc|png|jpe?g|bmp|gif|txt|nfo|url|lnk)$/i.test(fileName)) {
@@ -1266,6 +1596,12 @@ export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
   let base = path.basename(fileName)
     .replace(/\.(mkv|mp4|ass|srt|zip|rar|7z)$/i, '')
     .trim();
+
+  // BUG C: a temporary downloader name (`direct_1795059597549`,
+  // `direct 1795059597549 - 10`, `ep_12`, `cloud_file_123`, …) must never
+  // become an English release title. Check BEFORE the `[._] -> space`
+  // normalization so both the file form and the caption form are matched.
+  if (isTempDownloadName(base)) return null;
 
   // Strip trailing language tags like .ARA, .Arabic, .AR
   base = base.replace(/\.(?:ara|arabic|ar)$/i, '').trim();
@@ -1280,6 +1616,9 @@ export function cleanEnglishTitleFromFilename(fileName, teamName = '') {
     fileTeam = teamMatch[1].trim();
     base = base.slice(teamMatch[0].length).trim();
   }
+  // BUG C (cont.): the temp token can also sit behind a [team] bracket (ASS
+  // Title headers carry one). Check the team-stripped base too.
+  if (isTempDownloadName(base)) return null;
 
   // Strip quality tags, codecs, CRCs, resolutions
   base = base
@@ -2030,8 +2369,15 @@ export function packFolderToZip(folderPath, destZipPath) {
 
 export async function downloadFileToDisk(url, destPath, headers = {}, options = {}) {
   const signal = AbortSignal.timeout(10 * 60 * 1000);
+  // S1c/F4: only an explicitly requested manual mode changes fetch behaviour;
+  // every existing caller (no `redirect` option) keeps the default 'follow'.
+  // F4: recovery messages still treat ANY 3xx as a typed fatal; non-recovery
+  // manual mode follows a BOUNDED, re-validated redirect chain instead.
+  const manualRedirect = options.redirect === RECOVERY_REDIRECT_MODE;
+  const isRecovery = options.recovery === true;
   const requestOptions = {
     signal,
+    ...(manualRedirect ? { redirect: RECOVERY_REDIRECT_MODE } : {}),
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
       ...headers
@@ -2048,8 +2394,30 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
       throw new Error(`Download redirected to unexpected host "${actualHost}" (expected "${expectedHost}")`);
     }
   };
+  const throwTypedRedirect = () => {
+    const err = new Error(RECOVERY_CODES.REDIRECT);
+    err.code = RECOVERY_CODES.REDIRECT;
+    throw err;
+  };
 
-  let res = await fetch(url, requestOptions);
+  let currentUrl = url;
+  let res = await fetch(currentUrl, requestOptions);
+  let hopsLeft = manualRedirect && !isRecovery ? 3 : 0;
+  while (manualRedirect && res.status >= 300 && res.status < 400) {
+    // Recovery: a 3xx is fatal BEFORE any body is read (typed RECOVERY_REDIRECT).
+    if (isRecovery) throwTypedRedirect();
+    if (hopsLeft-- <= 0) throw new Error('Too many redirects');
+    const location = res.headers.get('location');
+    if (!location) throw new Error('Redirect without Location');
+    let nextUrl;
+    try { nextUrl = new URL(location, currentUrl); } catch { throw new Error('Invalid redirect'); }
+    // Re-validate with the SAME validator and require the same host BEFORE the
+    // next request — an SSRF redirect can never smuggle a private host through.
+    const nextHost = validateTorrentUrl(nextUrl.toString(), { recovery: false });
+    if (expectedHost && nextHost !== expectedHost) throw new Error('Redirect host rejected');
+    currentUrl = nextUrl.toString();
+    res = await fetch(currentUrl, requestOptions);
+  }
   assertHost(res);
 
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
@@ -2071,10 +2439,14 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
     });
 
     if (action && params.has('confirm')) {
+      // F12: no drive.google.com torrent URL ever reaches this sink — torrent
+      // URLs come from the site allowlist via validateTorrentUrl — so strict
+      // expectedHost equality here (no driveusercontent exception) is intentional.
       const confirmedUrl = new URL(action, res.url);
       confirmedUrl.search = params.toString();
       console.log('   ↪️ Confirming public Google Drive download.');
       res = await fetch(confirmedUrl.toString(), requestOptions);
+      if (manualRedirect && res.status >= 300 && res.status < 400) throwTypedRedirect();
       assertHost(res);
       if (!res.ok) throw new Error(`Google Drive confirmation returned HTTP ${res.status}`);
     }
@@ -2343,7 +2715,7 @@ async function resolveMediafireDownloadUrl(mfUrl) {
   }
 }
 
-function parseEraiMessage(msg) {
+export function parseEraiMessage(msg) {
   const text = msg.message || '';
 
   const titleMatch = text.match(/Title:\s*(.+)/i);
@@ -2372,6 +2744,21 @@ function parseEraiMessage(msg) {
           nyaaUrl = ent.url;
         }
       }
+    }
+  }
+  // C4: a synthetic recovery message has NO Telegram entities — its torrent
+  // URL is plain text. Without this fallback parseEraiMessage returns no URL
+  // and the release is silently skipped (never published).
+  // S1a/S1b: https ONLY, and validate before it can reach the download sink.
+  // An unsafe URL is dropped (torrentUrl stays empty → the release is skipped
+  // and never downloaded). The entity-based path above is unchanged.
+  if (!torrentUrl) {
+    const plain = text.match(/https:\/\/[^\s"'<>]+\.torrent[^\s"'<>]*/i);
+    if (plain) {
+      try {
+        validateTorrentUrl(plain[0], { recovery: isRecoveryMessage(msg) });
+        torrentUrl = plain[0];
+      } catch { /* unsafe URL: leave empty, never reaches the sink */ }
     }
   }
 
@@ -2570,10 +2957,28 @@ function downloadTorrentWithAria2c(args, timeoutMs = 8 * 60 * 1000) {
   });
 }
 
-async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOfficial = false, preferArabic = true, customSubName = '') {
+export async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOfficial = false, preferArabic = true, customSubName = '', options = {}) {
+  // S1b/S1c: validate FIRST (no raw URL in any thrown message), pin the host and
+  // cap the bytes. The text/html rejection already lives in downloadFileToDisk.
+  const { recovery = false } = options;
+  const expectedHost = validateTorrentUrl(torrentUrl, { recovery });
   const torrentPath = path.join(workDir, 'release.torrent');
-  await downloadFileToDisk(torrentUrl, torrentPath);
-  console.log(`   📥 Torrent file downloaded (${fs.statSync(torrentPath).size} bytes)`);
+  await downloadFileToDisk(torrentUrl, torrentPath, {}, {
+    expectedHost,
+    maxBytes: 20 * 1024 * 1024,
+    // F4: manual redirect for ALL messages (recovery still aborts on any 3xx,
+    // non-recovery follows a bounded re-validated chain in downloadFileToDisk).
+    redirect: RECOVERY_REDIRECT_MODE,
+    recovery,
+  });
+  // S1d: only accept a file that actually downloaded with a non-zero size.
+  const torrentSize = fs.statSync(torrentPath).size;
+  if (!(torrentSize > 0)) {
+    // F11: never leak an empty file behind a failed size check.
+    try { fs.rmSync(torrentPath, { force: true }); } catch { }
+    throw new Error('Torrent download produced an empty file');
+  }
+  console.log(`   📥 Torrent file downloaded (${torrentSize} bytes)`);
 
   const downloadDir = path.join(workDir, 'mkv_dl');
   fs.mkdirSync(downloadDir, { recursive: true });
@@ -2624,6 +3029,17 @@ async function downloadAndExtractSubtitleFromTorrent(torrentUrl, workDir, isOffi
 // Document publisher (Bot API with automatic MTProto Fallback)
 // ====================================================================
 export async function publishDocument(client, filePath, caption, options = {}) {
+  // BUG C — last-line defence for all 9 publish sites: a caption or file name
+  // that is still a temporary downloader artefact is refused (counts as failed
+  // at the caller). Never transform it into a title — that is the root cause.
+  const captionBase = stripTeamAndTrailingTags(caption);
+  const fileBase = stripTeamAndTrailingTags(path.basename(filePath));
+  if (isTempDownloadName(captionBase) || isTempDownloadName(fileBase)) {
+    const refused = logSafe(captionBase || fileBase);
+    console.warn(`   ⚠️ Refusing to publish temporary download name: "${refused}"`);
+    return { ok: false, description: `Temporary download name refused: ${refused}` };
+  }
+
   const fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
   const FILE_SIZE_BOT_API_LIMIT = 50 * 1024 * 1024; // 50 MB (official Bot API document limit)
 
@@ -3032,6 +3448,30 @@ export async function checkTelegramChannels(existingClient = null) {
     { connectionRetries: 5 }
   );
 
+  // Recovery / backfill spec (RECOVERY_SPEC). Parsed once per run; a blank or
+  // absent value is completely inert. A parse error is fatal and logged by
+  // code only — the raw spec is never echoed.
+  let recoveryTasks = [];
+  try {
+    recoveryTasks = parseRecoverySpec(process.env.RECOVERY_SPEC || '').tasks;
+  } catch (specErr) {
+    throw createFatalError(RECOVERY_CODES.SPEC_INVALID, RECOVERY_CODES.SPEC_INVALID, summary);
+  }
+  const fetchByIds = (chatId, ids) => client.getMessages(chatId, { ids });
+  const recoveryLog = (...args) => console.log(...args);
+  // F1/F4: EVERY recovery message (synthetic / id / pending retry) carries a
+  // marker. Its postUrl scrape forbids redirects (SSRF second hop); ONLY the
+  // typed recovery refusals are fatal — every other error propagates unchanged.
+  const scrapeWithRecoveryGuard = (msg, scrape) => withRecoveryMode(msg, async () => {
+    try {
+      return await scrape();
+    } catch (e) {
+      const fatalCode = recoveryFatalCodeFor(e);
+      if (fatalCode) throw createFatalError(fatalCode, fatalCode, summary);
+      throw e;
+    }
+  }, recoveryState);
+
   try {
     if (!client.connected) {
       console.log(`\n📡 [Telegram MTProto Client] Connecting to Telegram...`);
@@ -3137,6 +3577,17 @@ export async function checkTelegramChannels(existingClient = null) {
       throw createFatalError('CHANNELS_ZERO', 'No target source channel found — refusing to run a silent window.', summary);
     }
 
+    // C4/F5: EVERY task must reference a FULL dialog id of a target source chat
+    // (strict String equality). One bogus chatId beside a valid one is fatal —
+    // never silently ignored. The withRecoveryMessages check stays as depth.
+    if (recoveryTasks.length) {
+      const unknown = unknownRecoveryChatIds(recoveryTasks, targetSourceChats.map(c => c.id));
+      if (unknown.length) {
+        // Fatal diagnostic is code-only: no raw spec and no chat id is echoed.
+        throw createFatalError(RECOVERY_CODES.CHAT_UNKNOWN, RECOVERY_CODES.CHAT_UNKNOWN, summary);
+      }
+    }
+
     fs.mkdirSync(OUT_DIR, { recursive: true });
 
     for (const chat of targetSourceChats) {
@@ -3153,9 +3604,21 @@ export async function checkTelegramChannels(existingClient = null) {
         // Sources can publish a batch far larger than one scheduled interval.
         // Keep enough history to retry a failed batch instead of losing it once
         // newer messages push it beyond the old 15-message window.
-        const msgs = await client.getMessages(chat.id, { limit: 15 });
+        const windowMsgs = await client.getMessages(chat.id, { limit: 15 });
+        const chatRecoveryTasks = recoveryTasks.filter(t => String(t.chatId) === idStr);
+        const { msgs, fatal: recoveryFatal } = await withRecoveryMessages({
+          chat, windowMsgs, posted, tasks: chatRecoveryTasks, fetchByIds, log: recoveryLog,
+        });
+        if (recoveryFatal) {
+          throw createFatalError(recoveryFatal.code, recoveryFatal.message, summary);
+        }
 
         for (const msg of msgs) {
+          // G2: expose the message being processed for the WHOLE iteration. The
+          // page-scrape guard restores its own flag when the scrape returns, but
+          // the fansub directory call happens later in this same iteration and
+          // must still see the recovery marker.
+          recoveryState.msg = isRecoveryMessage(msg) ? msg : null;
           const msgKey = `tg_${chat.id}_${msg.id}`;
           const text = msg.message || '';
           if (isMessageAlreadyHandled(posted, msgKey)) {
@@ -3185,15 +3648,15 @@ export async function checkTelegramChannels(existingClient = null) {
 
             const formattedTitle = `[${eraiData.sourceName}] ${eraiData.title}`;
             const eraiResolved = await resolveCanonicalTitle(formattedTitle);
-            const releaseKeys = getReleaseKeys(formattedTitle, true, eraiResolved);
+            const phase1 = computeReleaseKeySet(formattedTitle, { isOfficial: true, resolved: eraiResolved });
 
-            if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+            if (isReleaseAlreadyPostedOrDispatched(posted, phase1.keys, { season: phase1.season })) {
               // P1-5: the log must not claim a publication that never
               // happened here — a dispatched release is named as such.
-              const wasDispatched = isReleaseDispatched(posted, releaseKeys);
+              const wasDispatched = isReleaseDispatched(posted, phase1.keys);
               console.log(`   ⏭️ [Erai-Raws] "${formattedTitle}" already ${wasDispatched ? 'dispatched to the sub-extractor' : 'posted as official release'}. Skipping.`);
               countSkipped(msgKey); // dedup hit
-              markReleaseAsKnown(posted, msgKey, releaseKeys);
+              markReleaseAsKnown(posted, msgKey, phase1.keys, { season: phase1.season });
               continue;
             }
 
@@ -3203,8 +3666,19 @@ export async function checkTelegramChannels(existingClient = null) {
             if (batchRange && batchRange[1] > batchRange[0]) {
               console.log(`   📦 [Erai-Raws] Detected multi-episode batch "${formattedTitle}" (episodes ${batchRange[0]}~${batchRange[1]}).`);
               if (process.env.GH_PAT && eraiData.torrentUrl) {
+                // F7: validate BEFORE handing the URL to Actions — an unsafe
+                // URL is never sent to the sub-extractor workflow. No raw URL
+                // in the log (a stable code is emitted instead).
+                let batchTorrentUrl = null;
+                try {
+                  validateTorrentUrl(eraiData.torrentUrl);
+                  batchTorrentUrl = eraiData.torrentUrl;
+                } catch {
+                  console.warn('   ⛔ [Erai-Raws] batch torrent URL rejected (TORRENT_URL_UNSAFE); skipping dispatch.');
+                }
+                if (batchTorrentUrl) {
                 console.log(`   🚀 Dispatching batch extraction to sub-extractor workflow...`);
-                const dispatched = await dispatchBatchExtractor(eraiData.torrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
+                const dispatched = await dispatchBatchExtractor(batchTorrentUrl, formattedTitle, CONFIG.TELEGRAM.TARGET_CHANNEL);
                 if (dispatched) {
                   // DEFERRED — the batch was handed to the sub-extractor
                   // repository, but the publication there is NOT confirmed
@@ -3212,12 +3686,16 @@ export async function checkTelegramChannels(existingClient = null) {
                   // published release) so the state does not claim a
                   // publication this bot never made — and it is not
                   // dispatched a second time.
-                  recordDispatchedBatch(posted, msgKey, releaseKeys, { title: formattedTitle, counters: { countDeferred } });
+                  recordDispatchedBatch(posted, msgKey, phase1.keys, { title: formattedTitle, counters: { countDeferred } });
                 } else {
                   // DEFERRED — never counted as failed, and deliberately NOT
                   // marked as posted so the release is retried next cycle.
                   countDeferred(msgKey);
                   console.warn(`   ⏸️ DEFERRED (batch dispatch failed): "${formattedTitle}" – NOT marked as posted`);
+                }
+                } else {
+                  countSkipped(msgKey); // unsafe batch torrent URL — never dispatched
+                  console.log(`   ⏭️ Skipping batch extraction (unsafe torrent URL).`);
                 }
               } else {
                 countSkipped(msgKey); // batch extraction skipped
@@ -3242,14 +3720,18 @@ export async function checkTelegramChannels(existingClient = null) {
 
             console.log(`\n✨ [Erai-Raws Official] "${formattedTitle}"`);
             console.log(`   📦 Source: ${eraiData.source} → [${eraiData.sourceName}]`);
-            console.log(`   🔗 Torrent: ${eraiData.torrentUrl}`);
+            // S2: log the host only — never the full URL / query / credentials.
+            console.log(`   🔗 Torrent host: ${sourceHostOf(eraiData.torrentUrl)}`);
 
             const eraiWorkDir = path.join(OUT_DIR, `erai_${msg.id}`);
             fs.mkdirSync(eraiWorkDir, { recursive: true });
 
             try {
               // isOfficial = true ensures strictly .ass extraction without fonts or zip
-              const extracted = await downloadAndExtractSubtitleFromTorrent(eraiData.torrentUrl, eraiWorkDir, true, true, formattedTitle);
+              const extracted = await downloadAndExtractSubtitleFromTorrent(
+                eraiData.torrentUrl, eraiWorkDir, true, true, formattedTitle,
+                { recovery: isRecoveryMessage(msg) },
+              );
 
               if (extracted && extracted.filePath) {
                 const effectiveTitle = extracted.resolvedTitle || formattedTitle;
@@ -3258,13 +3740,22 @@ export async function checkTelegramChannels(existingClient = null) {
                 safeMoveFile(extracted.filePath, finalPath);
 
                 const caption = formatCleanCaption(effectiveTitle, false, true);
+                // BUG B — phase-2 gate: re-check on the post-resolver title.
+                const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                  effectiveTitle, resolved: eraiResolved, isOfficial: true,
+                });
+                if (!gate.proceed) {
+                  countSkipped(msgKey);
+                  try { fs.rmSync(finalPath, { force: true }); } catch { }
+                  continue;
+                }
                 console.log(`   📤 Publishing official sub: "${logSafe(caption)}" (filename: ${logSafe(cleanFileName)})`);
                 const sendResult = await publishDocument(client, finalPath, caption);
 
                 if (sendResult?.ok) {
                   console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
                   countPublished(msgKey);
-                  markReleaseAsPosted(posted, msgKey, releaseKeys);
+                  markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                 } else {
                   countFailed(msgKey);
                   console.error(`   ❌ Failed to send document:`, sendResult);
@@ -3334,14 +3825,13 @@ export async function checkTelegramChannels(existingClient = null) {
 
                 const isOfficialSubdl = isOfficialPlatformRelease(cleanTitle);
                 const cleanTitleResolved = await resolveCanonicalTitle(cleanTitle);
-                const releaseKeys = isOfficialSubdl
-                  ? getReleaseKeys(cleanTitle, true, cleanTitleResolved)
-                  : getFansubReleaseKeys(cleanTitle, cleanTitleResolved);
+                const phase1 = computeReleaseKeySet(cleanTitle, { isOfficial: isOfficialSubdl, resolved: cleanTitleResolved });
+                const linkedMsgKey = linkedMsgId ? `tg_${chat.id}_${linkedMsgId}` : null;
 
-                if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+                if (isReleaseAlreadyPostedOrDispatched(posted, phase1.keys, { season: phase1.season })) {
                   countSkipped(msgKey); // dedup hit
-                  markReleaseAsKnown(posted, msgKey, releaseKeys);
-                  if (linkedMsgId) markReleaseAsKnown(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
+                  markReleaseAsKnown(posted, msgKey, phase1.keys, { season: phase1.season });
+                  if (linkedMsgKey) markReleaseAsKnown(posted, linkedMsgKey, phase1.keys, { season: phase1.season });
                   continue;
                 }
 
@@ -3463,14 +3953,23 @@ export async function checkTelegramChannels(existingClient = null) {
                       }
 
                       const caption = formatCleanCaption(cleanTitle, validated.isArchive, isOfficialPlatformRelease(cleanTitle), hasArchiveFonts);
+                      const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                        effectiveTitle: cleanTitle, resolved: cleanTitleResolved,
+                        isOfficial: isOfficialSubdl, linkedMsgKey,
+                      });
+                      if (!gate.proceed) {
+                        countSkipped(msgKey);
+                        try { fs.rmSync(finalPath, { force: true }); } catch { }
+                        continue;
+                      }
                       console.log(`   📤 Publishing Subdl direct file: "${logSafe(caption)}" (filename: ${logSafe(cleanFileName)})`);
                       const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
                         countPublished(msgKey);
-                        markReleaseAsPosted(posted, msgKey, releaseKeys);
-                        if (linkedMsgId) markReleaseAsPosted(posted, `tg_${chat.id}_${linkedMsgId}`, releaseKeys);
+                        markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
+                        if (linkedMsgKey) markReleaseAsPosted(posted, linkedMsgKey, gate.mergedKeys);
                       } else {
                         countFailed(msgKey);
                         console.error(`   ❌ Failed to send document:`, sendResult);
@@ -3501,13 +4000,11 @@ export async function checkTelegramChannels(existingClient = null) {
             // messages must be deduplicated within that team, not globally.
             const isOfficialSubdl = isOfficialPlatformRelease(rawTitle);
             const rawTitleResolved = await resolveCanonicalTitle(rawTitle);
-            const releaseKeys = isOfficialSubdl
-              ? getReleaseKeys(rawTitle, true, rawTitleResolved)
-              : getFansubReleaseKeys(rawTitle, rawTitleResolved);
+            const phase1 = computeReleaseKeySet(rawTitle, { isOfficial: isOfficialSubdl, resolved: rawTitleResolved });
 
-            if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+            if (isReleaseAlreadyPostedOrDispatched(posted, phase1.keys, { season: phase1.season })) {
               countSkipped(msgKey); // dedup hit
-              markReleaseAsKnown(posted, msgKey, releaseKeys);
+              markReleaseAsKnown(posted, msgKey, phase1.keys, { season: phase1.season });
               continue;
             }
 
@@ -3694,13 +4191,21 @@ export async function checkTelegramChannels(existingClient = null) {
                   }
 
                   const caption = formatCleanCaption(rawTitle, isArchiveRelease, isOfficialSubdl, hasFonts);
+                  const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                    effectiveTitle: rawTitle, resolved: rawTitleResolved, isOfficial: isOfficialSubdl,
+                  });
+                  if (!gate.proceed) {
+                    countSkipped(msgKey);
+                    try { fs.rmSync(finalFilePath, { force: true }); } catch { }
+                    continue;
+                  }
                   console.log(`   📤 Publishing to channel: "${logSafe(caption)}" (filename: ${logSafe(path.basename(finalFilePath))})`);
                   const sendResult = await publishDocument(client, finalFilePath, caption);
 
                   if (sendResult?.ok) {
                     console.log(`   ✅ Successfully posted! (Message ID: ${sendResult.result?.message_id})`);
                     countPublished(msgKey);
-                    markReleaseAsPosted(posted, msgKey, releaseKeys);
+                    markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                   } else {
                     countFailed(msgKey);
                     console.error(`   ❌ Failed to send document:`, sendResult);
@@ -3745,11 +4250,11 @@ export async function checkTelegramChannels(existingClient = null) {
 
                 const titleLine = formatCleanTitle(docBaseName);
                 const titleLineResolved = await resolveCanonicalTitle(titleLine);
-                const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
+                const phase1 = computeReleaseKeySet(titleLine, { isOfficial: false, resolved: titleLineResolved });
 
-                if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+                if (isReleaseAlreadyPostedOrDispatched(posted, phase1.keys, { season: phase1.season })) {
                   countSkipped(msgKey); // dedup hit
-                  markReleaseAsKnown(posted, msgKey, releaseKeys);
+                  markReleaseAsKnown(posted, msgKey, phase1.keys, { season: phase1.season });
                   continue;
                 }
 
@@ -3771,13 +4276,21 @@ export async function checkTelegramChannels(existingClient = null) {
                       safeMoveFile(localFilePath, finalPath);
 
                       const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                      const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                        effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
+                      });
+                      if (!gate.proceed) {
+                        countSkipped(msgKey);
+                        try { fs.rmSync(finalPath, { force: true }); } catch { }
+                        continue;
+                      }
                       console.log(`   📤 Publishing LazySano release: "${logSafe(caption)}"`);
                       const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted!`);
                         countPublished(msgKey);
-                        markReleaseAsPosted(posted, msgKey, releaseKeys);
+                        markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                       } else {
                         // No failure branch existed here: the release was
                         // silently lost. It is NOT marked as posted, so it is
@@ -3809,10 +4322,10 @@ export async function checkTelegramChannels(existingClient = null) {
 
             if (titleLine) {
               const titleLineResolved = await resolveCanonicalTitle(titleLine);
-              const releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
-              if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+              const phase1 = computeReleaseKeySet(titleLine, { isOfficial: false, resolved: titleLineResolved });
+              if (isReleaseAlreadyPostedOrDispatched(posted, phase1.keys, { season: phase1.season })) {
                 countSkipped(msgKey); // dedup hit
-                markReleaseAsKnown(posted, msgKey, releaseKeys);
+                markReleaseAsKnown(posted, msgKey, phase1.keys, { season: phase1.season });
                 continue;
               }
 
@@ -3822,21 +4335,21 @@ export async function checkTelegramChannels(existingClient = null) {
                 // m7: a collection title ("الدفعة الأولى", "[01~05]") asks for
                 // the WHOLE batch — the DDL directory then holds one archive
                 // per episode and the whole-batch archive must be preferred.
-                const pageData = await scrapePostPage(postPageUrl, null, extractEpisodeNumber(titleLine) || null, titleLine, { batch: isCollectionTitle(titleLine) });
+                const pageData = await scrapeWithRecoveryGuard(msg, () => scrapePostPage(postPageUrl, null, extractEpisodeNumber(titleLine) || null, titleLine, { batch: isCollectionTitle(titleLine) }));
                 // P1-1b: a negative-cached candidate was already fetched and
                 // found to have NO link — the request was not made again. It
-                // is logged distinctly and left unclassified on purpose: the
-                // message can still be published from another candidate, and
-                // the per-message safety net counts it as skipped.
+                // is logged distinctly and left unclassified by the cycle
+                // counters on purpose: the message can still be published from
+                // another candidate, and the per-message safety net counts it
+                // as skipped. (The pending ledger still records it — see below.)
                 const negativeCached = Boolean(pageData?.negativeCached);
-                if (negativeCached) {
-                  countNoLinks(postPageUrl);
-                  console.log(`   ⏭️ Negative cache: no links for ${postPageUrl} — skipped this cycle (no fetch).`);
-                } else if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
-                else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) {
-                  countNoLinks(postPageUrl);
-                  console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
-                }
+                // C8/F7: EVERY confirmed no-links outcome is recorded in the
+                // ledger — negative-cached OR freshly scraped — with the same
+                // bounds: max 3 attempts/msg, 200 pending keys (oldest pruned),
+                // 7d TTL skips on read only.
+                noteNoLinksOutcome(pageData, posted, msgKey, postPageUrl, countNoLinks,
+                  (level, text) => console[level](text));
+                if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
                 if (pageData && !negativeCached) {
                   let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
                   if (pageData.videoLinks?.top4top) {
@@ -3868,11 +4381,19 @@ export async function checkTelegramChannels(existingClient = null) {
                               safeMoveFile(tempDest, finalPath);
 
                               const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                              const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                                effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
+                              });
+                              if (!gate.proceed) {
+                                countSkipped(msgKey);
+                                try { fs.rmSync(finalPath, { force: true }); } catch { }
+                                continue;
+                              }
                               console.log(`   📤 Publishing LazySano post link: "${logSafe(caption)}"`);
                               const sendResult = await publishDocument(client, finalPath, caption);
                               if (sendResult?.ok) {
                                 countPublished(msgKey);
-                                markReleaseAsPosted(posted, msgKey, releaseKeys);
+                                markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                               } else {
                                 // No failure branch existed here (F-10).
                                 countFailed(msgKey);
@@ -3908,11 +4429,19 @@ export async function checkTelegramChannels(existingClient = null) {
                         safeMoveFile(tempDest, finalPath);
 
                         const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                        const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                          effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
+                        });
+                        if (!gate.proceed) {
+                          countSkipped(msgKey);
+                          try { fs.rmSync(finalPath, { force: true }); } catch { }
+                          continue;
+                        }
                         console.log(`   📤 Publishing LazySano post link: "${logSafe(caption)}"`);
                         const sendResult = await publishDocument(client, finalPath, caption);
                         if (sendResult?.ok) {
                           countPublished(msgKey);
-                          markReleaseAsPosted(posted, msgKey, releaseKeys);
+                          markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                         } else {
                           // No failure branch existed here (F-10).
                           countFailed(msgKey);
@@ -3951,11 +4480,11 @@ export async function checkTelegramChannels(existingClient = null) {
 
           let titleLine = extractTeamAndFormatTitle(text);
           const titleLineResolved = await resolveCanonicalTitle(titleLine);
-          let releaseKeys = getFansubReleaseKeys(titleLine, titleLineResolved);
+          const phase1 = computeReleaseKeySet(titleLine, { isOfficial: false, resolved: titleLineResolved });
 
-          if (isReleaseAlreadyPostedOrDispatched(posted, releaseKeys)) {
+          if (isReleaseAlreadyPostedOrDispatched(posted, phase1.keys, { season: phase1.season })) {
             countSkipped(msgKey); // dedup hit
-            markReleaseAsKnown(posted, msgKey, releaseKeys);
+            markReleaseAsKnown(posted, msgKey, phase1.keys, { season: phase1.season });
             continue;
           }
 
@@ -3989,13 +4518,21 @@ export async function checkTelegramChannels(existingClient = null) {
                     safeMoveFile(localFilePath, finalPath);
 
                     const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                    const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                      effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
+                    });
+                    if (!gate.proceed) {
+                      countSkipped(msgKey);
+                      try { fs.rmSync(finalPath, { force: true }); } catch { }
+                      continue;
+                    }
                     console.log(`   📤 Publishing to channel: "${logSafe(caption)}"`);
                     const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);
                       countPublished(msgKey);
-                      markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                     } else {
                       // No failure branch existed here (F-10).
                       countFailed(msgKey);
@@ -4046,22 +4583,22 @@ export async function checkTelegramChannels(existingClient = null) {
             console.log(`\n✨ [Fansub Post] "${logSafe(titleLine)}"`);
             console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
             const targetEp = extractEpisodeNumber(titleLine);
-            const pageData = await scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine);
+            const pageData = await scrapeWithRecoveryGuard(msg, () => scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine));
 
             // P1-1b: a negative-cached candidate was already fetched and found
             // to have NO link — the request was not made again. It is logged
-            // distinctly and left unclassified on purpose: this message can
-            // still be published from another candidate URL, and the
-            // per-message safety net counts it as skipped.
+            // distinctly and left unclassified by the cycle counters on
+            // purpose: this message can still be published from another
+            // candidate URL, and the per-message safety net counts it as
+            // skipped. (The pending ledger still records it — see below.)
             const negativeCached = Boolean(pageData?.negativeCached);
-            if (negativeCached) {
-              countNoLinks(postPageUrl);
-              console.log(`   ⏭️ Negative cache: no links for ${postPageUrl} — skipped this cycle (no fetch).`);
-            } else if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
-            else if (!pageData.bestDownloadUrl && !pageData.videoLinks?.directSub) {
-              countNoLinks(postPageUrl);
-              console.warn(`   ⚠️ No download links found in ${postPageUrl}`);
-            }
+            // C8/F7: EVERY confirmed no-links outcome is recorded in the
+            // ledger — negative-cached OR freshly scraped — with the same
+            // bounds: max 3 attempts/msg, 200 pending keys (oldest pruned),
+            // 7d TTL skips on read only.
+            noteNoLinksOutcome(pageData, posted, msgKey, postPageUrl, countNoLinks,
+              (level, text) => console[level](text));
+            if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
 
             if (pageData && !negativeCached) {
               const fansubWorkDir = path.join(OUT_DIR, `fansub_${msg.id}`);
@@ -4078,7 +4615,8 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
                 if (directUrl && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directUrl) && !/\.(ass|srt|zip|rar|7z)$/i.test(directUrl)) {
                   // X7: the same batch option as the LazySano caller — a
-                  // collection title asks for the whole batch.
+                  // collection title asks for the whole batch. (The no-redirect
+                  // mode for recovery messages is injected by the local wrapper.)
                   const resolved = await resolveSubtitleFromDirectory(directUrl, targetEp, { batch: isCollectionTitle(titleLine) });
                   if (resolved) directUrl = resolved;
                 }
@@ -4153,7 +4691,7 @@ export async function checkTelegramChannels(existingClient = null) {
                         }
                       }
                     } else if (source.kind === 'mega') {
-                      const megaRelease = await downloadMegaFolderRelease(source.url, fansubWorkDir, targetEp, { rawTitle: titleLine, listedFiles: listing });
+                      const megaRelease = await downloadMegaFolderRelease(source.url, fansubWorkDir, targetEp, { rawTitle: titleLine, listedFiles: listing, batch: isCollectionTitle(titleLine) });
                       if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
                         downloadedFilePath = megaRelease.filePath;
                       }
@@ -4188,18 +4726,13 @@ export async function checkTelegramChannels(existingClient = null) {
                       }
                     }
                   } catch (e) {
-                    if (isCloudCapError(e)) {
-                      // M6: a cap refusal is a REFUSAL, not a soft failure: the
-                      // source goes into a 6 h cooldown (the key carries the
-                      // REDACTED url — a Mega key never ends up in a log).
-                      // The refusal is NOT added to the P0 per-message summary
-                      // counters: the message itself ends up as `skipped`
-                      // through the safety net further down.
-                      markCloudCapCooldown(source.kind, source.url);
-                      console.warn(`   ⚠️ ${sourceLabel} REFUSED (${e.code}): ${logSafe(e.message)} — cooldown ${Math.round(CLOUD_CAP_LIMITS.CAP_COOLDOWN_MS / 60000)} min`);
-                    } else {
-                      console.warn(`   ⚠️ ${sourceLabel} download failed:`, logSafe(e && e.message));
-                    }
+                    // M6: a cap refusal is a REFUSAL, not a soft failure: the
+                    // source goes into a 6 h cooldown (the key carries the
+                    // REDACTED url — a Mega key never ends up in a log), EXCEPT
+                    // for a SERIES_FOLDER_BATCH refusal — there the loop simply
+                    // continues to the next source. No state key is written,
+                    // so the message ends `skipped` via the safety net below.
+                    handleCloudCapRefusal(e, { kind: source.kind, url: source.url, label: sourceLabel });
                   }
                 }
 
@@ -4269,7 +4802,13 @@ export async function checkTelegramChannels(existingClient = null) {
                     console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
                   } else {
                     console.log(`   📥 Fansub torrent found: ${redactUrl(pageData.videoLinks.torrent)}`);
-                    const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine);
+                    const extractedTorrent = await downloadAndExtractSubtitleFromTorrent(
+                      pageData.videoLinks.torrent, fansubWorkDir, false, false, titleLine,
+                      // F9: use the in-scope loop `msg`, not recoveryState.msg —
+                      // nested scrape guards can restore/clear the shared state
+                      // during this iteration, so the two can diverge.
+                      { recovery: isRecoveryMessage(msg) },
+                    );
                     if (extractedTorrent && extractedTorrent.filePath) {
                       if (extractedTorrent.resolvedTitle) {
                         titleLine = extractedTorrent.resolvedTitle;
@@ -4279,13 +4818,21 @@ export async function checkTelegramChannels(existingClient = null) {
                       safeMoveFile(extractedTorrent.filePath, finalPath);
 
                       const caption = formatCleanCaption(titleLine, extractedTorrent.isArchive, false);
+                      const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                        effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
+                      });
+                      if (!gate.proceed) {
+                        countSkipped(msgKey);
+                        try { fs.rmSync(finalPath, { force: true }); } catch { }
+                        continue;
+                      }
                       console.log(`   📤 Publishing to channel: "${logSafe(caption)}"`);
                       const sendResult = await publishDocument(client, finalPath, caption);
 
                       if (sendResult?.ok) {
                         console.log(`   ✅ Successfully posted!`);
                         countPublished(msgKey);
-                        markReleaseAsPosted(posted, msgKey, releaseKeys);
+                        markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                         fs.rmSync(finalPath, { force: true });
                         break;
                       } else {
@@ -4318,13 +4865,21 @@ export async function checkTelegramChannels(existingClient = null) {
                     safeMoveFile(extracted.filePath, finalPath);
 
                     const caption = formatCleanCaption(titleLine, extracted.isArchive, false);
+                    const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
+                      effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
+                    });
+                    if (!gate.proceed) {
+                      countSkipped(msgKey);
+                      try { fs.rmSync(finalPath, { force: true }); } catch { }
+                      continue;
+                    }
                     console.log(`   📤 Publishing to channel: "${logSafe(caption)}"`);
                     const sendResult = await publishDocument(client, finalPath, caption);
 
                     if (sendResult?.ok) {
                       console.log(`   ✅ Successfully posted!`);
                       countPublished(msgKey);
-                      markReleaseAsPosted(posted, msgKey, releaseKeys);
+                      markReleaseAsPosted(posted, msgKey, gate.mergedKeys);
                       fs.rmSync(finalPath, { force: true });
                       break;
                     } else {

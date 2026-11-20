@@ -502,19 +502,19 @@ export function extractExplicitEpisodeRange(text) {
 
 // The narrowing decision of a cloud folder, as ONE pure function.
 //
-// A folder that holds MORE THAN ONE episode is a BATCH: every episode of it
-// belongs to the release, so the download must NOT be narrowed to the episode
-// the post asks for. That narrowing is what silently dropped four episodes:
-// the post said "الدفعة الأولى" ("the first BATCH"), the folder held 001-005,
-// the title resolved to episode "01", and only "- 001" was published.
+// A folder that holds MORE THAN ONE episode is a BATCH by default: every
+// episode of it belongs to the release, so the download must NOT be narrowed
+// to the episode the post asks for. That narrowing is what silently dropped
+// four episodes: the post said "الدفعة الأولى" ("the first BATCH"), the folder
+// held 001-005, the title resolved to episode "01", and only "- 001" shipped.
 //
-// m9 (DECISION, no code): a multi-episode folder is NEVER narrowed by a
-// single requested episode. The narrowing happens ONLY for
-//   - an explicit episode range/list in the title ("01~05") — take exactly
-//     those episodes (the current meaning of that branch),
-//   - a folder that offers a SINGLE episode — the per-episode folder case,
-//     which must not regress.
-export function selectFolderTargets(subFiles, { targetEpisode = null, extractedEps = [] } = {}) {
+// m9 (INVARIANT): a multi-episode folder is NEVER narrowed UNLESS the caller
+// explicitly passes `batch: false` for a SINGLE-episode title. `batch`
+// defaults to true so EVERY existing caller keeps the batch behaviour. The
+// only other narrowing rule is an explicit episode range/list in the title
+// ("01~05") — take exactly those episodes. A non-parsable filename never
+// makes a release vanish: a failed narrow falls through to "take all".
+export function selectFolderTargets(subFiles, { targetEpisode = null, extractedEps = [], batch = true } = {}) {
   const all = Array.isArray(subFiles) ? subFiles : [];
   if (all.length === 0) return [];
 
@@ -524,8 +524,16 @@ export function selectFolderTargets(subFiles, { targetEpisode = null, extractedE
     if (match.length > 0) return match;
   }
 
+  // A SINGLE-episode title (batch: false) narrows a multi-episode folder to
+  // the requested episode. Zero matches FALL THROUGH — never return [] here,
+  // so a folder with non-parsable names is still downloaded whole.
+  if (batch !== true && targetEpisode) {
+    const match = all.filter(f => matchesEpisode(f.name, targetEpisode));
+    if (match.length > 0) return match;
+  }
+
   // A multi-episode folder is a batch: take ALL of it (m9 — the requested
-  // episode never narrows a batch).
+  // episode never narrows a batch unless batch: false was passed explicitly).
   if (countFolderEpisodes(all) > 1) return all;
 
   // A single-episode folder: the requested episode decides (as before).
@@ -546,13 +554,13 @@ export function selectFolderTargets(subFiles, { targetEpisode = null, extractedE
 // .ass/.srt files only) — the archives are filtered BEFORE the episode
 // count, so an archive can be chosen as a SINGLE release but never as a
 // batch member.
-export function selectFolderSubtitleBatch(subFiles, { targetEpisode = null, extractedEps = [] } = {}) {
+export function selectFolderSubtitleBatch(subFiles, { targetEpisode = null, extractedEps = [], batch = true } = {}) {
   const all = Array.isArray(subFiles) ? subFiles : [];
   if (all.length === 0) return [];
   const subs = all.filter(f => f && SUBTITLE_FILE_RE.test(f.name || ''));
   if (subs.length === 0) return [];
   if (countFolderEpisodes(subs) <= 1) return [];
-  return selectFolderTargets(subs, { targetEpisode, extractedEps });
+  return selectFolderTargets(subs, { targetEpisode, extractedEps, batch });
 }
 
 // F2c — does this cloud folder listing offer SUBTITLE files?
@@ -743,6 +751,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   const {
     rawTitle = '',
     listedFiles = null,
+    batch = true,
     downloadNode = downloadMegaNode,
   } = options || {};
 
@@ -764,23 +773,42 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   if (subFiles.length > 0) {
     // F2a: a folder that holds several episodes is a BATCH — the whole batch
     // is downloaded, never narrowed to the episode the post asks for (the
-    // same rule as the Drive folder).
-    // m8 (parity with the Drive path): the EXPLICIT episode range of the
-    // title is the only narrowing rule (M4) — a title with a single episode
-    // number never narrows a multi-episode folder (m9).
+    // same rule as the Drive folder). m8/m9: an EXPLICIT episode range is the
+    // only other narrowing rule; a single-episode TITLE narrows ONLY when the
+    // caller explicitly passes `batch: false` (a single-episode post).
     const targetSubs = selectFolderTargets(subFiles, {
       targetEpisode,
       extractedEps: extractExplicitEpisodeRange(rawTitle),
+      batch,
     });
     console.log(`   🎯 [Mega Release] ${targetSubs.length}/${subFiles.length} subtitle file(s) selected from the folder.`);
 
     const isBatch = targetSubs.length > 1;
     const hasFonts = fontFiles.length > 0;
+    // The fonts of the release (packToZip puts them under Fonts/). Counted
+    // towards the cap alongside the selected subtitles.
+    const fontCount = fontFiles.length;
 
     // If multiple subtitles or fonts are present, bundle into zip archive
     if (isBatch || hasFonts) {
-      console.log(`   📦 [Mega Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontFiles.length} font(s)). Downloading and packing to .zip...`);
+      console.log(`   📦 [Mega Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontCount} font(s)). Downloading and packing to .zip...`);
       // The cap is checked BEFORE the first download (M6).
+      //
+      // A single-episode title narrowed out of a series-wide folder is NOT a
+      // batch: refusing it with the generic TOO_MANY_FILES would put the
+      // source into a 6 h cooldown and hide that another source may still
+      // carry the requested episode. Give it its own code so the caller can
+      // skip THIS source only. The message carries counts + limit alone
+      // (no URL, no raw title — the caller wraps it in logSafe).
+      const narrowed = batch !== true && Boolean(targetEpisode) && targetSubs.length < subFiles.length;
+      const seriesFolderCounts = `${targetSubs.length} sub(s) + ${fontCount} font(s) > ${CLOUD_CAP_LIMITS.MAX_FILES}`;
+      if (narrowed && targetSubs.length + fontCount > CLOUD_CAP_LIMITS.MAX_FILES) {
+        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
+      }
+      // Fonts alone can blow the budget even with a single selected sub.
+      if (targetSubs.length === 1 && fontCount >= CLOUD_CAP_LIMITS.MAX_FILES) {
+        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
+      }
       assertCloudBatchCaps(targetSubs, fontFiles);
 
       const unpackDir = path.join(destDir, nextTempTag('mega_unpack'));
