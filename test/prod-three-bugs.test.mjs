@@ -438,10 +438,12 @@ test('RETRACTED_KEYS eviction: false sequel dedup keys are filtered in load and 
   const { mergePostedIds } = await import('../scripts/merge-posted-state.mjs');
   const { loadPostedIds } = tc;
 
-  assert.equal(RETRACTED_KEYS.size, 170);
+  assert.equal(RETRACTED_KEYS.size, 312);
   assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11484'));
   assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11486'));
   assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11490'));
+  assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11268'));
+  assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11331'));
 
   // Test mergePostedIds excludes RETRACTED_KEYS
   const mergeResult = mergePostedIds(

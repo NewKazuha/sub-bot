@@ -3517,7 +3517,9 @@ export async function checkTelegramChannels(existingClient = null) {
   } catch (specErr) {
     throw createFatalError(RECOVERY_CODES.SPEC_INVALID, RECOVERY_CODES.SPEC_INVALID, summary);
   }
-  const fetchByIds = (chatId, ids) => client.getMessages(chatId, { ids });
+  const fetchByIds = (chatId, ids) => client.getMessages(chatId, {
+    ids: Array.isArray(ids) ? ids.map(id => Number(id)).filter(n => Number.isFinite(n) && n > 0) : ids,
+  });
   const recoveryLog = (...args) => console.log(...args);
   // F1/F4: EVERY recovery message (synthetic / id / pending retry) carries a
   // marker. Its postUrl scrape forbids redirects (SSRF second hop); ONLY the
