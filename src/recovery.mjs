@@ -286,8 +286,12 @@ export function syntheticMessage(task) {
   // A `.torrent` postUrl is an Erai-Raws style post. The spec's `title` field
   // cannot hold newlines, so build the multi-line body here — otherwise
   // parseEraiMessage finds no `Title:`/`Source:`/torrent URL and skips it.
+  const title = String(task.title || '');
+  const platformMatch = title.match(/^\[([^\]]+)\]\s*(.*)$/);
+  const source = platformMatch ? platformMatch[1].trim() : 'Erai-Raws';
+  const cleanTitle = platformMatch ? platformMatch[2].trim() : title;
   const message = /\.torrent(?:[?#]|$)/i.test(String(task.postUrl || ''))
-    ? `Title: ${task.title}\nSource: Erai-Raws\nSubtitles: Arabic\n${task.postUrl}`
+    ? `Title: ${cleanTitle}\nSource: ${source}\nSubtitles: Arabic\n${task.postUrl}`
     : `${task.title}\n${task.postUrl}`;
   return tagRecoveryMessage({
     id: syntheticIdFor(task.postUrl),

@@ -2330,7 +2330,7 @@ export function extractArchive(archivePath, destDir) {
     for (const tool of ['7z', SevenZip.path7za]) {
       try {
         const slt = execFileSync(tool, ['l', '-slt', archivePath], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 });
-        symlinkProbes.push(/^Symbolic Link = /m.test(slt) ? 'unsafe' : 'checked');
+        symlinkProbes.push(/^Symbolic Link = \S/m.test(slt) ? 'unsafe' : 'checked');
       } catch { symlinkProbes.push('unavailable'); }
     }
     if (symlinkProbes.includes('unsafe')) return refuse('archive contains symbolic links.');
@@ -3708,7 +3708,9 @@ export async function checkTelegramChannels(existingClient = null) {
               continue;
             }
 
-            const formattedTitle = `[${eraiData.sourceName}] ${eraiData.title}`;
+            const formattedTitle = eraiData.title.startsWith(`[${eraiData.sourceName}]`)
+              ? eraiData.title
+              : (eraiData.title.startsWith('[') ? eraiData.title : `[${eraiData.sourceName}] ${eraiData.title}`);
             const eraiResolved = await resolveCanonicalTitle(formattedTitle);
             const phase1 = computeReleaseKeySet(formattedTitle, { isOfficial: true, resolved: eraiResolved });
 
