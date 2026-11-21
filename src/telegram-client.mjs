@@ -2854,6 +2854,12 @@ export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial
       if (!selectedTrack && !preferArabic) {
         selectedTrack = subTracks[0];
       }
+      // A single untagged subtitle track in a fansub video is the group's own
+      // subs (overwhelmingly Arabic here) — take it; multi-track untagged stays
+      // ambiguous and is refused.
+      if (!selectedTrack && subTracks.length === 1) {
+        selectedTrack = subTracks[0];
+      }
 
       if (!selectedTrack) return null;
 
@@ -4509,7 +4515,7 @@ export async function checkTelegramChannels(existingClient = null) {
             const originalName = doc.attributes?.find(a => a.fileName)?.fileName || `sub_${msg.id}.ass`;
             const ext = path.extname(originalName).toLowerCase();
 
-            if (['.ass', '.srt', '.zip', '.rar', '.7z'].includes(ext)) {
+            if (['.ass', '.srt', '.zip', '.rar', '.7z', '.mkv'].includes(ext)) {
               console.log(`\n✨ [Fansub Attachment] "${logSafe(titleLine)}" (${logSafe(originalName)})`);
               const localFilePath = path.join(OUT_DIR, safeRemoteBaseName(originalName, `sub_${msg.id}.ass`));
               if (!isInsideDir(localFilePath, OUT_DIR)) {
@@ -4521,18 +4527,40 @@ export async function checkTelegramChannels(existingClient = null) {
               try {
                 await client.downloadMedia(msg, { outputFile: localFilePath, workers: 4 });
                 if (fs.existsSync(localFilePath) && fs.statSync(localFilePath).size > 0) {
-                  const validated = validateFileMagic(localFilePath);
+                  const validated = ext === '.mkv' ? { ext: '.mkv', isArchive: false } : validateFileMagic(localFilePath);
                   if (validated) {
-                    titleLine = resolveEnglishTitleIfArabic(titleLine, [originalName, localFilePath], [localFilePath]);
-                    if (validated.isArchive) {
-                      const archiveFiles = listArchiveFiles(localFilePath);
+                    let publishPath = localFilePath;
+                    let pubValidated = validated;
+                    if (ext === '.mkv') {
+                      // The source posted the episode as video only: extract the
+                      // Arabic softsubs + fonts from the MKV instead of waiting
+                      // for a separate subtitle file that may never come.
+                      if (!toolsAvailable) {
+                        countDeferred(msgKey);
+                        console.warn(`   ⏸️ DEFERRED (media tools missing for MKV extraction): "${logSafe(titleLine)}" – NOT marked as posted`);
+                        continue;
+                      }
+                      console.log(`   🎞️ Extracting Arabic subtitles + fonts from attached video: ${logSafe(originalName)}`);
+                      const extracted = extractSubtitleAndFontsFromAnyFile(localFilePath, OUT_DIR, false, true, titleLine);
+                      try { fs.rmSync(localFilePath, { force: true }); } catch { }
+                      if (!extracted || !extracted.filePath || !fs.existsSync(extracted.filePath)) {
+                        countFailed(msgKey);
+                        console.error(`   ❌ No Arabic subtitle track in the attached video: "${logSafe(originalName)}"`);
+                        continue;
+                      }
+                      publishPath = extracted.filePath;
+                      pubValidated = validateFileMagic(publishPath) || { ext: extracted.ext || '.ass', isArchive: !!extracted.isArchive };
+                    }
+                    titleLine = resolveEnglishTitleIfArabic(titleLine, [originalName, publishPath], [publishPath]);
+                    if (pubValidated.isArchive) {
+                      const archiveFiles = listArchiveFiles(publishPath);
                       titleLine = resolveEnglishTitleIfArabic(titleLine, [originalName, ...archiveFiles]);
                     }
-                    const cleanFileName = getSafeTelegramFileName(titleLine, validated.ext);
+                    const cleanFileName = getSafeTelegramFileName(titleLine, pubValidated.ext);
                     const finalPath = path.join(OUT_DIR, cleanFileName);
-                    safeMoveFile(localFilePath, finalPath);
+                    safeMoveFile(publishPath, finalPath);
 
-                    const caption = formatCleanCaption(titleLine, validated.isArchive, false);
+                    const caption = formatCleanCaption(titleLine, pubValidated.isArchive, false);
                     const gate = gateReleaseBeforePublish(posted, msgKey, phase1, {
                       effectiveTitle: titleLine, resolved: titleLineResolved, isOfficial: false,
                     });

@@ -802,6 +802,8 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
 
   // 1. Direct subtitle files (.ass/.srt)
+  let episodeAbsent = false;
+  try {
   if (subFiles.length > 0) {
     // F2a: a folder that holds several episodes is a BATCH — the whole batch
     // is downloaded, never narrowed to the episode the post asks for (the
@@ -947,6 +949,14 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
       subNames: [chosen.name]
     };
   }
+  } catch (e) {
+    if (e.code !== 'EPISODE_ABSENT') throw e;
+    // The requested episode has no subtitle/archive in the folder yet — fall
+    // through to the softsub MKV branch: the episode may exist as a video with
+    // muxed Arabic subs + fonts. If no matching MKV exists either, that branch
+    // re-throws EPISODE_ABSENT (defer + retry, never a different episode).
+    episodeAbsent = true;
+  }
 
   // 3. Softsub MKV files
   if (mkvFiles.length > 0) {
@@ -954,6 +964,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
     if (targetEpisode) {
       const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
       if (match) chosen = match;
+      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
     }
     console.log(`   🎬 Mega: found MKV: ` + logSafe(chosen.name));
     const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, nextTempTag('mega_mkv')));
@@ -970,6 +981,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
     };
   }
 
+  if (episodeAbsent) throw episodeAbsentError();
   return null;
 }
 
@@ -982,6 +994,8 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
 
   // 1. Direct subtitle files (.ass/.srt/.zip/.rar/.7z)
   const subFiles = clean.filter(f => /\.(ass|srt|zip|7z|rar)$/i.test(f.name));
+  let episodeAbsent = false;
+  try {
   if (subFiles.length > 0) {
     // M3: the batch holds the real subtitle files only (an ARCHIVE can be
     // chosen as a single release, never as a batch member — the packer drops
@@ -1013,6 +1027,11 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
     console.log(`   ✅ Mega: using latest subtitle: ${logSafe(latest.name)}`);
     return { node: latest.node, name: latest.name, type: 'subtitle', size: latest.size };
   }
+  } catch (e) {
+    if (e.code !== 'EPISODE_ABSENT') throw e;
+    // Fall through to the softsub MKV branch (same contract as the download path).
+    episodeAbsent = true;
+  }
 
   // 2. Softsub MKV files
   const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
@@ -1024,11 +1043,15 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
         return { node: match.node, name: match.name, type: 'mkv', size: match.size };
       }
     }
+    if (targetEpisode && mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) {
+      throw episodeAbsentError();
+    }
     const latest = mkvFiles[mkvFiles.length - 1];
     console.log(`   🎬 Mega: using latest MKV: ${logSafe(latest.name)}`);
     return { node: latest.node, name: latest.name, type: 'mkv', size: latest.size };
   }
 
+  if (episodeAbsent) throw episodeAbsentError();
   return null;
 }
 
