@@ -335,6 +335,25 @@ test('episodes: 0 is treated as unknown (resolver omits it; no sequel overflow)'
   assert.ok(!overSequel.includes(A_FULL_NORM), 'fail-closed: diff 3 > sequel total 2 must not emit sequel keys');
 });
 
+test('episodes: 1 (JoJo defect): entries with <= 1 episode never trigger sequel overflow', () => {
+  assert.equal(tc.SEQUEL_OVERFLOW_MIN_EPISODES, 2, 'SEQUEL_OVERFLOW_MIN_EPISODES must be 2');
+  const jojoResolved = {
+    romaji: 'JoJo no Kimyou na Bouken: Steel Ball Run',
+    english: "JoJo's Bizarre Adventure: Steel Ball Run",
+    episodes: 1,
+    sequel: {
+      id: 214000,
+      romaji: 'JoJo no Kimyou na Bouken: Steel Ball Run 2nd & 3rd STAGE',
+      episodes: 11,
+    },
+  };
+  const title = '[Erai-Raws] [Netflix] JoJo no Kimyou na Bouken: Steel Ball Run - 07';
+  const keys = tc.getReleaseKeys(title, true, jojoResolved);
+  // Must NOT contain sequel keys like 2nd_3rd_stage or ep_6
+  assert.ok(!keys.some(k => k.includes('2nd_3rd_stage')), 'episodes: 1 must not emit sequel overflow keys');
+  assert.ok(!keys.some(k => k.includes('canon_jojo_steel_ball_run_ep_6') || k.includes('canon_jojo_steel_ball_run_ep_06')), 'must not emit ep_6 keys for ep 07');
+});
+
 // ---------------------------------------------------------------------------
 // Extra (iii) — acceptance و: resolved=null on defect B = pre-fix-shaped base
 // keys (no fast-path, no sequel additions on the null path).

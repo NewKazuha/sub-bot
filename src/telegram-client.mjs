@@ -103,6 +103,13 @@ export const FATAL_CODES = {
   RECOVERY_FETCH_UNSAFE: RECOVERY_CODES.FETCH_UNSAFE,
 };
 
+/**
+ * Minimum total episodes required for a resolved season before sequel overflow can trigger.
+ * Prevents single-episode placeholders (e.g. movies, specials, or AniList entries with episodes: 1
+ * such as JoJo: Steel Ball Run) from generating bogus sequel overflow keys for normal episode numbers.
+ */
+export const SEQUEL_OVERFLOW_MIN_EPISODES = 2;
+
 export function createFatalError(code, message, summary = null) {
   const err = new Error(message);
   err.isFatal = true;
@@ -626,8 +633,9 @@ function collectIdentityExtraTitles(title, epNum, resolved) {
     // season name — emit the keys of the sequel title with the recomputed
     // 1-indexed difference (e.g. 13 - 12 = 1). Original keys stay (cumulative
     // posting). Fail-open: any error in here means no extra titles.
+    // Single-episode titles (episodes <= 1, like JoJo SBR placeholder) are guarded out.
     if (
-      Number.isInteger(resolved.episodes) && resolved.episodes > 0 &&
+      Number.isInteger(resolved.episodes) && resolved.episodes >= SEQUEL_OVERFLOW_MIN_EPISODES &&
       Number(epNum) > resolved.episodes &&
       (Number(epNum) - resolved.episodes) <= 100 &&
       resolved.sequel && resolved.sequel.id != null
