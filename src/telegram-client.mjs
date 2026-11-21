@@ -1500,9 +1500,24 @@ export function noteNoLinksOutcome(pageData, posted, msgKey, postPageUrl, countN
   return false;
 }
 
+// Broken-emoji remnants (U+FFFD replacement chars + orphaned ZWJ/variation
+// selectors) must never reach a published caption, file name, or dedup key.
+// Valid emoji ZWJ sequences (❤️‍🔥, 👨‍👩‍👧) are preserved.
+export function sanitizeBrokenChars(text) {
+  let s = String(text ?? '');
+  if (!s) return s;
+  s = s.replace(/\uFFFD/g, '');
+  // Orphaned joiners/selectors at the edges or next to whitespace.
+  s = s.replace(/(^|\s)[\u200D\uFE0F]+/g, '$1').replace(/[\u200D\uFE0F]+(?=\s|$)/g, '');
+  // A ZWJ adjacent to an ASCII character is a broken remnant, never a valid
+  // emoji sequence.
+  s = s.replace(/\u200D(?=[\x20-\x7E])|(?<=[\x20-\x7E])\u200D/g, '');
+  return s.replace(/\s{2,}/g, ' ').trim();
+}
+
 export function formatCleanTitle(raw) {
-  let cleaned = raw
-    .replace(/^[📍📌🎬\s]+/, '')
+  let cleaned = sanitizeBrokenChars(raw)
+    .replace(/^[📍📌🎬\s]+/u, '')
     .replace(/\[\+fonts?\]/gi, '')
     .trim();
   cleaned = cleaned.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
@@ -1975,7 +1990,7 @@ export function formatCleanCaption(title, isZip = false, isOfficial = false, has
 }
 
 export function getSafeTelegramFileName(name, ext = '.ass') {
-  let clean = String(name ?? '')
+  let clean = sanitizeBrokenChars(name)
     // M2: the C0 control characters (NUL, ESC, …) can never reach a
     // published document name.
     .replace(/[\u0000-\u001f\u007f]/g, ' ')

@@ -799,7 +799,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
   const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
   const fontFiles = clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
-  const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
+  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
 
   // 1. Direct subtitle files (.ass/.srt)
   let episodeAbsent = false;
@@ -1034,7 +1034,7 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
   }
 
   // 2. Softsub MKV files
-  const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
+  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
   if (mkvFiles.length > 0) {
     if (targetEpisode) {
       const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
@@ -1178,12 +1178,13 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extra
   }
 
   // 2. MKV files
-  const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
+  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
   if (mkvFiles.length > 0) {
     let chosen = mkvFiles[mkvFiles.length - 1];
     if (targetEpisode) {
       const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
       if (match) chosen = match;
+      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
     }
     console.log(`   🎬 Mediafire: found MKV ` + logSafe(chosen.name));
     const resolved = await resolveMediafireDirectDownload(chosen.directUrl);
@@ -1444,12 +1445,13 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null, extrac
   }
 
   // 2. MKV files
-  const mkvFiles = clean.filter(f => /\.mkv$/i.test(f.name));
+  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
   if (mkvFiles.length > 0) {
     let chosen = mkvFiles[mkvFiles.length - 1];
     if (targetEpisode) {
       const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
       if (match) chosen = match;
+      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
     }
     console.log(`   🎬 Drive: MKV ${logSafe(chosen.name)}`);
     return {

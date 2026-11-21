@@ -1117,7 +1117,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
           curr = curr.parent();
         }
 
-        allLinks.push({ href, text, parentContext, containerHeading });
+        allLinks.push({ href, text, parentContext, containerHeading, el });
       }
     }
   });
@@ -1155,6 +1155,54 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     for (const l of allLinks) {
       const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
       if (!isRoot && (subHeadingRegex.test(l.text) || /subs-[^/]+\.workers\.dev/i.test(l.href))) {
+        directSubLink = l.href;
+        break;
+      }
+    }
+  }
+
+  // D0. The label immediately BEFORE the link's block (walking up a few
+  // wrapper levels): blogspot puts "ملف الترجمة والخطوط" in its own div and
+  // the link in the NEXT div — the ancestor-heading walk never sees it.
+  if (!directSubLink) {
+    for (const l of allLinks) {
+      const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
+      if (isRoot || !l.el) continue;
+      if (!isAnyHostOf(l.href, ['drive.google.com', 'mega.nz', 'mediafire.com', 'top4top.io'])) continue;
+      const head = $(l.el).closest('h1, h2, h3, h4, h5, h6');
+      const scope = head.length ? head : $(l.el).closest('p, div');
+      let nearLabel = '';
+      let cur = scope;
+      for (let depth = 0; depth < 4 && cur.length && !nearLabel; depth++) {
+        const par = cur.parent();
+        if (!par.length) break;
+        const nodes = par.contents().toArray();
+        const idx = nodes.indexOf(cur[0]);
+        for (let j = idx - 1; j >= 0; j--) {
+          const n = nodes[j];
+          const t = (n.type === 'text' ? (n.data || '') : $(n).text()).trim().replace(/\s+/g, ' ');
+          if (t) { nearLabel = t; break; }
+        }
+        cur = par;
+      }
+      if (nearLabel && nearLabel.length <= 80 && subExplicitRegex.test(nearLabel)) {
+        directSubLink = l.href;
+        break;
+      }
+    }
+  }
+
+  // D1. A heading that EXPLICITLY names the subtitle/fonts file wins over a
+  // generic "Softsub" video heading: a post can offer both as Drive folders,
+  // and picking the video first left the dedicated subs folder unused.
+  if (!directSubLink) {
+    for (const l of allLinks) {
+      const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
+      if (!isRoot && l.containerHeading && subExplicitRegex.test(l.containerHeading) &&
+          (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) ||
+           isHostOf(l.href, 'top4top.io') || isHostOf(l.href, 'mediafire.com') ||
+           isHostOf(l.href, 'urls.mugi-subs.com') || isHostOf(l.href, 'tinyurl.com') ||
+           isAnyHostOf(l.href, ['drive.google.com', 'mega.nz']))) {
         directSubLink = l.href;
         break;
       }
