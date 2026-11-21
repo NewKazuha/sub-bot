@@ -440,6 +440,32 @@ export function matchesEpisode(filename, targetEp) {
   return foundEps.includes(targetNorm);
 }
 
+// EPISODE_ABSENT — the requested episode is not in the folder yet (the
+// source uploads it later). A typed, NON-cap error: the caller logs it and
+// moves on without publishing, so the message is retried on a later cycle.
+// Never substitute a DIFFERENT episode for the requested one.
+export function episodeAbsentError() {
+  const e = new Error('requested episode not present in folder (EPISODE_ABSENT)');
+  e.code = 'EPISODE_ABSENT';
+  return e;
+}
+
+// Archive choice for a single-episode request. A matching archive wins; if
+// none matches but the names ARE episode-parsable, the episode is absent →
+// EPISODE_ABSENT (defer). Non-parsable names keep the legacy last-archive
+// fallback (a folder we cannot read episode numbers from is taken as-is).
+export function chooseArchiveForEpisode(arcFiles, targetEpisode) {
+  let chosen = arcFiles[arcFiles.length - 1];
+  if (targetEpisode) {
+    const match = arcFiles.find(f => matchesEpisode(f.name, targetEpisode));
+    if (match) return match;
+    if (arcFiles.some(f => extractEpisodesFromText(f.name).length > 0)) {
+      throw episodeAbsentError();
+    }
+  }
+  return chosen;
+}
+
 // ====================================================================
 // Folder target selection (F2a)
 // ====================================================================
@@ -522,14 +548,20 @@ export function selectFolderTargets(subFiles, { targetEpisode = null, extractedE
   if (Array.isArray(extractedEps) && extractedEps.length > 0) {
     const match = all.filter(f => extractedEps.some(ep => matchesEpisode(f.name, ep)));
     if (match.length > 0) return match;
+    // Parseable names but none of the requested episodes: defer, never
+    // substitute other episodes.
+    if (all.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
   }
 
   // A SINGLE-episode title (batch: false) narrows a multi-episode folder to
-  // the requested episode. Zero matches FALL THROUGH — never return [] here,
-  // so a folder with non-parsable names is still downloaded whole.
+  // the requested episode. Zero matches fall through ONLY for non-parsable
+  // names (such a folder is still downloaded whole); when the names ARE
+  // parseable but the episode is absent, throw EPISODE_ABSENT so the caller
+  // defers instead of publishing a different episode.
   if (batch !== true && targetEpisode) {
     const match = all.filter(f => matchesEpisode(f.name, targetEpisode));
     if (match.length > 0) return match;
+    if (all.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
   }
 
   // A multi-episode folder is a batch: take ALL of it (m9 — the requested
@@ -874,6 +906,11 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
 
     // Single subtitle without fonts: download directly as naked subtitle
     const singleSub = targetSubs[0];
+    // A parseable name carrying a DIFFERENT episode is never a substitute
+    // for the requested one (EPISODE_ABSENT → defer, retry next cycle).
+    if (targetEpisode && extractEpisodesFromText(singleSub.name).length > 0 && !matchesEpisode(singleSub.name, targetEpisode)) {
+      throw episodeAbsentError();
+    }
     console.log(`   📥 Downloading single Mega subtitle: ` + logSafe(singleSub.name));
     // The per-file cap of a single download (C7b/C10).
     assertCloudBatchCaps([singleSub]);
@@ -896,11 +933,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
 
   // 2. Archive files (.zip/.rar/.7z)
   if (arcFiles.length > 0) {
-    let chosen = arcFiles[arcFiles.length - 1];
-    if (targetEpisode) {
-      const match = arcFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) chosen = match;
-    }
+    const chosen = chooseArchiveForEpisode(arcFiles, targetEpisode);
     console.log(`   📦 Mega: found archive: ` + logSafe(chosen.name));
     const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, nextTempTag('mega_arc')));
     if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
@@ -940,7 +973,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   return null;
 }
 
-export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, extractedEps = [], listedFiles = null) {
+export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, extractedEps = [], listedFiles = null, batch = true) {
   const files = listedFiles || await listMegaFolder(folderUrl);
   if (files.length === 0) return null;
 
@@ -956,13 +989,13 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
     // F2d: a folder that holds MORE THAN ONE episode is a BATCH — return ALL
     // of its subtitle files so the caller publishes them as ONE package.
     // (The VIDEO branch below stays single-file — that case is still open.)
-    const batch = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps });
-    if (batch.length > 1) {
-      console.log(`   📦 Mega: subtitle batch of ${batch.length} file(s) — one package.`);
+    const batchSel = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps, batch: batch === true });
+    if (batchSel.length > 1) {
+      console.log(`   📦 Mega: subtitle batch of ${batchSel.length} file(s) — one package.`);
       return {
         type: 'subtitles',
-        files: batch.map(f => ({ node: f.node, name: f.name, size: f.size })),
-        subNames: batch.map(f => f.name),
+        files: batchSel.map(f => ({ node: f.node, name: f.name, size: f.size })),
+        subNames: batchSel.map(f => f.name),
       };
     }
     if (targetEpisode) {
@@ -973,6 +1006,10 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
       }
     }
     const latest = subFiles[subFiles.length - 1];
+    // Never substitute a parseable DIFFERENT episode for the requested one.
+    if (targetEpisode && extractEpisodesFromText(latest.name).length > 0 && !matchesEpisode(latest.name, targetEpisode)) {
+      throw episodeAbsentError();
+    }
     console.log(`   ✅ Mega: using latest subtitle: ${logSafe(latest.name)}`);
     return { node: latest.node, name: latest.name, type: 'subtitle', size: latest.size };
   }
@@ -1050,7 +1087,7 @@ export async function listMediafireFolder(folderUrl) {
   }
 }
 
-export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extractedEps = [], listedFiles = null) {
+export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extractedEps = [], listedFiles = null, batch = true) {
   // If single file URL
   if (!mfUrl.includes('/folder/')) {
     const direct = await resolveMediafireDirectDownload(mfUrl);
@@ -1081,26 +1118,29 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extra
     // F2d: a folder that holds MORE THAN ONE episode is a BATCH — return ALL
     // of its subtitle files so the caller publishes them as ONE package.
     // (The VIDEO branch below stays single-file — that case is still open.)
-    const batch = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps });
-    if (batch.length > 1) {
-      console.log(`   📦 Mediafire: subtitle batch of ${batch.length} file(s) — one package.`);
+    const batchSel = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps, batch: batch === true });
+    if (batchSel.length > 1) {
+      console.log(`   📦 Mediafire: subtitle batch of ${batchSel.length} file(s) — one package.`);
       // The cap is checked BEFORE the per-file round-trips (M6).
-      assertCloudBatchCaps(batch);
+      assertCloudBatchCaps(batchSel);
       const files = [];
-      for (const f of batch) {
+      for (const f of batchSel) {
         const resolved = await resolveMediafireDirectDownload(f.directUrl);
         files.push({ name: f.name, size: f.size, directUrl: resolved || f.directUrl });
       }
       return {
         type: 'subtitles',
         files,
-        subNames: batch.map(f => f.name),
+        subNames: batchSel.map(f => f.name),
       };
     }
     let chosen = subFiles[subFiles.length - 1];
     if (targetEpisode) {
       const match = subFiles.find(f => matchesEpisode(f.name, targetEpisode));
       if (match) chosen = match;
+    }
+    if (targetEpisode && extractEpisodesFromText(chosen.name).length > 0 && !matchesEpisode(chosen.name, targetEpisode)) {
+      throw episodeAbsentError();
     }
     console.log(`   ✅ Mediafire: found subtitle ` + logSafe(chosen.name));
     // The per-file cap of a single file (C7b/C10).
@@ -1323,7 +1363,7 @@ export async function listDriveFolderWithSubtitles(folderUrl, { strict = false }
   return top;
 }
 
-export async function findBestFileInDrive(driveUrl, targetEpisode = null, extractedEps = [], listedFiles = null) {
+export async function findBestFileInDrive(driveUrl, targetEpisode = null, extractedEps = [], listedFiles = null, batch = true) {
   // If single file
   if (!isDriveFolderUrl(driveUrl)) {
     const id = extractDriveFileId(driveUrl);
@@ -1354,19 +1394,22 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null, extrac
     // F2d: a folder that holds MORE THAN ONE episode is a BATCH — return ALL
     // of its subtitle files so the caller publishes them as ONE package.
     // (The VIDEO branch below stays single-file — that case is still open.)
-    const batch = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps });
-    if (batch.length > 1) {
-      console.log(`   📦 Drive: subtitle batch of ${batch.length} file(s) — one package.`);
+    const batchSel = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps, batch: batch === true });
+    if (batchSel.length > 1) {
+      console.log(`   📦 Drive: subtitle batch of ${batchSel.length} file(s) — one package.`);
       return {
         type: 'subtitles',
-        files: batch.map(f => ({ id: f.id, name: f.name, directUrl: getDriveDirectUrl(f.id), size: f.size })),
-        subNames: batch.map(f => f.name),
+        files: batchSel.map(f => ({ id: f.id, name: f.name, directUrl: getDriveDirectUrl(f.id), size: f.size })),
+        subNames: batchSel.map(f => f.name),
       };
     }
     let chosen = subFiles[subFiles.length - 1];
     if (targetEpisode) {
       const match = subFiles.find(f => matchesEpisode(f.name, targetEpisode));
       if (match) chosen = match;
+    }
+    if (targetEpisode && extractEpisodesFromText(chosen.name).length > 0 && !matchesEpisode(chosen.name, targetEpisode)) {
+      throw episodeAbsentError();
     }
     console.log(`   ✅ Drive: subtitle ${logSafe(chosen.name)}`);
     return {
@@ -1422,6 +1465,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
     listedFiles = null,
     // The download sink is injectable so the batch can be tested offline.
     downloadFile = downloadGoogleDriveFileToDisk,
+    // Single-episode titles narrow a multi-episode folder (P1 wiring).
+    batch = true,
   } = options || {};
 
   const files = (Array.isArray(listedFiles) && listedFiles.length > 0) ? listedFiles : await listDriveFolderWithSubtitles(folderUrl);
@@ -1529,6 +1574,11 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
 
     // Single subtitle without fonts
     const singleSub = targetSubs[0];
+    // A parseable name carrying a DIFFERENT episode is never a substitute
+    // for the requested one (EPISODE_ABSENT → defer, retry next cycle).
+    if (targetEpisode && extractEpisodesFromText(singleSub.name).length > 0 && !matchesEpisode(singleSub.name, targetEpisode)) {
+      throw episodeAbsentError();
+    }
     console.log(`   📥 Downloading single Drive subtitle: ${logSafe(singleSub.name)}`);
     // The per-file cap of a single download (C7b/C10).
     assertCloudBatchCaps([singleSub]);
@@ -1554,11 +1604,7 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
 
   // 2. Archive files (.zip/.rar/.7z)
   if (arcFiles.length > 0) {
-    let chosen = arcFiles[arcFiles.length - 1];
-    if (targetEpisode) {
-      const match = arcFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) chosen = match;
-    }
+    const chosen = chooseArchiveForEpisode(arcFiles, targetEpisode);
     console.log(`   📦 Drive: found archive: ${logSafe(chosen.name)}`);
     const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(chosen.name, nextTempTag('drive_arc'))));
     if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);

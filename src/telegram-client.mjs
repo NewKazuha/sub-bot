@@ -2823,6 +2823,9 @@ export function extractSubtitleAndFontsFromAnyFile(filePath, workDir, isOfficial
             return { filePath: repackedZip, isArchive: true, ext: '.zip', resolvedTitle: customSubName };
           }
         }
+      } else {
+        // A refused extraction must never publish the raw archive.
+        return null;
       }
     }
     return { filePath, isArchive: magic.isArchive, ext: magic.ext, resolvedTitle: customSubName };
@@ -3885,6 +3888,12 @@ export async function checkTelegramChannels(existingClient = null) {
                               }
                             }
                             try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { }
+                          } else {
+                            // A refused extraction must NEVER publish the raw archive.
+                            console.warn(`   ⚠️ Extraction refused — not publishing the raw archive.`);
+                            countFailed(msgKey);
+                            try { fs.rmSync(localFilePath, { force: true }); } catch { }
+                            continue;
                           }
                         } else {
                           // For batch releases or releases with fonts, repack as clean universal .zip
@@ -3939,6 +3948,12 @@ export async function checkTelegramChannels(existingClient = null) {
                               // Keep original archive as effectiveDownloadPath (already set to localFilePath)
                             }
                             try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { }
+                          } else {
+                            // A refused extraction must NEVER publish the raw archive.
+                            console.warn(`   ⚠️ Extraction refused — not publishing the raw archive.`);
+                            countFailed(msgKey);
+                            try { fs.rmSync(localFilePath, { force: true }); } catch { }
+                            continue;
                           }
                         }
                       } else {
@@ -4676,7 +4691,7 @@ export async function checkTelegramChannels(existingClient = null) {
                   console.log(`   📥 Resolving ${sourceLabel}: ${redactUrl(source.url)}`);
                   try {
                     if (source.kind === 'mediafire') {
-                      const mfBest = await findBestFileInMediafire(source.url, targetEp, titleEps, listing);
+                      const mfBest = await findBestFileInMediafire(source.url, targetEp, titleEps, listing, isCollectionTitle(titleLine));
                       if (mfBest && (mfBest.directUrl || mfBest.type === 'subtitles')) {
                         if (mfBest.type === 'subtitle' || mfBest.type === 'subtitles' || toolsAvailable) {
                           const mfLabel = mfBest.name || `${mfBest.files.length} subtitle(s)`;
@@ -4703,7 +4718,7 @@ export async function checkTelegramChannels(existingClient = null) {
                           targetEp,
                           pageData.videoLinks?.fonts,
                           titleLine,
-                          { listedFiles: listing }
+                          { listedFiles: listing, batch: isCollectionTitle(titleLine) }
                         );
                         if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
                           downloadedFilePath = driveRelease.filePath;
@@ -4711,7 +4726,7 @@ export async function checkTelegramChannels(existingClient = null) {
                       }
 
                       if (!downloadedFilePath) {
-                        const driveBest = await findBestFileInDrive(source.url, targetEp, titleEps, listing);
+                        const driveBest = await findBestFileInDrive(source.url, targetEp, titleEps, listing, isCollectionTitle(titleLine));
                         if (driveBest && (driveBest.directUrl || driveBest.type === 'subtitles')) {
                           if (driveBest.type === 'subtitle' || driveBest.type === 'subtitles' || toolsAvailable) {
                             const driveLabel = driveBest.name || `${driveBest.files.length} subtitle(s)`;

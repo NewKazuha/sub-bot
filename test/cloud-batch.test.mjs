@@ -1455,12 +1455,36 @@ test('T58 — the m9 invariant: batch:true (and omitted) still selects all 7 epi
   assert.equal(cf.selectFolderSubtitleBatch(files, { targetEpisode: '7' }).length, 7, 'the listing path keeps the default');
 });
 
-test('T59 — a 21-file folder still throws TOO_MANY_FILES when the selection was NOT narrowed', async () => {
+test('T59 — a parseable folder missing the requested episode defers (EPISODE_ABSENT), never downloads', async () => {
   const dest = tmpDir('cloud-t59-');
-  // Episodes 10..30: nothing matches target "7", so batch:false falls THROUGH
-  // to the whole folder and the generic cap applies (not SERIES_FOLDER_BATCH).
+  // Episodes 10..30: nothing matches target "7". Substituting another
+  // episode (or the whole folder) is wrong — the source has not uploaded
+  // ep 7 yet, so the release defers and is retried on a later cycle.
   const listed = Array.from({ length: 21 }, (_, i) => ({
     name: `Horemajo - ${String(i + 10).padStart(2, '0')}.ass`,
+    size: 2048,
+    node: { id: i }
+  }));
+
+  let calls = 0;
+  // EPISODE_ABSENT is deliberately NOT a CloudCapError: no 6h cooldown —
+  // the release is retried on the next cycle (the source uploads it soon).
+  await assert.rejects(
+    cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+      listedFiles: listed,
+      batch: false,
+      downloadNode: async () => { calls += 1; }
+    }),
+    (e) => e.code === 'EPISODE_ABSENT'
+  );
+  assert.equal(calls, 0, 'nothing is downloaded');
+  assert.deepEqual(entriesOf(dest), []);
+});
+
+test('T59b — a NON-parsable oversized folder still falls through to the generic cap', async () => {
+  const dest = tmpDir('cloud-t59b-');
+  const listed = 'abcdefghijklmnopqrstu'.split('').map((c, i) => ({
+    name: `subtitle_${c}.ass`,
     size: 2048,
     node: { id: i }
   }));
@@ -1475,7 +1499,6 @@ test('T59 — a 21-file folder still throws TOO_MANY_FILES when the selection wa
     'TOO_MANY_FILES'
   );
   assert.equal(calls, 0, 'nothing is downloaded');
-  assert.deepEqual(entriesOf(dest), []);
 });
 
 test('T60 — a narrowed 1-sub + 20-fonts series folder throws SERIES_FOLDER_BATCH', async () => {
