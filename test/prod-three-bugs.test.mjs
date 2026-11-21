@@ -270,6 +270,8 @@ test('SEC T1: validateTorrentUrl rejects http/userinfo/IP literals; recovery use
   const allowHost = allowed.find(h => h === 'rhythm-sub.com') || allowed.find(h => !h.includes('blogspot')) || allowed[0];
   assert.equal(validateTorrentUrl(`https://sub.${allowHost}/x.torrent`, { recovery: true }), `sub.${allowHost}`);
   assert.equal(validateTorrentUrl(`https://${allowHost}/x.torrent`, { recovery: true }), allowHost);
+  assert.equal(validateTorrentUrl('https://nyaa.si/download/123.torrent', { recovery: true }), 'nyaa.si');
+  assert.equal(validateTorrentUrl('https://www.erai-raws.info/123.torrent', { recovery: true }), 'www.erai-raws.info');
 });
 
 test('SEC T2: isTempDownloadName normalises / strips compound extensions and still refuses false positives', () => {

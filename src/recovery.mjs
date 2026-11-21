@@ -133,7 +133,7 @@ const SYNTH_TASK_KEYS = new Set(['kind', 'chatId', 'title', 'postUrl']);
 // Host allowlist (C1). Hosts of CONFIG.SITES bases + blogspot.com/*.
 // ---------------------------------------------------------------------------
 export function siteHosts() {
-  const hosts = new Set(['blogspot.com']);
+  const hosts = new Set(['blogspot.com', 'nyaa.si', 'erai-raws.info']);
   for (const site of CONFIG.SITES || []) {
     try {
       const h = new URL(site.base).hostname.toLowerCase();
