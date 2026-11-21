@@ -705,6 +705,16 @@ test('F2b: an Arabic ordinal is an episode only when the title is about an episo
     '',
     'a part is a collection, not an episode'
   );
+  assert.equal(
+    tc.extractEpisodeNumber('[HEROKU] الحلقة 7 من أنمي Toaru Anbu no ITEM مترجمة'),
+    '7',
+    'الحلقة with numeric digit extracts cleanly'
+  );
+  assert.equal(
+    tc.extractEpisodeNumber('حلقة 08 من أنمي'),
+    '8',
+    'حلقة with numeric digit extracts cleanly'
+  );
 });
 
 

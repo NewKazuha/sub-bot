@@ -526,8 +526,8 @@ export function extractEpisodeNumber(text) {
     if (item.p.test(ordinalText)) return item.ep;
   }
 
-  // 1. Explicit dash or episode prefixes: " - 46", " - 02", " ep 04", " episode 12", " e04", " #46"
-  const mExplicit = cleaned.match(/(?:\s+-\s*|\bep(?:isode)?\s*|\be\s*|#\s*)(\d{1,4})(?:\s*v\d+)?\b/i);
+  // 1. Explicit dash or episode prefixes: " - 46", " - 02", " ep 04", " episode 12", " e04", " #46", "الحلقة 07", "حلقة 7"
+  const mExplicit = cleaned.match(/(?:\s+-\s*|\bep(?:isode)?\s*|\be\s*|#\s*|الحلقة\s*|حلقة\s*)(\d{1,4})(?:\s*v\d+)?\b/i);
   if (mExplicit) return mExplicit[1].replace(/^0+/, '') || '0';
 
   // 2. Loose patterns like bare numbers: " 46", "~ 46" require a trailing bracket, paren, dot, or end-of-string
