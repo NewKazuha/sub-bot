@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { RETRACTED_KEYS } from '../src/retracted-keys.mjs';
 
 // ---------------------------------------------------------------------------
 // Measured thresholds (execution spec §0 — the audit's proposed numbers
@@ -128,9 +129,9 @@ export function mergePostedIds(ours, theirs, options = {}) {
   const remoteBad = new Set(remoteCheck.rejected.map(r => r.index));
 
   const localSet = new Set();
-  ours.forEach((v, i) => { if (!localBad.has(i)) localSet.add(v); });
+  ours.forEach((v, i) => { if (!localBad.has(i) && !RETRACTED_KEYS.has(v)) localSet.add(v); });
   const remoteSet = new Set();
-  if (!remoteAbsent) theirs.forEach((v, i) => { if (!remoteBad.has(i)) remoteSet.add(v); });
+  if (!remoteAbsent) theirs.forEach((v, i) => { if (!remoteBad.has(i) && !RETRACTED_KEYS.has(v)) remoteSet.add(v); });
 
   // P-7: accumulate into ONE Set (no [...localSet, ...remoteSet] → Set →
   // spread round-trip over two ~42k Sets).

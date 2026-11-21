@@ -378,3 +378,83 @@ test('F10: compound-extension strip is limited to known archive suffixes', () =>
     assert.equal(isTempDownloadName(legit), false, `must NOT reject ${legit}`);
   }
 });
+
+test('N Season regression: computeReleaseKeySet attaches episode token to canonical titles', () => {
+  const cases = [
+    {
+      title: '[Crunchyroll] Black Clover 2nd Season - 08',
+      resolved: { romaji: 'Black Clover 2nd Season', english: 'Black Clover Season 2' },
+      season: 2,
+      expectedEpisode: 8,
+      forbiddenEpisode: 2,
+    },
+    {
+      title: '[Netflix] Ranma 1/2 3rd Season - 08',
+      resolved: { romaji: 'Ranma 1/2 (2024) 3rd Season', english: 'Ranma1/2 (2024) Season 3' },
+      season: 3,
+      expectedEpisode: 8,
+      forbiddenEpisode: 3,
+    },
+    {
+      title: '[Crunchyroll] Yasei no Last Boss ga Arawareta 2nd Season - 09',
+      resolved: { romaji: 'Yasei no Last Boss ga Arawareta! 2nd Season', english: 'A Wild Last Boss Appeared! Season 2' },
+      season: 2,
+      expectedEpisode: 9,
+      forbiddenEpisode: 2,
+    },
+  ];
+
+  for (const c of cases) {
+    const { keys, season } = computeReleaseKeySet(c.title, { isOfficial: true, resolved: c.resolved });
+    assert.equal(season, c.season, `season for ${c.title} must match`);
+
+    // Must NOT contain any key scoped to the season number as an episode
+    const badKeys = keys.filter(k => new RegExp(`(?:^|_)ep_0?${c.forbiddenEpisode}(?:_|$)`).test(k));
+    assert.deepEqual(badKeys, [], `${c.title} must NOT generate false keys for episode ${c.forbiddenEpisode}`);
+
+    // Must contain episode-scoped keys for the actual episode
+    const goodKeys = keys.filter(k => new RegExp(`(?:^|_)ep_0?${c.expectedEpisode}(?:_|$)`).test(k));
+    assert.ok(goodKeys.length > 0, `${c.title} must generate episode-scoped keys for episode ${c.expectedEpisode}`);
+
+    // Simulate an existing posted.json containing previous episode keys (e.g. ep 2)
+    const mockPosted = new Set([
+      `official_ep_${c.forbiddenEpisode}_dummy`,
+      `token_ep_${c.forbiddenEpisode}_dummy`,
+      `black_clover_2nd_season_ep_${c.forbiddenEpisode}_crunchyroll`,
+      `ranma_1_2_2024_3rd_season_ep_${c.forbiddenEpisode}_netflix`,
+      `yasei_no_last_boss_ga_arawareta_2nd_season_ep_${c.forbiddenEpisode}_crunchyroll`,
+    ]);
+
+    assert.equal(
+      isReleaseAlreadyPostedOrDispatched(mockPosted, keys, { season }),
+      false,
+      `episode ${c.expectedEpisode} must NOT be suppressed by earlier episode ${c.forbiddenEpisode} keys in posted.json`
+    );
+  }
+});
+
+test('RETRACTED_KEYS eviction: false sequel dedup keys are filtered in load and merge', async () => {
+  const { RETRACTED_KEYS } = await import('../src/retracted-keys.mjs');
+  const { mergePostedIds } = await import('../scripts/merge-posted-state.mjs');
+  const { loadPostedIds } = tc;
+
+  assert.equal(RETRACTED_KEYS.size, 170);
+  assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11484'));
+  assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11486'));
+  assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11490'));
+
+  // Test mergePostedIds excludes RETRACTED_KEYS
+  const mergeResult = mergePostedIds(
+    ['tg_-1002084152036_11486', 'legit_key_1'],
+    ['tg_-1002084152036_11484', 'legit_key_2']
+  );
+  assert.deepEqual(mergeResult.merged.sort(), ['legit_key_1', 'legit_key_2']);
+
+  // Test loadPostedIds excludes RETRACTED_KEYS from loaded set
+  fs.mkdirSync('data', { recursive: true });
+  fs.writeFileSync('data/posted.json', JSON.stringify(['tg_-1002084152036_11490', 'clean_saved_key']));
+  const loaded = loadPostedIds();
+  assert.equal(loaded.has('clean_saved_key'), true);
+  assert.equal(loaded.has('tg_-1002084152036_11490'), false);
+  assert.equal(loaded.size, 1);
+});

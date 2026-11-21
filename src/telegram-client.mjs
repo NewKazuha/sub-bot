@@ -56,6 +56,7 @@ import {
   normalizeTeamName,
   buildSyntheticTitle
 } from './title-identity.mjs';
+import { RETRACTED_KEYS } from './retracted-keys.mjs';
 
 // F1/F4: the recovery path must forbid redirects. The call sites stay exactly
 // as they were (audited by T38); a thin wrapper injects the single no-redirect
@@ -249,7 +250,11 @@ export function loadPostedIds() {
   const parsePosted = (raw) => {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) throw new Error('posted.json is not a JSON array');
-    return new Set(parsed);
+    const set = new Set(parsed);
+    for (const k of RETRACTED_KEYS) {
+      set.delete(k);
+    }
+    return set;
   };
 
   // A missing file is a legitimate first run — return an empty set (no throw).
@@ -1313,6 +1318,29 @@ export function computeReleaseKeySet(title, { isOfficial = false, resolved = nul
   const teamPrefix = teamMatch ? `[${teamMatch[1]}] ` : '';
   const withTeam = (name) => teamPrefix ? `${teamPrefix}${name}` : String(name);
 
+  const getCandidateWithEp = (seriesName) => {
+    if (!seriesName) return null;
+    const base = withTeam(seriesName);
+
+    const ep = extractEpisodeNumber(raw);
+    if (ep) {
+      const baseEp = extractEpisodeNumber(base);
+      if (baseEp !== ep) {
+        return `${base} - ${ep.padStart(2, '0')}`;
+      }
+      return base;
+    }
+
+    const batch = extractBatchRange(raw);
+    if (batch && batch[1] > batch[0]) {
+      const padStart = String(batch[0]).padStart(2, '0');
+      const padEnd = String(batch[1]).padStart(2, '0');
+      return `${base} - ${padStart}-${padEnd}`;
+    }
+
+    return base;
+  };
+
   const keys = [];
   const addFor = (candidate) => {
     if (!candidate) return;
@@ -1320,8 +1348,8 @@ export function computeReleaseKeySet(title, { isOfficial = false, resolved = nul
     else keys.push(...getFansubReleaseKeys(candidate, r));
   };
   addFor(raw);
-  if (r?.romaji) addFor(withTeam(r.romaji));
-  if (r?.english) addFor(withTeam(r.english));
+  if (r?.romaji) addFor(getCandidateWithEp(r.romaji));
+  if (r?.english) addFor(getCandidateWithEp(r.english));
 
   return { keys: Array.from(new Set(keys.filter(Boolean))), season: season ?? null };
 }
