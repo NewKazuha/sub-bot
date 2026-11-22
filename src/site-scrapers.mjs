@@ -744,7 +744,7 @@ function getLinkTarget($, el, pageUrl) {
   return normaliseLinkUrl(match?.[1], pageUrl);
 }
 
-export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { redirect } = {}) {
+export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { batch = false, redirect } = {}) {
   const recoveryMode = isRecoveryRedirectOption(redirect);
   const extras = recoveryFetchExtras(recoveryMode);
   try {
@@ -820,14 +820,26 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { re
     const subFiles = files.filter(f => /\.(ass|srt|zip|rar|7z)$/i.test(f.name || ''));
     if (!subFiles.length) return null;
 
-    let chosen = subFiles[subFiles.length - 1];
+    let chosen = null;
     if (targetEp) {
       const epNorm = String(targetEp).replace(/^0+/, '');
-      const match = subFiles.find(f => {
+      chosen = subFiles.find(f => {
         const found = (f.name || '').match(/(\d{1,4})/g) || [];
         return found.some(n => n.replace(/^0+/, '') === epNorm);
       });
-      if (match) chosen = match;
+    }
+
+    if (!chosen && batch) {
+      // For batch releases, prefer the batch archive (.zip/.rar/.7z)
+      const archives = subFiles.filter(f => /\.(zip|rar|7z)$/i.test(f.name || ''));
+      if (archives.length > 0) {
+        // If an archive carries a range (e.g. 01 ~ 13) or batch keyword, pick it
+        chosen = archives.find(f => /[-~–]|\bbatch\b|\bcomplete\b/i.test(f.name || '')) || archives[0];
+      }
+    }
+
+    if (!chosen) {
+      chosen = subFiles[subFiles.length - 1];
     }
 
     return `${base}${encodeURIComponent(chosen.name)}`;
@@ -856,7 +868,7 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
   }
 
   if (!isRocks && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) {
-    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp, { redirect });
+    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp, { batch, redirect });
     if (goIndexFile) return goIndexFile;
   }
 
@@ -1060,6 +1072,28 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
         console.log(`   🛡️ Cloudflare challenge detected (${res.status}), attempting curl_cffi fallback...`);
         const cfHtml = fetchHtmlWithImpersonation(pageUrl, cookieHeader);
         if (cfHtml) html = cfHtml;
+      }
+
+      if (html) {
+        // Follow HTML meta refresh redirect (e.g. Staatic static site redirects on Cloudflare Pages)
+        const metaRefreshMatch = html.match(/<meta[^>]*http-equiv=["']?refresh["']?[^>]*content=["']?[^"'>]*url=([^"'>\s]+)/i);
+        if (metaRefreshMatch && !recoveryMode) {
+          const redirectTarget = metaRefreshMatch[1].trim().replace(/^['"]|['"]$/g, '');
+          try {
+            const resolvedRedirect = new URL(redirectTarget, pageUrl).toString();
+            if (resolvedRedirect !== pageUrl) {
+              console.log(`   🔀 HTML meta refresh detected: redirecting to ${resolvedRedirect}`);
+              const res2 = await fetchWithTimeout(resolvedRedirect, {
+                headers: { 'User-Agent': UA, 'Cookie': cookieHeader },
+                ...(options.redirect ? { redirect: options.redirect } : {}),
+              });
+              if (res2.ok) {
+                html = await res2.text();
+                pageUrl = resolvedRedirect;
+              }
+            }
+          } catch { }
+        }
       }
     } catch (e) {
       // C1: on the recovery path NO fallback may follow a redirect or bypass

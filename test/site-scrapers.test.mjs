@@ -634,3 +634,59 @@ test('F2d: a single-episode folder is still narrowed to one file, and the video 
   assert.equal(driveVideo.type, 'mkv');
   assert.equal(driveVideo.files, undefined);
 });
+
+test('scrapePostPage follows HTML meta refresh redirect', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    calls++;
+    if (calls === 1) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'text/html' },
+        text: async () => '<html><head><meta http-equiv="refresh" content="0;url=https://example.com/target" /></head><body></body></html>',
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => 'text/html' },
+      text: async () => '<html><body><a href="https://example.com/file.ass">ملف الترجمة</a></body></html>',
+    };
+  };
+
+  try {
+    const data = await ss.scrapePostPage('https://example.com/start', null, null, 'Test Title');
+    assert.equal(calls, 2, 'followed the meta refresh redirect');
+    assert.equal(data.pageUrl, 'https://example.com/target');
+    assert.equal(data.bestDownloadUrl, 'https://example.com/file.ass');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('resolveGoIndexSubtitle prefers batch archive when batch: true', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({
+      data: {
+        files: [
+          { name: '[Group] Show - 01 ~ 12 [Subs + Fonts].zip', size: 1024 },
+          { name: '[Group] Show - 01.ass', size: 50 },
+          { name: '[Group] Show - 02.ass', size: 50 }
+        ]
+      }
+    })
+  });
+
+  try {
+    const res = await ss.resolveGoIndexSubtitle('https://example.workers.dev/0:/Show/', null, { batch: true });
+    assert.ok(res.includes('%5BGroup%5D%20Show%20-%2001%20~%2012%20%5BSubs%20%2B%20Fonts%5D.zip'), 'chose the batch archive');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

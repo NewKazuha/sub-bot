@@ -4683,7 +4683,8 @@ export async function checkTelegramChannels(existingClient = null) {
             console.log(`\n✨ [Fansub Post] "${logSafe(titleLine)}"`);
             console.log(`   🌐 Scraping fansub post: ${postPageUrl}`);
             const targetEp = extractEpisodeNumber(titleLine);
-            const pageData = await scrapeWithRecoveryGuard(msg, () => scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine));
+            const isBatch = isCollectionTitle(titleLine);
+            const pageData = await scrapeWithRecoveryGuard(msg, () => scrapePostPage(postPageUrl, matchingSite, targetEp, titleLine, { batch: isBatch }));
 
             // P1-1b: a negative-cached candidate was already fetched and found
             // to have NO link — the request was not made again. It is logged
