@@ -1645,3 +1645,75 @@ test('T66 — a fonts-only (0-subtitle) Mega folder keeps the existing path', as
   assert.equal(calls, 0);
   assert.deepEqual(entriesOf(dest), []);
 });
+
+test('T67 — downloadMegaFolderRelease with skipFonts: true downloads single sub even when folder has 20+ fonts', async () => {
+  const dest = tmpDir('cloud-t67-');
+  const listed = [
+    { name: 'Horemajo - 07.ass', size: 2048, node: { id: 1 } },
+    ...Array.from({ length: 22 }, (_, i) => ({ name: `Font${i + 1}.ttf`, size: 2048, node: { id: 100 + i } }))
+  ];
+  let calls = 0;
+  const release = await cf.downloadMegaFolderRelease('https://mega.nz/folder/megakey', dest, '7', {
+    listedFiles: listed,
+    batch: false,
+    skipFonts: true,
+    downloadNode: async (_node, destPath) => { calls += 1; fs.writeFileSync(destPath, '[Script Info]\n'); return destPath; }
+  });
+  assert.ok(release && release.filePath);
+  assert.equal(release.isArchive, false);
+  assert.equal(release.hasFonts, false);
+  assert.equal(calls, 1, 'downloaded exactly 1 sub file');
+  assert.ok(fs.existsSync(release.filePath));
+});
+
+test('T68 — extractAssFontNames and findMatchingFontFiles match styles correctly', () => {
+  const sampleAss = `[Script Info]
+Title: Sample
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour
+Style: Default,adobe arabic,78,&H00FFFFFF
+Style: Signs,29LT Riwaya,65,&H00F7F7F7
+Style: Other,Noto Kufi Arabic,60,&H00E6E4E4
+`;
+  const fonts = cf.extractAssFontNames(sampleAss);
+  assert.deepEqual(fonts.sort(), ['29LT Riwaya', 'Noto Kufi Arabic', 'adobe arabic'].sort());
+
+  const availableFiles = [
+    { name: 'arial-1.ttf' },
+    { name: 'adobe-arabic-bold.otf' },
+    { name: '29LTRiwaya-Regular.ttf' },
+    { name: 'خط-بدر-اليدوي.ttf' },
+    { name: 'NotoKufiArabic-Bold-1.ttf' },
+  ];
+  const matched = cf.findMatchingFontFiles(fonts, availableFiles);
+  assert.deepEqual(matched.map(f => f.name).sort(), [
+    '29LTRiwaya-Regular.ttf',
+    'NotoKufiArabic-Bold-1.ttf',
+    'adobe-arabic-bold.otf'
+  ].sort());
+});
+
+test('T69 — tryBundleMatchingFonts bundles matched fonts into zip', async () => {
+  const dest = tmpDir('cloud-t69-');
+  const subFile = path.join(dest, 'sample.ass');
+  fs.writeFileSync(subFile, `[Script Info]\n[V4+ Styles]\nStyle: Default,adobe arabic,78,&H00FFFFFF\n`);
+
+  const availableFiles = [
+    { name: 'adobe-arabic-bold.otf', id: 1 },
+    { name: 'unrelated.ttf', id: 2 }
+  ];
+
+  let fontCalls = 0;
+  const bundled = await cf.tryBundleMatchingFonts(subFile, availableFiles, dest, async (font, fontDest) => {
+    fontCalls++;
+    fs.writeFileSync(fontDest, 'dummyfont');
+  });
+
+  assert.ok(bundled && bundled.endsWith('.zip'), 'returns zip when fonts matched');
+  assert.equal(fontCalls, 1, 'downloaded only the 1 matched font');
+  assert.ok(fs.existsSync(bundled));
+
+  const zipEntries = new AdmZip(bundled).getEntries().map(e => e.entryName);
+  assert.ok(zipEntries.includes('sample.ass'));
+  assert.ok(zipEntries.some(e => e.startsWith('Fonts/')));
+});

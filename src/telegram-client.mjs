@@ -17,6 +17,8 @@ import {
   downloadMegaNode,
   downloadMegaFolderRelease,
   downloadDriveFolderRelease,
+  downloadGoogleDriveFileToDisk,
+  tryBundleMatchingFonts,
   isDriveFolderUrl,
   findBestFileInMediafire,
   findBestFileInDrive,
@@ -4759,6 +4761,7 @@ export async function checkTelegramChannels(existingClient = null) {
                 // multi-episode folder (m9).
                 const titleEps = extractExplicitEpisodeRange(titleLine || '');
                 const CLOUD_LABEL = { mediafire: 'Mediafire', mega: 'Mega', drive: 'Google Drive' };
+                const seriesFolderRefusals = [];
                 for (const source of cloudSources) {
                   if (downloadedFilePath) break;
                   const sourceLabel = CLOUD_LABEL[source.kind] || source.kind;
@@ -4830,7 +4833,76 @@ export async function checkTelegramChannels(existingClient = null) {
                     // for a SERIES_FOLDER_BATCH refusal — there the loop simply
                     // continues to the next source. No state key is written,
                     // so the message ends `skipped` via the safety net below.
+                    if (e && e.code === 'SERIES_FOLDER_BATCH') {
+                      seriesFolderRefusals.push({ source, targetEp, listing, sourceLabel });
+                    }
                     handleCloudCapRefusal(e, { kind: source.kind, url: source.url, label: sourceLabel });
+                  }
+                }
+
+                // Fallback for single-episode series folder refusal: if no other cloud source
+                // provided the subtitle, download the single subtitle from the series folder
+                // (skipping or matching fonts so the cap is not exceeded).
+                if (!downloadedFilePath && seriesFolderRefusals.length > 0) {
+                  for (const ref of seriesFolderRefusals) {
+                    if (downloadedFilePath) break;
+                    console.log(`   🔄 Fallback: downloading single subtitle from ${ref.sourceLabel}...`);
+                    try {
+                      if (ref.source.kind === 'mega') {
+                        const megaRelease = await downloadMegaFolderRelease(
+                          ref.source.url,
+                          fansubWorkDir,
+                          ref.targetEp,
+                          {
+                            rawTitle: titleLine,
+                            listedFiles: ref.listing,
+                            batch: isCollectionTitle(titleLine),
+                            skipFonts: true,
+                          }
+                        );
+                        if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
+                          const fontFiles = Array.isArray(ref.listing) ? ref.listing.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name || '')) : [];
+                          downloadedFilePath = await tryBundleMatchingFonts(
+                            megaRelease.filePath,
+                            fontFiles,
+                            fansubWorkDir,
+                            async (font, dest, dir) => {
+                              if (font.node) {
+                                await downloadMegaNode(font.node, dest, dir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+                              }
+                            }
+                          );
+                        }
+                      } else if (ref.source.kind === 'drive') {
+                        const driveRelease = await downloadDriveFolderRelease(
+                          ref.source.url,
+                          fansubWorkDir,
+                          ref.targetEp,
+                          null,
+                          titleLine,
+                          {
+                            listedFiles: ref.listing,
+                            batch: isCollectionTitle(titleLine),
+                            skipFonts: true,
+                          }
+                        );
+                        if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
+                          const fontFiles = Array.isArray(ref.listing) ? ref.listing.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name || '')) : [];
+                          downloadedFilePath = await tryBundleMatchingFonts(
+                            driveRelease.filePath,
+                            fontFiles,
+                            fansubWorkDir,
+                            async (font, dest) => {
+                              if (font.id) {
+                                await downloadGoogleDriveFileToDisk(font.id, dest, font.name, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+                              }
+                            }
+                          );
+                        }
+                      }
+                    } catch (fbErr) {
+                      console.warn(`   ⚠️ ${ref.sourceLabel} fallback failed: ${logSafe(fbErr && fbErr.message)}`);
+                    }
                   }
                 }
 

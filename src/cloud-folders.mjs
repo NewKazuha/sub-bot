@@ -784,6 +784,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
     rawTitle = '',
     listedFiles = null,
     batch = true,
+    skipFonts = false,
     downloadNode = downloadMegaNode,
   } = options || {};
 
@@ -798,7 +799,7 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
 
   const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
   const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
-  const fontFiles = clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+  const fontFiles = skipFonts ? [] : clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
 
   // 1. Direct subtitle files (.ass/.srt)
@@ -1492,6 +1493,7 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
     downloadFile = downloadGoogleDriveFileToDisk,
     // Single-episode titles narrow a multi-episode folder (P1 wiring).
     batch = true,
+    skipFonts = false,
   } = options || {};
 
   const files = (Array.isArray(listedFiles) && listedFiles.length > 0) ? listedFiles : await listDriveFolderWithSubtitles(folderUrl);
@@ -1503,10 +1505,10 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
 
   const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
   const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
-  let fontFiles = clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+  let fontFiles = skipFonts ? [] : clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
 
   // If a separate fonts folder URL is provided
-  if (fontsUrl && isDriveFolderUrl(fontsUrl)) {
+  if (!skipFonts && fontsUrl && isDriveFolderUrl(fontsUrl)) {
     console.log(`   📂 Fetching fonts from separate Drive folder: ${redactUrl(fontsUrl)}`);
     try {
       const fItems = await listDriveFolder(fontsUrl);
@@ -1646,5 +1648,110 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
   }
 
   return null;
+}
+
+// Extract font family names declared in ASS/SSA subtitle Style lines
+export function extractAssFontNames(assText) {
+  if (!assText || typeof assText !== 'string') return [];
+  const fontNames = new Set();
+  for (const line of assText.split(/\r?\n/)) {
+    if (/^Style:\s*/i.test(line)) {
+      const parts = line.split(',');
+      if (parts[1]) {
+        const fn = parts[1].trim();
+        if (fn) fontNames.add(fn);
+      }
+    }
+  }
+  return [...fontNames];
+}
+
+// Match font family names against available font file objects ({ name, node/id, ... })
+export function findMatchingFontFiles(assFontNames, availableFontFiles) {
+  if (!Array.isArray(assFontNames) || !Array.isArray(availableFontFiles)) return [];
+  const matched = [];
+  const used = new Set();
+  for (const fontName of assFontNames) {
+    const cleanFont = fontName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    if (!cleanFont || cleanFont.length < 2) continue;
+    for (const f of availableFontFiles) {
+      if (!f || !f.name || used.has(f.name)) continue;
+      const fBase = f.name.replace(/\.(ttf|otf|woff2?|ttc)$/i, '');
+      const cleanFile = fBase.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      if (!cleanFile) continue;
+      if (cleanFile.includes(cleanFont) || cleanFont.includes(cleanFile)) {
+        matched.push(f);
+        used.add(f.name);
+      }
+    }
+  }
+  return matched;
+}
+
+// Try to bundle matching fonts for a single ASS subtitle file when available
+export async function tryBundleMatchingFonts(subFilePath, fontFiles, destDir, downloadFontFn) {
+  if (!subFilePath || !fs.existsSync(subFilePath) || !/\.(ass|ssa)$/i.test(subFilePath)) {
+    return subFilePath;
+  }
+  if (!Array.isArray(fontFiles) || fontFiles.length === 0 || typeof downloadFontFn !== 'function') {
+    return subFilePath;
+  }
+  try {
+    const assText = fs.readFileSync(subFilePath, 'utf8');
+    const neededFonts = extractAssFontNames(assText);
+    if (neededFonts.length === 0) return subFilePath;
+
+    const matched = findMatchingFontFiles(neededFonts, fontFiles);
+    if (matched.length === 0) return subFilePath;
+    if (1 + matched.length > CLOUD_CAP_LIMITS.MAX_FILES) return subFilePath;
+
+    const unpackDir = path.join(destDir, nextTempTag('bundle_unpack'));
+    fs.mkdirSync(unpackDir, { recursive: true });
+    const fontsDir = path.join(unpackDir, 'Fonts');
+    fs.mkdirSync(fontsDir, { recursive: true });
+
+    try {
+      const subBase = path.basename(subFilePath);
+      const subDest = path.join(unpackDir, subBase);
+      fs.copyFileSync(subFilePath, subDest);
+
+      const usedNames = new Set();
+      const fontTargets = matched.map(f => ({
+        font: f,
+        name: f.name,
+        dest: path.join(fontsDir, uniqueFileName(safeRemoteBaseName(f.name, nextTempTag('font')), usedNames)),
+      }));
+
+      for (const t of fontTargets) {
+        if (!isInsideDir(t.dest, fontsDir)) throw new Error('unsafe cloud font name: ' + t.name);
+      }
+
+      await mapWithConcurrency(fontTargets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
+        await downloadFontFn(t.font, t.dest, fontsDir);
+      });
+
+      let totalBytes = fs.statSync(subDest).size;
+      for (const t of fontTargets) {
+        if (fs.existsSync(t.dest)) {
+          totalBytes += fs.statSync(t.dest).size;
+        }
+      }
+      if (totalBytes > CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES) {
+        return subFilePath;
+      }
+
+      const repackedZip = path.join(destDir, `${nextTempTag('matched_bundle')}.zip`);
+      packToZip(unpackDir, repackedZip);
+      if (fs.existsSync(repackedZip) && fs.statSync(repackedZip).size > 100) {
+        try { fs.rmSync(subFilePath, { force: true }); } catch { }
+        return repackedZip;
+      }
+    } finally {
+      try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch { }
+    }
+  } catch (err) {
+    console.warn(`   ⚠️ Font bundling fallback failed, using naked subtitle: ${logSafe(err && err.message)}`);
+  }
+  return subFilePath;
 }
 
