@@ -1553,9 +1553,21 @@ export function sanitizeBrokenChars(text) {
   return s.replace(/\s{2,}/g, ' ').trim();
 }
 
+const LEADING_EMOJI_SYMBOL_RE = /^(?:(\[[^\]]+\]\s*))?(?:(?:[\p{Extended_Pictographic}\u2600-\u26FF\u2700-\u27BF\u25A0-\u25FF\u{1F1E6}-\u{1F1FF}✦✧★☆✪✵✹✸✷✶◆◇■□▲▼▶◀●○•※⚜〽][\uFE00-\uFE0F\u200D\u{1F3FB}-\u{1F3FF}]*)[\s_\-–—·•:]*)+/gu;
+const TRAILING_EMOJI_SYMBOL_RE = /(?:[\s_\-–—·•:]*(?:[\p{Extended_Pictographic}\u2600-\u26FF\u2700-\u27BF\u25A0-\u25FF\u{1F1E6}-\u{1F1FF}✦✧★☆✪✵✹✸✷✶◆◇■□▲▼▶◀●○•※⚜〽][\uFE00-\uFE0F\u200D\u{1F3FB}-\u{1F3FF}]*))+[\s_\-–—·•:]*$/gu;
+
+export function stripEmojisAndDecorations(text) {
+  let s = String(text ?? '');
+  if (!s) return s;
+  s = s.replace(LEADING_EMOJI_SYMBOL_RE, (_, team) => team || '');
+  s = s.replace(TRAILING_EMOJI_SYMBOL_RE, '');
+  // Normalize middle dot / bullet used as separators between title and episode/season
+  s = s.replace(/\s+[·•]\s+/g, ' - ');
+  return s.replace(/\s{2,}/g, ' ').trim();
+}
+
 export function formatCleanTitle(raw) {
-  let cleaned = sanitizeBrokenChars(raw)
-    .replace(/^[📍📌🎬\s]+/u, '')
+  let cleaned = stripEmojisAndDecorations(sanitizeBrokenChars(raw))
     .replace(/\[\+fonts?\]/gi, '')
     .trim();
   cleaned = cleaned.replace(/^\[\s*hoshizora(?:[-_\s]*subs?)?\s*\]/i, '[ReDEJA]');
@@ -2028,11 +2040,12 @@ export function formatCleanCaption(title, isZip = false, isOfficial = false, has
 }
 
 export function getSafeTelegramFileName(name, ext = '.ass') {
-  let clean = sanitizeBrokenChars(name)
+  let clean = stripEmojisAndDecorations(sanitizeBrokenChars(name))
     // M2: the C0 control characters (NUL, ESC, …) can never reach a
     // published document name.
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/[\\/:*?"<>|,]+/g, ' ')
+    .replace(/[\p{Extended_Pictographic}\u2600-\u26FF\u2700-\u27BF\u25A0-\u25FF\u{1F1E6}-\u{1F1FF}✦✧★☆✪✵✹✸✷✶◆◇■□▲▼▶◀●○•※⚜〽][\uFE00-\uFE0F\u200D\u{1F3FB}-\u{1F3FF}]*/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
   const maxBaseLen = 55 - ext.length;
