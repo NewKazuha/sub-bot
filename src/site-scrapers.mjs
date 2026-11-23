@@ -820,10 +820,14 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
     const subFiles = files.filter(f => /\.(ass|srt|zip|rar|7z)$/i.test(f.name || ''));
     if (!subFiles.length) return null;
 
+    const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
+    const nonFontSubFiles = subFiles.filter(f => !isPureFont(f.name || ''));
+    const candidateFiles = nonFontSubFiles.length > 0 ? nonFontSubFiles : subFiles;
+
     let chosen = null;
     if (targetEp) {
       const epNorm = String(targetEp).replace(/^0+/, '');
-      chosen = subFiles.find(f => {
+      chosen = candidateFiles.find(f => {
         const found = (f.name || '').match(/(\d{1,4})/g) || [];
         return found.some(n => n.replace(/^0+/, '') === epNorm);
       });
@@ -831,7 +835,7 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
 
     if (!chosen && batch) {
       // For batch releases, prefer the batch archive (.zip/.rar/.7z)
-      const archives = subFiles.filter(f => /\.(zip|rar|7z)$/i.test(f.name || ''));
+      const archives = candidateFiles.filter(f => /\.(zip|rar|7z)$/i.test(f.name || ''));
       if (archives.length > 0) {
         // If an archive carries a range (e.g. 01 ~ 13) or batch keyword, pick it
         chosen = archives.find(f => /[-~–]|\bbatch\b|\bcomplete\b/i.test(f.name || '')) || archives[0];
@@ -839,7 +843,8 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
     }
 
     if (!chosen) {
-      chosen = subFiles[subFiles.length - 1];
+      const archives = candidateFiles.filter(f => /\.(zip|rar|7z)$/i.test(f.name || ''));
+      chosen = archives.length > 0 ? archives[archives.length - 1] : candidateFiles[candidateFiles.length - 1];
     }
 
     return `${base}${encodeURIComponent(chosen.name)}`;
@@ -920,8 +925,17 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
 
     // m7: a BATCH directory without an episode — prefer the archive that
     // carries NO episode token (the whole batch in one archive).
+    const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
+    const nonFontCandidates = candidates.filter(u => {
+      let decoded = u;
+      try { decoded = decodeURIComponent(u); } catch { }
+      const fn = decoded.split(/[?#]/)[0].split('/').pop() || decoded;
+      return !isPureFont(fn);
+    });
+    const pool = nonFontCandidates.length > 0 ? nonFontCandidates : candidates;
+
     if (batch && !targetEp) {
-      const archives = candidates.filter(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url));
+      const archives = pool.filter(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url));
       const decodedName = (url) => {
         let decoded = url;
         try { decoded = decodeURIComponent(url); } catch { }
@@ -938,13 +952,93 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
     }
 
     // Prefer an archive because fansub releases commonly bundle fonts with it.
-    return candidates.find(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url)) || candidates[0] || null;
+    return pool.find(url => /\.(?:zip|rar|7z)(?:$|[?#])/i.test(url)) || pool[0] || null;
   } catch (e) {
     // F3/F4: never convert a typed recovery refusal into a link/no-link result.
     if (recoveryFatalCodeFor(e)) throw e;
     console.warn(`Could not inspect subtitle directory ${directoryUrl}:`, e.message);
     return null;
   }
+}
+
+export async function resolveFontFromDirectory(directoryUrl) {
+  if (!directoryUrl || !/(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) return null;
+  const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
+  const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
+
+  // 1. Try application/json (Mejaow / modern GoIndex workers)
+  try {
+    const resJson = await fetchWithTimeout(directoryUrl, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page_token: null, page_index: 0 }),
+    });
+    if (resJson.ok) {
+      let json = null;
+      if (typeof resJson.json === 'function') {
+        json = await resJson.json().catch(() => null);
+      }
+      if (!json && typeof resJson.text === 'function') {
+        const rawText = await resJson.text();
+        try { json = JSON.parse(rawText); } catch {}
+      }
+      const files = json?.data?.files || [];
+      const fontFile = files.find(f => isPureFont(f.name || '') && /\.(?:zip|rar|7z|ttf|otf)$/i.test(f.name || ''));
+      if (fontFile) return `${base}${encodeURIComponent(fontFile.name)}`;
+    }
+  } catch { }
+
+  // 2. Try application/x-www-form-urlencoded (Rocks-Team / HashHackers GDI workers)
+  try {
+    const formParams = new URLSearchParams({ q: '', password: '', page_token: '', page_index: '0' });
+    const res = await fetchWithTimeout(directoryUrl, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formParams.toString(),
+    });
+    if (res.ok) {
+      let json = null;
+      if (typeof res.json === 'function') {
+        json = await res.json().catch(() => null);
+      }
+      if (!json && typeof res.text === 'function') {
+        const rawText = await res.text();
+        try { json = JSON.parse(rawText); } catch {
+          const rev = rawText.split('').reverse().join('');
+          const sliced = rev.substr(24).slice(0, -20);
+          const b64 = atob(sliced);
+          const uri = b64.split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('');
+          json = JSON.parse(decodeURIComponent(uri));
+        }
+      }
+      const files = json?.data?.files || [];
+      const fontFile = files.find(f => isPureFont(f.name || '') && /\.(?:zip|rar|7z|ttf|otf)$/i.test(f.name || ''));
+      if (fontFile) return `${base}${encodeURIComponent(fontFile.name)}`;
+    }
+  } catch { }
+
+  try {
+    const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
+    if (res.ok) {
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      let fontHref = null;
+      $('a[href]').each((_, el) => {
+        const href = normaliseLinkUrl($(el).attr('href'), directoryUrl);
+        const label = $(el).text().trim();
+        let decoded = href || '';
+        try { decoded = decodeURIComponent(decoded); } catch { }
+        const fn = decoded.split(/[?#]/)[0].split('/').pop() || decoded;
+        if (href && (isPureFont(fn) || isPureFont(label)) && /\.(?:zip|rar|7z|ttf|otf)(?:$|[?#])/i.test(href)) {
+          fontHref = href;
+          return false;
+        }
+      });
+      return fontHref;
+    }
+  } catch { }
+
+  return null;
 }
 
 export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null, releaseTitle = null, options = {}) {
@@ -1130,7 +1224,10 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     const text = $(el).text().trim().replace(/\s+/g, ' ');
     if (href) {
       const isIgnored = IGNORED_DOMAINS.some(d => href.includes(d));
-      if (!isIgnored) {
+      const isSelf = href.replace(/#.*$/, '') === pageUrl.replace(/#.*$/, '');
+      const tag = (el.tagName || '').toLowerCase();
+      const isContainer = ['article', 'section', 'body', 'main'].includes(tag) || text.length > 120;
+      if (!isIgnored && !isSelf && !isContainer) {
         // Check parent/surrounding context text
         const parentContext = $(el).closest('div, section, article, p, table, tr, td, li').text().trim().replace(/\s+/g, ' ');
 
@@ -1159,7 +1256,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   // 1. Check for dedicated Subtitle / Font links
   // Patterns used by the fansub sites: "ملف الترجمة والخطوط", "ملف الترجمة",
   // "Softsub", and buttons labelled "هنا" or "التحميل" under these headings.
-  const subExplicitRegex = /(?:ملف\s*(?:الترجمة|الترجمات|الخطوط)|(?:الترجمة|الترجمات)\s*(?:و\s*الخطوط)?|subtitles?)/i;
+  const subExplicitRegex = /(?:ملف\s*(?:الترجمة|الترجمات|الخطوط)|(?:الترجمة|الترجمات)\s*(?:و\s*الخطوط)?|(?:الخطوط)\s*و\s*(?:الترجمة|الترجمات)|subtitles?)/i;
   const subHeadingRegex = /(?:ملف(?:ات)?\s*(?:الترجمة|الترجمات)(?:\s*و\s*الخطوط)?|(?:الترجمة|الترجمات)\s*و?\s*الخطوط|ملف\s*الخطوط|soft\s*sub|subtitles?)/i;
   const actionButtonRegex = /^(?:هنا|اضغط\s*هنا|إضغط\s*هنا|اضغط|إضغط|التحميل|تحميل|تنزيل|download|direct|ddl)$/i;
 
@@ -1326,8 +1423,15 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     // options object stays verbatim so normal (non-recovery) callers are unchanged.
     const directoryOptions = { batch: Boolean(options.batch) };
     directoryOptions.redirect = options.redirect;
-    const resolvedFile = await resolveSubtitleFromDirectory(directSubLink, effectiveEp, directoryOptions);
-    if (resolvedFile) directSubLink = resolvedFile;
+    const dirUrl = directSubLink;
+    const resolvedFile = await resolveSubtitleFromDirectory(dirUrl, effectiveEp, directoryOptions);
+    if (resolvedFile) {
+      directSubLink = resolvedFile;
+      if (!fontsLink) {
+        const fontFile = await resolveFontFromDirectory(dirUrl);
+        if (fontFile) fontsLink = fontFile;
+      }
+    }
   }
 
   // A subtitle button can itself be a short link. Once expanded, expose the

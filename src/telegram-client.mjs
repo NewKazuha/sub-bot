@@ -4751,7 +4751,41 @@ export async function checkTelegramChannels(existingClient = null) {
                     } else {
                       await downloadFileToDisk(directUrl, tempDest, { Referer: postPageUrl }, dlOptions);
                     }
-                    if (fs.existsSync(tempDest)) downloadedFilePath = tempDest;
+                    if (fs.existsSync(tempDest)) {
+                      downloadedFilePath = tempDest;
+                      const magic = validateFileMagic(tempDest);
+                      if (magic && !magic.isArchive && pageData.videoLinks?.fonts) {
+                        try {
+                          const fontsTemp = path.join(fansubWorkDir, `fonts_${Date.now()}`);
+                          console.log(`   📥 Downloading accompanying fonts bundle: ${redactUrl(pageData.videoLinks.fonts)}`);
+                          await downloadFileToDisk(pageData.videoLinks.fonts, fontsTemp, { Referer: postPageUrl });
+                          if (fs.existsSync(fontsTemp)) {
+                            const fontsFolder = path.join(fansubWorkDir, 'Fonts');
+                            fs.mkdirSync(fontsFolder, { recursive: true });
+                            if (validateFileMagic(fontsTemp)?.isArchive) {
+                              extractArchive(fontsTemp, fontsFolder);
+                              try { fs.rmSync(fontsTemp, { force: true }); } catch { }
+                            } else {
+                              safeMoveFile(fontsTemp, path.join(fontsFolder, path.basename(pageData.videoLinks.fonts)));
+                            }
+                            // Name the sub file with its extension so the zip holds a recognizable subtitle
+                            const properSubName = path.basename(directUrl).split(/[?#]/)[0] || `subtitle${magic.ext}`;
+                            const properSubPath = path.join(fansubWorkDir, decodeURIComponent(properSubName));
+                            if (tempDest !== properSubPath) {
+                              safeMoveFile(tempDest, properSubPath);
+                            }
+                            const repacked = path.join(fansubWorkDir, 'release.zip');
+                            packFolderToZip(fansubWorkDir, repacked);
+                            if (fs.existsSync(repacked) && fs.statSync(repacked).size > 100) {
+                              downloadedFilePath = repacked;
+                              console.log(`   📦 Packaged standalone subtitle + fonts into ZIP: ${logSafe(path.basename(repacked))}`);
+                            }
+                          }
+                        } catch (e) {
+                          console.warn(`   ⚠️ Failed to bundle fonts with subtitle:`, e.message);
+                        }
+                      }
+                    }
                   } catch (e) {
                     console.warn(`   ⚠️ Direct download failed:`, e.message);
                   }

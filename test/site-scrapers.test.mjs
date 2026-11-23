@@ -690,3 +690,87 @@ test('resolveGoIndexSubtitle prefers batch archive when batch: true', async () =
     globalThis.fetch = realFetch;
   }
 });
+
+test('resolveGoIndexSubtitle ignores pure font zip archive and picks .ass subtitle', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({
+      data: {
+        files: [
+          { name: '[Skibidi-Subs] Umamusume Road to The Rop MOVIE Arabic.ass', size: 18664652 },
+          { name: 'Uma_Fonts.zip', size: 1677721 }
+        ]
+      }
+    })
+  });
+
+  try {
+    const res = await ss.resolveGoIndexSubtitle('https://ddl.skibidisubs.workers.dev/0:/Uma/', null);
+    assert.ok(res.includes('Arabic.ass'), 'picked the .ass file instead of Uma_Fonts.zip');
+    assert.ok(!res.includes('Uma_Fonts.zip'), 'did not pick pure font archive');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('resolveFontFromDirectory finds font archive in directory', async () => {
+  const realFetch = globalThis.fetch;
+  const mockPayload = {
+    data: {
+      files: [
+        { name: '[Skibidi-Subs] Umamusume Road to The Rop MOVIE Arabic.ass', size: 18664652 },
+        { name: 'Uma_Fonts.zip', size: 1677721 }
+      ]
+    }
+  };
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => mockPayload,
+    text: async () => JSON.stringify(mockPayload)
+  });
+
+  try {
+    const font = await ss.resolveFontFromDirectory('https://ddl.skibidisubs.workers.dev/0:/Uma/');
+    assert.ok(font && font.includes('Uma_Fonts.zip'), 'found font archive');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('scrapePostPage ignores Blogger <article data-url> container and selects real directSub link', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => 'text/html' },
+      text: async () => `
+        <html><body>
+          <article class="post" data-id="123" data-url="https://blog.example.com/2026/11/post.html">
+            <h1 class="post-title">Anime Release</h1>
+            <div class="post-body">
+              Here is the release text mentioning ملف الترجمة والخطوط and lots of descriptions...
+              <div class="download-section">
+                <a href="https://worker.example.workers.dev/0:/Anime/sub.ass">ملف الترجمة والخطوط</a>
+              </div>
+            </div>
+          </article>
+        </body></html>
+      `,
+    };
+  };
+
+  try {
+    const data = await ss.scrapePostPage('https://blog.example.com/2026/11/post.html', null, null, 'Anime Release');
+    assert.equal(data.bestDownloadUrl, 'https://worker.example.workers.dev/0:/Anime/sub.ass');
+    assert.equal(data.videoLinks?.directSub, 'https://worker.example.workers.dev/0:/Anime/sub.ass');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
