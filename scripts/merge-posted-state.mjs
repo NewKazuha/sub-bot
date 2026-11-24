@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { RETRACTED_KEYS } from '../src/retracted-keys.mjs';
+import { RETRACTED_KEYS, RETRACTION_MARKER } from '../src/retracted-keys.mjs';
 
 // ---------------------------------------------------------------------------
 // Measured thresholds (execution spec §0 — the audit's proposed numbers
@@ -99,7 +99,9 @@ export function validatePostedIds(arr) {
 /**
  * Union-merge the two sides. No key of either side is lost (subset
  * property), modulo the explicitly reported rejections.
- * → { merged, rejected, localCount, remoteCount, invalid }
+ * → { merged, rejected, localCount, remoteCount, realMergedCount, invalid }
+ * `realMergedCount` is the union size EXCLUDING the bookkeeping marker, so
+ * the absolute floor (MIN_MERGED_ENTRIES) counts real posted keys only.
  *
  * `options.localCheck` / `options.remoteCheck` let a caller that ALREADY
  * validated the sides (P-2: validate once, then merge the validated sides)
@@ -121,6 +123,7 @@ export function mergePostedIds(ours, theirs, options = {}) {
       rejected: localCheck.rejected.length + (remoteAbsent ? 0 : remoteCheck.rejected.length),
       localCount: 0,
       remoteCount: 0,
+      realMergedCount: 0,
       invalid,
     };
   }
@@ -128,16 +131,37 @@ export function mergePostedIds(ours, theirs, options = {}) {
   const localBad = new Set(localCheck.rejected.map(r => r.index));
   const remoteBad = new Set(remoteCheck.rejected.map(r => r.index));
 
+  // One-time migration: the RETRACTED_KEYS purge is only performed while the
+  // version marker is absent. If EITHER side carries the marker the migration
+  // is already applied — retracted keys are preserved (they are historical
+  // only and must not be re-erased from a legitimate later release). The
+  // marker itself is bookkeeping, never a posted release key: strip it from
+  // both sides before the union and emit exactly one marker in the output.
+  const migrationApplied = ours.includes(RETRACTION_MARKER)
+    || (!remoteAbsent && theirs.includes(RETRACTION_MARKER));
+
   const localSet = new Set();
-  ours.forEach((v, i) => { if (!localBad.has(i) && !RETRACTED_KEYS.has(v)) localSet.add(v); });
+  ours.forEach((v, i) => {
+    if (localBad.has(i) || v === RETRACTION_MARKER) return;
+    if (!migrationApplied && RETRACTED_KEYS.has(v)) return;
+    localSet.add(v);
+  });
   const remoteSet = new Set();
-  if (!remoteAbsent) theirs.forEach((v, i) => { if (!remoteBad.has(i) && !RETRACTED_KEYS.has(v)) remoteSet.add(v); });
+  if (!remoteAbsent) theirs.forEach((v, i) => {
+    if (remoteBad.has(i) || v === RETRACTION_MARKER) return;
+    if (!migrationApplied && RETRACTED_KEYS.has(v)) return;
+    remoteSet.add(v);
+  });
 
   // P-7: accumulate into ONE Set (no [...localSet, ...remoteSet] → Set →
   // spread round-trip over two ~42k Sets).
   const mergedSet = new Set();
   localSet.forEach(k => mergedSet.add(k));
   remoteSet.forEach(k => mergedSet.add(k));
+  // Count REAL posted keys before the marker joins the set: the bookkeeping
+  // marker must not satisfy MIN_MERGED_ENTRIES on its own.
+  const realMergedCount = mergedSet.size;
+  mergedSet.add(RETRACTION_MARKER); // persist the version record once
   const merged = Array.from(mergedSet);
   const rejected = localCheck.rejected.length + (remoteAbsent ? 0 : remoteCheck.rejected.length);
   // P-8/F-01: with the remote absent there is no baseline to compare against,
@@ -148,6 +172,7 @@ export function mergePostedIds(ours, theirs, options = {}) {
     rejected,
     localCount: localSet.size,
     remoteCount: effectiveRemoteCount,
+    realMergedCount,
     invalid: [],
   };
 }
@@ -516,7 +541,7 @@ export async function pushStateWithRetries({
       const verdict = classifyMerge({
         localCount: merge.localCount,
         remoteCount: merge.remoteCount,
-        mergedCount: merge.merged.length,
+        mergedCount: merge.realMergedCount,
         rejected: merge.rejected,
       });
       if (verdict.corrupt) {
@@ -766,7 +791,7 @@ async function main() {
     const verdict = classifyMerge({
       localCount: merge.localCount,
       remoteCount: merge.remoteCount,
-      mergedCount: merge.merged.length,
+      mergedCount: merge.realMergedCount,
       rejected: merge.rejected,
     });
     if (verdict.corrupt) {

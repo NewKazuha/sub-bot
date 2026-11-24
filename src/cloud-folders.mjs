@@ -7,6 +7,7 @@ import { createWriteStream } from 'node:fs';
 import { Readable, Transform } from 'node:stream';
 import AdmZip from 'adm-zip';
 import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
+import { fetchSafe, isStaticSafeUrl } from './url-safety.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
@@ -414,18 +415,29 @@ export function extractEpisodesFromText(text) {
   // Range matching: "07 & 08", "07-08", "07_08", "07 to 08"
   const rangeMatch = cleaned.match(/(\d{1,4})\s*(?:[-&~–]|to|and)\s*(\d{1,4})/i);
   if (rangeMatch) {
-    const start = parseInt(rangeMatch[1], 10);
-    const end = parseInt(rangeMatch[2], 10);
-    if (!isNaN(start) && !isNaN(end) && Math.abs(end - start) <= 50) {
-      const min = Math.min(start, end);
-      const max = Math.max(start, end);
-      for (let i = min; i <= max; i++) eps.add(String(i));
+    // "S01 - 02" / "Season 1 - 02" / "Season2 - 05" is a season + an
+    // episode, NOT a range — the "2 - 05" inside these names must not
+    // expand to episodes 2..5. The single-number pass below still extracts
+    // the episode ("05" → 5). Mirrors extractExplicitEpisodeRange.
+    const head = cleaned.slice(0, rangeMatch.index) + rangeMatch[1];
+    if (!/(?:S\d{1,2}|Season\s*\d{1,2}|Season)\s*$/i.test(head)) {
+      const start = parseInt(rangeMatch[1], 10);
+      const end = parseInt(rangeMatch[2], 10);
+      if (!isNaN(start) && !isNaN(end) && Math.abs(end - start) <= 50) {
+        const min = Math.min(start, end);
+        const max = Math.max(start, end);
+        for (let i = min; i <= max; i++) eps.add(String(i));
+      }
     }
   }
 
   // Single numbers: " - 08", "E08", "EP08", "Episode 8", " #8", " [08]"
   const singleMatches = cleaned.matchAll(/(?:-\s*|ep(?:isode)?\s*|e\s*|#\s*|\[|\s+)(\d{1,4})(?:\s*v\d+)?(?:\s*\]|\s*\[|\s*\(|\s*\.|\s*$|\s+)/gi);
   for (const m of singleMatches) {
+    // A spelled-out season number ("Season 2 - 05") is a season, not an
+    // episode: skip the "2" that the whitespace prefix would otherwise add.
+    const head = cleaned.slice(0, m.index) + m[1];
+    if (/(?:S\d{1,2}|Season\s*\d{1,2}|Season)\s*$/i.test(head)) continue;
     const num = m[1].replace(/^0+/, '') || '0';
     eps.add(num);
   }
@@ -513,9 +525,10 @@ export function extractExplicitEpisodeRange(text) {
     if (!(start < end)) continue;
     // the span cap
     if (end - start > CLOUD_RANGE_MAX_SPAN) continue;
-    // "S01 - 02" / "Season 1 - 02" is a season + an episode, NOT a range
+    // "S01 - 02" / "Season 1 - 02" / "Season2 - 05" is a season + an
+    // episode, NOT a range (spelled-out season numbers included)
     const head = raw.slice(0, m.index) + m[1];
-    if (/(?:S\d{1,2}|Season)\s*$/i.test(head)) continue;
+    if (/(?:S\d{1,2}|Season\s*\d{1,2}|Season)\s*$/i.test(head)) continue;
     // neither endpoint is a resolution ("1080p - 1081", "1080 - 1081p")
     if (/\dp/i.test(m[0])) continue;
     if (/^\s*p/i.test(raw.slice(m.index + m[0].length))) continue;
@@ -1061,11 +1074,23 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
 // ====================================================================
 
 export async function resolveMediafireDirectDownload(mfUrl) {
+  // SSRF: `mfUrl` is scraped/user input. The HOSTNAME must be mediafire.com
+  // (or a subdomain) BEFORE any request — a URL that merely mentions
+  // mediafire.com in its query (e.g. http://169.254.169.254/?x=mediafire.com/file)
+  // is NOT a mediafire URL and is refused with ZERO fetches.
+  if (!isProviderHostUrl(mfUrl, 'mediafire')) return null;
   try {
-    const res = await fetchWithTimeout(mfUrl, {
-      headers: { 'User-Agent': UA }
+    // fetchSafe keeps redirect:'manual' and re-validates EVERY hop with DNS,
+    // so a public mediafire host cannot 302 us into a private/metadata address.
+    // The initial URL uses the DNS-free static validator so a legitimate public
+    // URL is still fetched even when DNS resolution is unavailable.
+    const result = await fetchSafe(mfUrl, {
+      sourceUrl: mfUrl,
+      initialValidator: isStaticSafeUrl,
+      headers: { 'User-Agent': UA },
     });
-    if (!res.ok) return null;
+    const res = result?.response;
+    if (!res?.ok) return null;
     const html = await res.text();
     const doc = cheerio.load(html);
     const dlBtn = doc('#downloadButton').attr('href') || doc('a[aria-label="Download file"]').attr('href');
@@ -1083,6 +1108,11 @@ async function listMediafireFolderStrict(folderUrl) {
   if (!match) return [];
   const folderKey = match[1];
 
+  // SSRF audit: `apiUrl` is built from the FIXED first-party host
+  // www.mediafire.com. `folderKey` is constrained to [a-zA-Z0-9]+ by the match
+  // above, so it cannot inject a host, a path separator or a query separator —
+  // no scraped hostname ever reaches this request. Documented safe; it stays
+  // on fetchWithTimeout (the listing is a trusted first-party API call).
   const apiUrl = `https://www.mediafire.com/api/1.4/folder/get_content.php?folder_key=${folderKey}&content_type=files&response_format=json`;
   const res = await fetchWithTimeout(apiUrl, {
     headers: { 'User-Agent': UA }
@@ -1135,6 +1165,8 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extra
 
   // 1. Direct subtitle files (.ass/.srt/.zip/.rar/.7z)
   const subFiles = clean.filter(f => /\.(ass|srt|zip|7z|rar)$/i.test(f.name));
+  let episodeAbsent = false;
+  try {
   if (subFiles.length > 0) {
     // M3: the batch holds the real subtitle files only (an ARCHIVE can be
     // chosen as a single release, never as a batch member — the packer drops
@@ -1177,6 +1209,13 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extra
       size: chosen.size
     };
   }
+  } catch (e) {
+    if (e.code !== 'EPISODE_ABSENT') throw e;
+    // The requested episode has no subtitle here — fall through to the
+    // softsub MKV branch. Never substitute a different episode: if the MKV
+    // branch also has no match, it re-throws EPISODE_ABSENT.
+    episodeAbsent = true;
+  }
 
   // 2. MKV files
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
@@ -1197,6 +1236,7 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extra
     };
   }
 
+  if (episodeAbsent) throw episodeAbsentError();
   return null;
 }
 
@@ -1229,6 +1269,9 @@ export async function downloadGoogleDriveFileToDisk(fileId, destPath, fileName =
   const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : null;
 
   try {
+    // SSRF audit: `url` is produced by getDriveDirectUrl(fileId), whose host is
+    // the FIXED drive.google.com; `fileId` is interpolated only into the `id=`
+    // query value, so it cannot rewrite the request host. Documented safe.
     let res = await fetchWithTimeout(url, { headers }, 60_000);
     if (!res.ok) {
       console.warn(`   ⚠️ Google Drive HTTP ${res.status} for file: ${logSafe(fileName || fileId)}`);
@@ -1252,7 +1295,28 @@ export async function downloadGoogleDriveFileToDisk(fileId, destPath, fileName =
       if (action && params.has('confirm')) {
         const confirmedUrl = new URL(action, res.url);
         confirmedUrl.search = params.toString();
-        res = await fetchWithTimeout(confirmedUrl.toString(), { headers }, 60_000);
+        // SSRF audit: the form `action` is HTML-derived (second-order input).
+        // Only an official Google host may be fetched — a poisoned form must
+        // never turn the confirmation into an internal HTTP client. fetchSafe
+        // then keeps redirect:'manual' and DNS-validates every hop.
+        const confirmedHost = cloudHostOf(confirmedUrl.toString());
+        if (!confirmedHost || !(confirmedHost === 'drive.google.com' ||
+              confirmedHost.endsWith('.google.com') || confirmedHost.endsWith('.googleusercontent.com'))) {
+          console.warn(`   ⚠️ Google Drive confirmation refused: foreign host`);
+          return false;
+        }
+        const confirmed = await fetchSafe(confirmedUrl.toString(), {
+          sourceUrl: confirmedUrl.toString(),
+          cookieHeader: cookie,
+          initialValidator: isStaticSafeUrl,
+          headers,
+          timeoutMs: 60_000,
+        });
+        res = confirmed?.response;
+        if (!res) {
+          console.warn(`   ⚠️ Google Drive confirmation refused: unsafe redirect`);
+          return false;
+        }
         const nextType = (res.headers.get('content-type') || '').toLowerCase();
         if (res.ok && !nextType.includes('text/html')) {
           // The file is STREAMED to the disk with a byte cap (C9): the old
@@ -1290,10 +1354,18 @@ async function listDriveFolderStrict(folderUrl) {
   const folderId = idMatch[1];
 
   const listUrl = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
-  const res = await fetchWithTimeout(listUrl, {
+  // SSRF audit: `folderId` is scraped/user input, so this request is hardened
+  // rather than left on a raw redirect-following fetch. The fixed host is
+  // asserted first and fetchSafe DNS-validates every redirect hop while the
+  // initial (fixed-host) URL uses the DNS-free static validator.
+  if (!isProviderHostUrl(listUrl, 'drive')) return [];
+  const listed = await fetchSafe(listUrl, {
+    sourceUrl: listUrl,
+    initialValidator: isStaticSafeUrl,
     headers: { 'User-Agent': UA },
-    redirect: 'follow'
   });
+  if (!listed) throw new Error('Google Drive listing fetch refused');
+  const res = listed.response;
 
   if (!res.ok) return [];
   // The listing response is read into the RAM: its size is capped (C12).
@@ -1412,6 +1484,8 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null, extrac
 
   // 1. Subtitles
   const subFiles = clean.filter(f => /\.(ass|srt|zip|7z|rar)$/i.test(f.name));
+  let episodeAbsent = false;
+  try {
   if (subFiles.length > 0) {
     // M3: the batch holds the real subtitle files only (an ARCHIVE can be
     // chosen as a single release, never as a batch member — the packer drops
@@ -1444,6 +1518,13 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null, extrac
       type: 'subtitle'
     };
   }
+  } catch (e) {
+    if (e.code !== 'EPISODE_ABSENT') throw e;
+    // The requested episode has no subtitle here — fall through to the
+    // softsub MKV branch. Never substitute a different episode: if the MKV
+    // branch also has no match, it re-throws EPISODE_ABSENT.
+    episodeAbsent = true;
+  }
 
   // 2. MKV files
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
@@ -1463,6 +1544,7 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null, extrac
     };
   }
 
+  if (episodeAbsent) throw episodeAbsentError();
   return null;
 }
 
@@ -1506,6 +1588,7 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
   const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
   const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
   let fontFiles = skipFonts ? [] : clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
 
   // If a separate fonts folder URL is provided
   if (!skipFonts && fontsUrl && isDriveFolderUrl(fontsUrl)) {
@@ -1522,6 +1605,8 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
   }
 
   // 1. Direct subtitle files (.ass/.srt)
+  let episodeAbsent = false;
+  try {
   if (subFiles.length > 0) {
     // Check if rawTitle specifies a batch range or specific episodes
     // M4: only an EXPLICIT episode range narrows the folder (a single
@@ -1529,7 +1614,7 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
     const extractedEps = extractExplicitEpisodeRange(rawTitle || '');
     // F2a: a folder with several episodes is a BATCH — the whole batch is
     // downloaded, never narrowed to the episode the post asks for.
-    const targetSubs = selectFolderTargets(subFiles, { targetEpisode, extractedEps });
+    const targetSubs = selectFolderTargets(subFiles, { targetEpisode, extractedEps, batch });
     console.log(`   🎯 [Drive Release] ${targetSubs.length}/${subFiles.length} subtitle file(s) selected from the folder.`);
 
     const isBatch = targetSubs.length > 1;
@@ -1646,7 +1731,40 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
       };
     }
   }
+  } catch (e) {
+    if (e.code !== 'EPISODE_ABSENT') throw e;
+    // The requested episode has no subtitle/archive here — fall through to
+    // the softsub MKV branch (muxed Arabic subs + fonts). If that branch has
+    // no matching episode either it re-throws EPISODE_ABSENT (defer, never
+    // substitute a different episode).
+    episodeAbsent = true;
+  }
 
+  // 3. Softsub MKV files
+  if (mkvFiles.length > 0) {
+    let chosen = mkvFiles[mkvFiles.length - 1];
+    if (targetEpisode) {
+      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
+      if (match) chosen = match;
+      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
+    }
+    console.log(`   🎬 Drive: found MKV: ` + logSafe(chosen.name));
+    const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(chosen.name, nextTempTag('drive_mkv'))));
+    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
+    // X4: a video is bounded by the 4 GiB ceiling, not the 64 MiB sub cap.
+    const ok = await downloadFile(chosen.id, destPath, chosen.name, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
+    if (ok) {
+      return {
+        filePath: destPath,
+        isArchive: false,
+        hasFonts: false,
+        type: 'mkv',
+        subNames: [chosen.name]
+      };
+    }
+  }
+
+  if (episodeAbsent) throw episodeAbsentError();
   return null;
 }
 

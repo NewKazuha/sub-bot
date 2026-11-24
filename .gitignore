@@ -13,3 +13,4 @@ temp_*
 *.log
 .reports/
 opencode.json
+.workbuddy-ai/

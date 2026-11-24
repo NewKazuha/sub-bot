@@ -58,7 +58,60 @@ import {
   normalizeTeamName,
   buildSyntheticTitle
 } from './title-identity.mjs';
-import { RETRACTED_KEYS } from './retracted-keys.mjs';
+import { RETRACTED_KEYS, RETRACTION_MARKER } from './retracted-keys.mjs';
+// V3: shared URL-safety boundary (leaf module, no cycle). Every download hop is
+// validated BEFORE it is requested; both the validator and the DNS resolver are
+// injectable so the download path can be exercised fully offline.
+import { isStaticSafeUrl, isAllowedMetaRefreshTarget, RecoveryRedirectError, fetchSafe } from './url-safety.mjs';
+
+// Provider identity is decided by URL HOSTNAME only. Substring checks such as
+// /mediafire\.com/i.test(url) accept `http://169.254.169.254/?x=mediafire.com/file`
+// and hand a metadata address to a resolver/fetch — see the Subdl font path.
+export function isUrlHostOf(url, domain) {
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const d = String(domain || '').trim().toLowerCase().replace(/^\./, '').replace(/\.$/, '');
+  if (!host || !d) return false;
+  return host === d || host.endsWith(`.${d}`);
+}
+
+// Extract the FIRST URL in `text` whose hostname is one of `domains`. The
+// extraction regex is intentionally broad — the hostname check is the sole
+// provider decision, so a provider name appearing in a query/path never wins.
+export function findProviderUrlInText(text, domains) {
+  const list = (Array.isArray(domains) ? domains : [domains]).filter(Boolean);
+  if (list.length === 0) return null;
+  for (const match of String(text || '').matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+    const url = match[0];
+    if (list.some(d => isUrlHostOf(url, d))) return url;
+  }
+  return null;
+}
+
+// The Subdl "fonts:" line (or, when absent, any provider-looking URL in the
+// message) is resolved to a provider by hostname. Returns null when the only
+// candidate is a lookalike, so no resolver is dispatched at all.
+export function pickFontProviderUrl(text) {
+  const source = String(text || '');
+  const labelled = source.match(/(?:fonts|subs\s*&\s*fonts)[^:]*:\s*(https?:\/\/[^\s"'<>]+)/i);
+  const domains = ['top4top.io', 'mediafire.com', 'mega.nz'];
+  // Preserve the original `labelled || anywhere` shape: if a fonts: line was
+  // found, ONLY its URL is considered (a hostile label never falls through to
+  // a different URL elsewhere in the message).
+  const url = labelled
+    ? findProviderUrlInText(labelled[1], domains)
+    : findProviderUrlInText(source, domains);
+  if (!url) return null;
+  if (isUrlHostOf(url, 'top4top.io')) return { kind: 'top4top', url };
+  if (isUrlHostOf(url, 'mediafire.com')) return { kind: 'mediafire', url };
+  return { kind: 'mega', url };
+}
 
 // F1/F4: the recovery path must forbid redirects. The call sites stay exactly
 // as they were (audited by T38); a thin wrapper injects the single no-redirect
@@ -69,7 +122,11 @@ import { RETRACTED_KEYS } from './retracted-keys.mjs';
 const recoveryState = { active: false, msg: null };
 function scrapePostPage(pageUrl, siteConfig, targetEp, releaseTitle, options = {}) {
   const effective = scrapeOptionsForState(options, recoveryState);
-  return baseScrapePostPage(pageUrl, siteConfig, targetEp, releaseTitle, effective);
+  // V3: forward an injected DNS resolver to the base scraper (used by its
+  // meta-refresh guard). scrapeOptionsForState already spreads `options`, so
+  // copy instead of mutating the caller's object when no new state was added.
+  return baseScrapePostPage(pageUrl, siteConfig, targetEp, releaseTitle,
+    options.lookup ? { ...effective, lookup: options.lookup } : effective);
 }
 // G2: the second directory call site keeps its exact batch-options shape (the
 // T38 source contract). The no-redirect mode is injected here from the same
@@ -148,6 +205,25 @@ export function safeMoveFile(src, dest) {
       return false;
     }
   }
+}
+
+// Resolve the on-disk destination for a remote-controlled subtitle file name.
+// The URL basename may be percent-encoded (e.g. %2e%2e%2f...): decode
+// defensively, reduce it to a single safe path component, and verify the
+// result stays inside workDir before the caller renames the temp file there.
+// Returns null on any doubt so the caller can keep the file under its temp
+// name instead of writing outside the work directory.
+export function resolveSafeSubtitleDestination(directUrl, workDir, ext) {
+  const rawName = path.basename(String(directUrl ?? '')).split(/[?#]/)[0];
+  let decoded = rawName;
+  try {
+    decoded = decodeURIComponent(rawName);
+  } catch {
+    // Malformed percent-encoding: fall back to the raw (still sanitized) name.
+  }
+  const safeName = safeRemoteBaseName(decoded, `subtitle${ext}`);
+  const result = path.join(workDir, safeName);
+  return isInsideDir(result, workDir) ? result : null;
 }
 
 // ====================================================================
@@ -260,15 +336,24 @@ export function loadPostedIds() {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) throw new Error('posted.json is not a JSON array');
     const set = new Set(parsed);
-    for (const k of RETRACTED_KEYS) {
-      set.delete(k);
+    if (!set.has(RETRACTION_MARKER)) {
+      // One-time purge: remove the retracted keys and record the marker so the
+      // next save persists the version record (after which filtering stops).
+      for (const k of RETRACTED_KEYS) {
+        set.delete(k);
+      }
+      set.add(RETRACTION_MARKER);
     }
+    // Marker present → migration already applied: never re-erase retracted
+    // keys. Keep the marker in the set so savePostedIds() writes it back —
+    // it is a fixed version record no release-key generator can produce.
     return set;
   };
 
-  // A missing file is a legitimate first run — return an empty set (no throw).
+  // A missing file is a legitimate first run — return an empty set carrying
+  // the marker so a fresh install records the migration and never purges.
   if (!fs.existsSync(POSTED_FILE)) {
-    return new Set();
+    return new Set([RETRACTION_MARKER]);
   }
 
   try {
@@ -2435,20 +2520,24 @@ export function packFolderToZip(folderPath, destZipPath) {
 
 export async function downloadFileToDisk(url, destPath, headers = {}, options = {}) {
   const signal = AbortSignal.timeout(10 * 60 * 1000);
-  // S1c/F4: only an explicitly requested manual mode changes fetch behaviour;
-  // every existing caller (no `redirect` option) keeps the default 'follow'.
-  // F4: recovery messages still treat ANY 3xx as a typed fatal; non-recovery
-  // manual mode follows a BOUNDED, re-validated redirect chain instead.
-  const manualRedirect = options.redirect === RECOVERY_REDIRECT_MODE;
+  // V3: manual redirects are now the DEFAULT. fetch() must never silently
+  // follow a scraped 302 into an internal address; every hop is validated by
+  // this function before it is requested. F4: recovery still treats ANY 3xx
+  // as a typed fatal; normal mode follows a BOUNDED, re-validated chain.
   const isRecovery = options.recovery === true;
   const requestOptions = {
     signal,
-    ...(manualRedirect ? { redirect: RECOVERY_REDIRECT_MODE } : {}),
+    redirect: 'manual',
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
       ...headers
     }
   };
+  // Overridable only by tests/host code — defaults to the DNS-free static
+  // guard. `options.lookup` is left undefined when absent so url-safety.mjs
+  // applies its own real dnsLookup default; never trust a caller-supplied one
+  // blindly in production.
+  const validateUrl = typeof options.validateUrl === 'function' ? options.validateUrl : isStaticSafeUrl;
   const expectedHost = options.expectedHost ? String(options.expectedHost).toLowerCase() : null;
   // The per-file cap (M6/C7b/C10): a hostile server must not be able to fill
   // the disk with ONE file.
@@ -2461,27 +2550,43 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
     }
   };
   const throwTypedRedirect = () => {
-    const err = new Error(RECOVERY_CODES.REDIRECT);
-    err.code = RECOVERY_CODES.REDIRECT;
-    throw err;
+    // Same typed code/message as before, now backed by the shared typed class.
+    throw new RecoveryRedirectError(RECOVERY_CODES.REDIRECT);
   };
+  // DNS-aware guard for every redirect hop. The static validator is NOT enough
+  // here: a public hostname can resolve to a private address. expectedHost is
+  // checked synchronously first, then EVERY resolved DNS answer must be public.
+  const validateHop = async (candidate, fromUrl) => {
+    let host;
+    try { host = new URL(candidate).hostname.toLowerCase(); } catch { throw new Error('Invalid redirect'); }
+    if (expectedHost && host !== expectedHost) throw new Error('Redirect host rejected');
+    if (!await isAllowedMetaRefreshTarget(candidate, fromUrl, options.lookup)) {
+      throw new Error('Download refused: unsafe redirect target');
+    }
+  };
+
+  // Refuse an attacker-supplied internal URL BEFORE the first request. This
+  // also closes the mugi-worker path, where expectedHost used to be checked
+  // only against the response URL AFTER the GET had already happened.
+  // Await the override: an async validator returning a Promise would be
+  // truthy here and silently fail open without this await.
+  if (!(await validateUrl(url, url))) throw new Error('Download refused: unsafe initial URL');
 
   let currentUrl = url;
   let res = await fetch(currentUrl, requestOptions);
-  let hopsLeft = manualRedirect && !isRecovery ? 3 : 0;
-  while (manualRedirect && res.status >= 300 && res.status < 400) {
+  let hopsLeft = isRecovery ? 0 : 3;
+  while (res.status >= 300 && res.status < 400) {
     // Recovery: a 3xx is fatal BEFORE any body is read (typed RECOVERY_REDIRECT).
     if (isRecovery) throwTypedRedirect();
     if (hopsLeft-- <= 0) throw new Error('Too many redirects');
     const location = res.headers.get('location');
     if (!location) throw new Error('Redirect without Location');
     let nextUrl;
-    try { nextUrl = new URL(location, currentUrl); } catch { throw new Error('Invalid redirect'); }
-    // Re-validate with the SAME validator and require the same host BEFORE the
-    // next request — an SSRF redirect can never smuggle a private host through.
-    const nextHost = validateTorrentUrl(nextUrl.toString(), { recovery: false });
-    if (expectedHost && nextHost !== expectedHost) throw new Error('Redirect host rejected');
-    currentUrl = nextUrl.toString();
+    try { nextUrl = new URL(location, currentUrl).toString(); } catch { throw new Error('Invalid redirect'); }
+    // Re-validate the resolved Location BEFORE the next request — an SSRF
+    // redirect can never smuggle a private host or address through.
+    await validateHop(nextUrl, currentUrl);
+    currentUrl = nextUrl;
     res = await fetch(currentUrl, requestOptions);
   }
   assertHost(res);
@@ -2491,7 +2596,8 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
   // Large public Google Drive files first return an HTML virus-scan warning.
   // Submit its public, one-time confirmation parameters before saving; without
   // this the extractor receives HTML instead of the MKV/subtitle file.
-  const isGoogleDrive = /(?:drive\.google\.com|drive\.usercontent\.google\.com)/i.test(`${url} ${res.url}`);
+  const isGoogleDrive = [url, res.url].some(u =>
+    isUrlHostOf(u, 'drive.google.com') || isUrlHostOf(u, 'drive.usercontent.google.com'));
   if (isGoogleDrive && /text\/html/i.test(res.headers.get('content-type') || '')) {
     const html = await res.text();
     const $ = cheerio.load(html);
@@ -2510,9 +2616,12 @@ export async function downloadFileToDisk(url, destPath, headers = {}, options = 
       // expectedHost equality here (no driveusercontent exception) is intentional.
       const confirmedUrl = new URL(action, res.url);
       confirmedUrl.search = params.toString();
+      // V3: the form action comes from response HTML, so it is untrusted too.
+      // Re-use the DNS-aware hop guard before issuing this second request.
+      await validateHop(confirmedUrl.toString(), res.url || url);
       console.log('   ↪️ Confirming public Google Drive download.');
       res = await fetch(confirmedUrl.toString(), requestOptions);
-      if (manualRedirect && res.status >= 300 && res.status < 400) throwTypedRedirect();
+      if (res.status >= 300 && res.status < 400) throwTypedRedirect();
       assertHost(res);
       if (!res.ok) throw new Error(`Google Drive confirmation returned HTTP ${res.status}`);
     }
@@ -2587,17 +2696,25 @@ function fetchSubdlHtmlWithCurl(url) {
   }
 }
 
-export async function resolveSubdlDownloadData(infoUrl) {
+export async function resolveSubdlDownloadData(infoUrl, options = {}) {
+  // infoUrl is fed to curl AND embedded into the Jina reader URL below. A
+  // hostname check here protects both sinks before any request is issued.
+  if (!isUrlHostOf(infoUrl, 'subdl.com')) return null;
   let html = '';
   try {
-    const res = await fetchWithTimeout(infoUrl, {
+    const result = await fetchSafe(infoUrl, {
+      sourceUrl: infoUrl,
+      initialValidator: isStaticSafeUrl,
+      lookup: options.lookup,
+      fetchImpl: options.fetchImpl,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9'
       }
     });
-    if (res.ok) {
+    const res = result?.response;
+    if (res?.ok) {
       const candidate = await res.text();
       if (!candidate.includes('Just a moment...') && !/<title>\s*Just a moment/i.test(candidate)) {
         html = candidate;
@@ -2614,14 +2731,22 @@ export async function resolveSubdlDownloadData(infoUrl) {
 
   // Cloudflare bypass fallback via Jina reader (returns complete HTML without Cloudflare challenge)
   if (!html || !html.includes('dl.subdl.com') || html.includes('Just a moment...')) {
+    // infoUrl was host-validated at entry, so it cannot smuggle a metadata
+    // target into the reader path. fetchSafe adds its own hop guards.
+    const jinaUrl = `https://r.jina.ai/${infoUrl}`;
     try {
-      const jinaRes = await fetchWithTimeout(`https://r.jina.ai/${infoUrl}`, {
+      const result = await fetchSafe(jinaUrl, {
+        sourceUrl: jinaUrl,
+        initialValidator: isStaticSafeUrl,
+        lookup: options.lookup,
+        fetchImpl: options.fetchImpl,
         headers: {
           'X-Return-Format': 'html',
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
       });
-      if (jinaRes.ok) {
+      const jinaRes = result?.response;
+      if (jinaRes?.ok) {
         const jinaHtml = await jinaRes.text();
         if (jinaHtml.includes('dl.subdl.com')) {
           html = jinaHtml;
@@ -2638,7 +2763,7 @@ export async function resolveSubdlDownloadData(infoUrl) {
   const allLinks = [];
   doc('a[href]').each((_, el) => {
     const href = doc(el).attr('href') || '';
-    if (href.includes('dl.subdl.com/subtitle/')) {
+    if (isUrlHostOf(href, 'dl.subdl.com') && href.includes('dl.subdl.com/subtitle/')) {
       if (!allLinks.includes(href)) allLinks.push(href);
     }
   });
@@ -2646,7 +2771,7 @@ export async function resolveSubdlDownloadData(infoUrl) {
   if (allLinks.length === 0) {
     const rawMatches = [...html.matchAll(/href=["']([^"']*dl\.subdl\.com\/subtitle\/[^"']*)["']/gi)];
     for (const m of rawMatches) {
-      if (!allLinks.includes(m[1])) allLinks.push(m[1]);
+      if (isUrlHostOf(m[1], 'dl.subdl.com') && !allLinks.includes(m[1])) allLinks.push(m[1]);
     }
   }
 
@@ -2737,12 +2862,23 @@ export function hasCoveringDocumentMsg(textMsg, allMsgs) {
   return null;
 }
 
-async function resolveTop4topDownloadUrl(top4topUrl) {
+export async function resolveTop4topDownloadUrl(top4topUrl, options = {}) {
   try {
-    const res = await fetchWithTimeout(top4topUrl, {
+    // An exported resolver must enforce its own provider identity: a URL that
+    // merely mentions top4top.io (e.g. https://evil.example/?x=top4top.io/file)
+    // is refused with ZERO fetches, even when called outside the message flow.
+    if (!isUrlHostOf(top4topUrl, 'top4top.io')) return null;
+    // The initial URL is also checked with the DNS-free guard; every redirect
+    // hop is DNS-checked by fetchSafe defaults.
+    const result = await fetchSafe(top4topUrl, {
+      sourceUrl: top4topUrl,
+      initialValidator: isStaticSafeUrl,
+      lookup: options.lookup,
+      fetchImpl: options.fetchImpl,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
     });
-    if (!res.ok) return null;
+    const res = result?.response;
+    if (!res?.ok) return null;
     const html = await res.text();
     const doc = cheerio.load(html);
     let directUrl = null;
@@ -2765,12 +2901,21 @@ async function resolveTop4topDownloadUrl(top4topUrl) {
   }
 }
 
-async function resolveMediafireDownloadUrl(mfUrl) {
+export async function resolveMediafireDownloadUrl(mfUrl, options = {}) {
   try {
-    const res = await fetchWithTimeout(mfUrl, {
+    // Same two-stage guard as the Top4Top resolver, including the explicit
+    // provider-host gate before any request (a mediafire.com mention in a
+    // query is not a Mediafire URL).
+    if (!isUrlHostOf(mfUrl, 'mediafire.com')) return null;
+    const result = await fetchSafe(mfUrl, {
+      sourceUrl: mfUrl,
+      initialValidator: isStaticSafeUrl,
+      lookup: options.lookup,
+      fetchImpl: options.fetchImpl,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
-    if (!res.ok) return null;
+    const res = result?.response;
+    if (!res?.ok) return null;
     const html = await res.text();
     const doc = cheerio.load(html);
     const dlBtn = doc('#downloadButton').attr('href') || doc('a[aria-label="Download file"]').attr('href');
@@ -4137,10 +4282,13 @@ export async function checkTelegramChannels(existingClient = null) {
                   if (!subdlMagic) {
                     try {
                       const textContent = fs.readFileSync(tempSubdl, 'utf8');
-                      const top4topMatch = textContent.match(/https?:\/\/[^\s"'<>]*top4top\.io\/[^\s"'<>]+/i);
-                      const mfMatch = textContent.match(/https?:\/\/[^\s"'<>]*mediafire\.com\/[^\s"'<>]+/i);
+                      // Extract every http(s) URL, then decide the provider by
+                      // HOSTNAME. A URL that merely mentions top4top.io/mediafire.com
+                      // in its query is not a provider link and is ignored.
+                      const top4topMatch = findProviderUrlInText(textContent, 'top4top.io');
+                      const mfMatch = findProviderUrlInText(textContent, 'mediafire.com');
                       if (top4topMatch) {
-                        const direct = await resolveTop4topDownloadUrl(top4topMatch[0]);
+                        const direct = await resolveTop4topDownloadUrl(top4topMatch);
                         if (direct) {
                           const fbDest = path.join(workDir, `fallback_top4top`);
                           await downloadFileToDisk(direct, fbDest);
@@ -4148,7 +4296,7 @@ export async function checkTelegramChannels(existingClient = null) {
                           if (subdlMagic) safeMoveFile(fbDest, tempSubdl);
                         }
                       } else if (mfMatch) {
-                        const mfBest = await findBestFileInMediafire(mfMatch[0]);
+                        const mfBest = await findBestFileInMediafire(mfMatch);
                         if (mfBest?.directUrl) {
                           const fbDest = path.join(workDir, `fallback_mf`);
                           await downloadFileToDisk(mfBest.directUrl, fbDest);
@@ -4183,16 +4331,18 @@ export async function checkTelegramChannels(existingClient = null) {
                     }
                   }
 
-                  // Check if message text specifies external fonts (Top4Top, Mediafire, Mega)
-                  const fontMatch = text.match(/(?:fonts|subs\s*&\s*fonts)[^:]*:\s*(https?:\/\/[^\s"'<>]+)/i) ||
-                                    text.match(/https?:\/\/(?:www\.)?(?:top4top\.io|mediafire\.com|mega\.nz)\/[^\s"'<>]+/i);
-                  if (fontMatch) {
-                    const fontUrl = fontMatch[1] || fontMatch[0];
+                  // Check if message text specifies external fonts (Top4Top, Mediafire, Mega).
+                  // Provider selection is hostname-based only — the old
+                  // /mediafire\.com/i.test(fontUrl) dispatched a metadata URL
+                  // carrying "?x=mediafire.com/file" to the Mediafire resolver.
+                  const fontProvider = pickFontProviderUrl(text);
+                  if (fontProvider) {
+                    const fontUrl = fontProvider.url;
                     console.log(`   🌐 Found fonts link in message: ${fontUrl}`);
                     let directFontUrl = null;
-                    if (/top4top\.io/i.test(fontUrl)) {
+                    if (fontProvider.kind === 'top4top') {
                       directFontUrl = await resolveTop4topDownloadUrl(fontUrl);
-                    } else if (/mediafire\.com/i.test(fontUrl)) {
+                    } else if (fontProvider.kind === 'mediafire') {
                       const mfBest = await findBestFileInMediafire(fontUrl);
                       directFontUrl = mfBest?.directUrl;
                     }
@@ -4443,15 +4593,16 @@ export async function checkTelegramChannels(existingClient = null) {
                 if (!pageData) console.warn(`   ⚠️ No page data extracted from ${postPageUrl}`);
                 if (pageData && !negativeCached) {
                   let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
-                  if (pageData.videoLinks?.top4top) {
+                  if (isUrlHostOf(pageData.videoLinks?.top4top, 'top4top.io')) {
                     const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
                     if (resolved) directUrl = resolved;
                   }
-                  if (!directUrl && pageData.videoLinks?.mediafire) {
+                  if (!directUrl && isUrlHostOf(pageData.videoLinks?.mediafire, 'mediafire.com')) {
                     const mfBest = await findBestFileInMediafire(pageData.videoLinks.mediafire);
                     if (mfBest?.directUrl && mfBest.type === 'subtitle') directUrl = mfBest.directUrl;
                   }
-                  if (!directUrl && pageData.videoLinks?.mega) {
+                  if (!directUrl && (isUrlHostOf(pageData.videoLinks?.mega, 'mega.nz') ||
+                                     isUrlHostOf(pageData.videoLinks?.mega, 'mega.co.nz'))) {
                     // M6/C11: a Mega source that already refused a cap is in
                     // cooldown (6 h) — it is not retried on every cycle.
                     if (isCloudCapCooldownActive('mega', pageData.videoLinks.mega)) {
@@ -4683,7 +4834,12 @@ export async function checkTelegramChannels(existingClient = null) {
             .filter(u => !u.includes('t.me') && !u.includes('twitter') && !u.includes('discord') && !u.includes('subdl.com'))
             .map(url => {
               const site = CONFIG.SITES.find(s => {
-                try { return url.includes(new URL(s.base).hostname); } catch { return false; }
+                // N5: match by HOST, never by substring. A URL such as
+                // https://evil.tld/?x=revivesubs.com must not inherit Revive's
+                // config (and its impersonation/cookie fetch path).
+                try {
+                  return new URL(url).hostname.toLowerCase() === new URL(s.base).hostname.toLowerCase();
+                } catch { return false; }
               });
               // Joint REVIVE/Rhythm releases must not stop at REVIVE's interactive
               // login wall when an accessible Rhythm mirror is also provided.
@@ -4723,7 +4879,7 @@ export async function checkTelegramChannels(existingClient = null) {
 
                 // 1. Direct or Top4Top download
                 let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
-                if (pageData.videoLinks?.top4top) {
+                if (isUrlHostOf(pageData.videoLinks?.top4top, 'top4top.io')) {
                   const resolved = await resolveTop4topDownloadUrl(pageData.videoLinks.top4top);
                   if (resolved) directUrl = resolved;
                 }
@@ -4736,7 +4892,9 @@ export async function checkTelegramChannels(existingClient = null) {
                 }
 
                 // Skip folder URLs from direct single-file HTTP download
-                if (directUrl && !isDriveFolderUrl(directUrl) && !directUrl.includes('mega.nz')) {
+                // (hostname-based: "mega.nz" in a query is not a Mega folder).
+                if (directUrl && !isDriveFolderUrl(directUrl) &&
+                    !isUrlHostOf(directUrl, 'mega.nz') && !isUrlHostOf(directUrl, 'mega.co.nz')) {
                   try {
                     console.log(`   📥 Direct download: ${redactUrl(directUrl)}`);
                     const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
@@ -4762,23 +4920,40 @@ export async function checkTelegramChannels(existingClient = null) {
                           if (fs.existsSync(fontsTemp)) {
                             const fontsFolder = path.join(fansubWorkDir, 'Fonts');
                             fs.mkdirSync(fontsFolder, { recursive: true });
+                            let fontsReady = true;
                             if (validateFileMagic(fontsTemp)?.isArchive) {
-                              extractArchive(fontsTemp, fontsFolder);
+                              fontsReady = extractArchive(fontsTemp, fontsFolder) === true;
                               try { fs.rmSync(fontsTemp, { force: true }); } catch { }
                             } else {
-                              safeMoveFile(fontsTemp, path.join(fontsFolder, path.basename(pageData.videoLinks.fonts)));
+                              fontsReady = safeMoveFile(fontsTemp, path.join(fontsFolder, safeRemoteBaseName(pageData.videoLinks.fonts))) === true;
                             }
-                            // Name the sub file with its extension so the zip holds a recognizable subtitle
-                            const properSubName = path.basename(directUrl).split(/[?#]/)[0] || `subtitle${magic.ext}`;
-                            const properSubPath = path.join(fansubWorkDir, decodeURIComponent(properSubName));
-                            if (tempDest !== properSubPath) {
-                              safeMoveFile(tempDest, properSubPath);
-                            }
-                            const repacked = path.join(fansubWorkDir, 'release.zip');
-                            packFolderToZip(fansubWorkDir, repacked);
-                            if (fs.existsSync(repacked) && fs.statSync(repacked).size > 100) {
-                              downloadedFilePath = repacked;
-                              console.log(`   📦 Packaged standalone subtitle + fonts into ZIP: ${logSafe(path.basename(repacked))}`);
+                            if (!fontsReady) {
+                              // The fonts archive was refused (unsafe entries,
+                              // symlinks, cap, ...). Do not package it — keep the
+                              // already-valid downloadedFilePath for release.
+                              console.warn(`   ⚠️ Fonts archive refused; publishing subtitle without fonts bundle.`);
+                            } else {
+                              // Name the sub file with its extension so the zip holds a recognizable subtitle.
+                              // The remote-controlled basename is decoded and sanitized before any move.
+                              const properSubPath = resolveSafeSubtitleDestination(directUrl, fansubWorkDir, magic.ext);
+                              if (properSubPath) {
+                                if (tempDest === properSubPath || safeMoveFile(tempDest, properSubPath)) {
+                                  // B1: keep downloadedFilePath in sync with the
+                                  // renamed file; downstream fallbacks are gated
+                                  // on this path and would otherwise be suppressed.
+                                  downloadedFilePath = properSubPath;
+                                } else {
+                                  console.warn(`   ⚠️ Could not rename downloaded subtitle; publishing under its temporary name.`);
+                                }
+                              } else {
+                                console.warn(`   ⚠️ Unsafe subtitle filename in download URL; publishing under its temporary name.`);
+                              }
+                              const repacked = path.join(fansubWorkDir, 'release.zip');
+                              packFolderToZip(fansubWorkDir, repacked);
+                              if (fs.existsSync(repacked) && fs.statSync(repacked).size > 100) {
+                                downloadedFilePath = repacked;
+                                console.log(`   📦 Packaged standalone subtitle + fonts into ZIP: ${logSafe(path.basename(repacked))}`);
+                              }
                             }
                           }
                         } catch (e) {

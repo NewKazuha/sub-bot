@@ -13,13 +13,19 @@ def main():
         headers["cookie"] = args.cookie
 
     try:
+        # Never let curl_cffi auto-follow a Location: an attacker page can
+        # 302 us into cloud metadata / loopback and the Node caller has no
+        # visibility into the hops. Fail closed on any 3xx instead.
         res = requests.get(
             args.url,
             headers=headers,
             impersonate="chrome120",
             timeout=30,
-            allow_redirects=True
+            allow_redirects=False
         )
+        if 300 <= res.status_code < 400:
+            sys.stderr.write("cf_fetch error: redirect refused (3xx not followed)\n")
+            sys.exit(1)
         sys.stdout.buffer.write(res.content)
         sys.exit(0)
     except Exception as e:

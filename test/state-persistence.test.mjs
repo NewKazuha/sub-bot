@@ -18,6 +18,13 @@ import {
   MAX_BYTES,
 } from '../scripts/merge-posted-state.mjs';
 import { createCycleCounters, formatNoLinksBySource } from '../src/telegram-client.mjs';
+import { RETRACTION_MARKER } from '../src/retracted-keys.mjs';
+
+// One-time RETRACTED_KEYS migration (owner decision 2026-11-23): loadPostedIds()
+// and mergePostedIds() now persist ONE version-marker key in posted.json. Every
+// exact expected count/array below therefore accounts for that single extra
+// key. The invariants these tests protect (union subset, caps, provenance,
+// atomicity, size guard) are unchanged — only the expected sizes shift by +1.
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const CLIENT_URL = pathToFileURL(path.join(REPO_ROOT, 'src', 'telegram-client.mjs')).href;
@@ -65,7 +72,7 @@ test('أ: corrupt posted.json with a healthy git HEAD is recovered from git', as
 
   const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
-  assert.match(r.stdout, /KEYS=3/);
+  assert.match(r.stdout, /KEYS=4/); // 3 recovered keys + the one-time migration marker
   assert.match(r.stderr, /HEAD/);
 });
 
@@ -100,7 +107,7 @@ test('ج: missing posted.json returns an empty set without throwing', async () =
 
   const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
-  assert.match(r.stdout, /KEYS=0/);
+  assert.match(r.stdout, /KEYS=1/); // empty state + the one-time migration marker
 });
 
 // ---------------------------------------------------------------------------
@@ -140,7 +147,7 @@ test('هـ: corrupt posted.json with a corrupt HEAD is recovered from git HEAD~1
 
   const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
-  assert.match(r.stdout, /KEYS=3/);
+  assert.match(r.stdout, /KEYS=4/); // 3 recovered keys + the one-time migration marker
   assert.match(r.stderr, /HEAD~1/, `expected recovery from HEAD~1, stderr=${r.stderr}`);
 });
 
@@ -162,7 +169,7 @@ test('و: valid non-array JSON in posted.json is rejected and recovered from git
 
   const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
-  assert.match(r.stdout, /KEYS=3/);
+  assert.match(r.stdout, /KEYS=4/); // 3 recovered keys + the one-time migration marker
   assert.match(r.stderr, /HEAD/, `expected recovery from git HEAD, stderr=${r.stderr}`);
 });
 
@@ -188,7 +195,7 @@ test('ز: a posted.json above the default 1 MB maxBuffer is still recovered from
 
   const r = runIn(dir, "const s = m.loadPostedIds(); console.log('KEYS=' + s.size);");
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
-  assert.match(r.stdout, /KEYS=20000/);
+  assert.match(r.stdout, /KEYS=20001/); // 20000 recovered keys + the one-time migration marker
 });
 
 // ---------------------------------------------------------------------------
@@ -232,7 +239,7 @@ test('ط: keys marked before a SIGKILL survive a fresh loadPostedIds (crash simu
   assert.equal(reload.status, 0, `expected exit 0, got ${reload.status} (stderr=${reload.stderr})`);
   assert.match(reload.stdout, /HAS_MSG=true/);
   assert.match(reload.stdout, /HAS_REL=true/);
-  assert.match(reload.stdout, /SIZE=2/);
+  assert.match(reload.stdout, /SIZE=3/); // marker + msg key + release key survive the crash
 });
 
 // ---------------------------------------------------------------------------
@@ -248,7 +255,7 @@ test('ي: a skip decision (msgKey-only mark) is durable without the end-of-cycle
   `);
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
   const disk = JSON.parse(r.stdout.slice(r.stdout.indexOf('DISK=') + 5).trim());
-  assert.deepEqual(disk, ['tg_3_300']);
+  assert.deepEqual(disk, [RETRACTION_MARKER, 'tg_3_300']);
 
   const reload = runIn(dir, "const s = m.loadPostedIds(); console.log('POSTED=' + s.has('tg_3_300'));");
   assert.equal(reload.status, 0, `expected exit 0 (stderr=${reload.stderr})`);
@@ -317,12 +324,12 @@ test('م: successive marks each persist and the size guard tracks growth', async
   `);
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
   const disk = JSON.parse(r.stdout.slice(r.stdout.indexOf('DISK=') + 5).trim().split('\nSIZE=')[0]);
-  assert.deepEqual(disk, ['a', 'b']);
-  assert.match(r.stdout, /SIZE=2/);
+  assert.deepEqual(disk, [RETRACTION_MARKER, 'a', 'b']);
+  assert.match(r.stdout, /SIZE=3/);
 
   const reload = runIn(dir, "const s = m.loadPostedIds(); console.log('SIZE=' + s.size);");
   assert.equal(reload.status, 0, `expected exit 0 (stderr=${reload.stderr})`);
-  assert.match(reload.stdout, /SIZE=2/);
+  assert.match(reload.stdout, /SIZE=3/);
 });
 
 // ===========================================================================
@@ -364,7 +371,7 @@ test('mergePostedIds: every key of both sides survives the union and the merge i
   const ours = ['a', 'b', 'c'];
   const theirs = ['c', 'd', 'e'];
   const merged = mergePostedIds(ours, theirs);
-  assert.deepEqual(merged.merged.slice().sort(), ['a', 'b', 'c', 'd', 'e']);
+  assert.deepEqual(merged.merged.slice().sort(), [RETRACTION_MARKER, 'a', 'b', 'c', 'd', 'e']);
   for (const k of ours) assert.ok(merged.merged.includes(k), `local key ${k} was lost`);
   for (const k of theirs) assert.ok(merged.merged.includes(k), `remote key ${k} was lost`);
   assert.equal(merged.localCount, 3);
@@ -433,6 +440,40 @@ test('classifyMerge: the shrink alarm needs BOTH margins — 900 keys green, 5,0
   // The floor and the growth guard are unchanged.
   assert.equal(classifyMerge({ localCount: 2000, remoteCount: 2000, mergedCount: 999 }).corrupt, true, 'the floor still holds');
   assert.equal(classifyMerge({ localCount: 2000, remoteCount: 4000, mergedCount: 4000 }).reason, 'growth', 'the growth guard still holds');
+});
+
+test('classifyMerge: the version marker must not inflate the 1000-key floor', () => {
+  const realKeys = (n) => Array.from({ length: n }, (_, i) => `key_${i}`);
+  const verdictFor = (merge) => classifyMerge({
+    localCount: merge.localCount,
+    remoteCount: merge.remoteCount,
+    mergedCount: merge.realMergedCount,
+    rejected: merge.rejected,
+  });
+
+  // 999 real keys + the marker: the marker is still persisted, but the floor
+  // must count only the 999 real posted keys.
+  const few = realKeys(999).concat(RETRACTION_MARKER);
+  const fewMerge = mergePostedIds(few, few);
+  assert.equal(fewMerge.merged.length, 1000, 'the marker is still persisted in merged');
+  assert.equal(fewMerge.merged.filter(k => k === RETRACTION_MARKER).length, 1);
+  assert.equal(fewMerge.realMergedCount, 999, 'only real keys count toward the floor');
+  assert.equal(verdictFor(fewMerge).corrupt, true, '999 real keys + marker is below the floor');
+  assert.equal(verdictFor(fewMerge).reason, 'below-floor');
+  // The old call site passed merge.merged.length (1000) and wrongly passed.
+  assert.equal(classifyMerge({
+    localCount: fewMerge.localCount,
+    remoteCount: fewMerge.remoteCount,
+    mergedCount: fewMerge.merged.length,
+  }).corrupt, false, 'the buggy call site counted the marker as a real entry');
+
+  // 1000 real keys + marker: a genuine floor-compliant state still passes.
+  const many = realKeys(1000).concat(RETRACTION_MARKER);
+  const manyMerge = mergePostedIds(many, many);
+  assert.equal(manyMerge.merged.length, 1001);
+  assert.equal(manyMerge.realMergedCount, 1000);
+  assert.equal(verdictFor(manyMerge).corrupt, false, '1000 real keys + marker meets the floor');
+  assert.equal(verdictFor(manyMerge).reason, 'ok');
 });
 
 test('classifyProvenance: a known foreign author is refused; an unverifiable one cannot block forever', () => {
@@ -665,7 +706,7 @@ test('the merged file is written with JSON.stringify(x, null, 2) and parses back
   });
   const content = writes.get('data/posted.json');
   assert.ok(content, 'data/posted.json must be written');
-  const expected = [...new Set([...local, ...remote])];
+  const expected = [...new Set([...local, ...remote]), RETRACTION_MARKER];
   assert.equal(content, JSON.stringify(expected, null, 2), 'the file must use the production format');
   assert.equal(JSON.parse(content).length, expected.length);
 });
@@ -755,7 +796,7 @@ test('the size guard: a duplicate mark performs no write and resetPostedSizeGuar
   assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr=${r.stderr})`);
   assert.match(r.stdout, /WRITES_1=1/, 'the first mark must write exactly once');
   assert.match(r.stdout, /WRITES_2=1/, 'a duplicate mark must not write again');
-  assert.match(r.stdout, /GUARD=2/, 'the guard counter must track the written size');
+  assert.match(r.stdout, /GUARD=3/, 'the guard counter must track the written size (marker + key + episode key)');
   assert.match(r.stdout, /GUARD_AFTER_RESET=-1/, 'the reset must clear the guard');
   assert.match(r.stdout, /WRITES_3=2/, 'after the reset the next mark must write again');
 });
@@ -780,9 +821,9 @@ test('merge-only CLI: the defaults do not crash and the title-map flags are hono
   // dereferenced args.local / args.remote without a default).
   const plain = runMerge(dir);
   assert.equal(plain.status, 0, `the merge-only CLI must not crash: ${plain.stderr}`);
-  assert.match(plain.stdout, /merged 1500 key/, 'the default paths must be merged');
+  assert.match(plain.stdout, /merged 1501 key/, 'the default paths must be merged (1500 keys + one marker)');
   const written = JSON.parse(fs.readFileSync(path.join(dir, 'data', 'posted.json'), 'utf8'));
-  assert.equal(written.length, 1500, 'the merged state must be written');
+  assert.equal(written.length, 1501, 'the merged state must be written (1500 keys + one marker)');
 
   // (2) the title-map flags are honoured — never silently ignored.
   const withTitles = runMerge(dir, [
@@ -857,7 +898,7 @@ test('P-8/F-01: an absent remote state file bootstraps — the local state is pu
   assert.equal(result.log.some(l => l.includes('::error::state corrupt:')), false, 'no corrupt error may be emitted for an absent remote');
   const content = writes.get('data/posted.json');
   assert.ok(content, 'the local state must be written');
-  assert.equal(JSON.parse(content).length, 1500);
+  assert.equal(JSON.parse(content).length, 1501); // 1500 local keys + one marker
 });
 
 test('P-8/F-01: a present-but-corrupt remote state file stays fail-closed red', async () => {
@@ -958,9 +999,9 @@ test('P-7: the union result is identical to the previous implementation (single 
   const local = ['a', 'b', 'a', 'c'];
   const remote = ['c', 'd', 'b'];
   const merged = mergePostedIds(local, remote);
-  const expected = [...new Set([...new Set(local), ...new Set(remote)])];
-  assert.deepEqual(merged.merged, expected, 'the union must keep insertion order and drop duplicates exactly like before');
-  assert.deepEqual(merged.merged, ['a', 'b', 'c', 'd']);
+  const expected = [...new Set([...new Set(local), ...new Set(remote)]), RETRACTION_MARKER];
+  assert.deepEqual(merged.merged, expected, 'the union must keep insertion order and drop duplicates exactly like before, plus one version marker');
+  assert.deepEqual(merged.merged, ['a', 'b', 'c', 'd', RETRACTION_MARKER]);
   assert.equal(merged.localCount, 3);
   assert.equal(merged.remoteCount, 3);
   const again = mergePostedIds(merged.merged, merged.merged);
@@ -1036,7 +1077,7 @@ test('push-path: rejected elements are counted and the valid keys still merge', 
   assert.equal(result.pushFailed, false);
   assert.ok(result.log.some(l => l.includes('⚠️ rejected 1 invalid key(s) during validation')), JSON.stringify(result.log));
   const merged = JSON.parse(writes.get('data/posted.json'));
-  assert.equal(merged.length, 3000, 'the valid keys of both sides merge (1500 local + 1500 remote), the invalid element is dropped and counted');
+  assert.equal(merged.length, 3001, 'the valid keys of both sides merge (1500 local + 1500 remote + one marker), the invalid element is dropped and counted');
   assert.equal(merged.includes(''), false, 'the rejected element must not survive the merge');
 });
 
@@ -1212,7 +1253,7 @@ test('real-git integration: a ≥2.1 MB posted.json blob pushes over a real remo
     path.join(dir, 'data', 'posted.json'),
     path.join(dir, 'data', 'title-map.json'),
   ], `unexpected writes: ${JSON.stringify([...writes.keys()])}`);
-  assert.equal(JSON.parse(writes.get(path.join(dir, 'data', 'posted.json'))).length, 20_001);
+  assert.equal(JSON.parse(writes.get(path.join(dir, 'data', 'posted.json'))).length, 20_002); // 20000 + 1 local-only + one marker
 
   // No checkout / pull / merge / reset — the commit is built on the fetched
   // tip with plumbing only.
@@ -1410,10 +1451,10 @@ test('P-8/F-01: the merge-only CLI bootstraps when the remote state file is ABSE
     '--github-output', outputFile,
   ]);
   assert.equal(r.status, 0, `an absent remote must bootstrap, not block the merge: ${r.stderr}`);
-  assert.match(r.stdout, /merged 1500 key/, r.stdout);
+  assert.match(r.stdout, /merged 1501 key/, r.stdout);
   assert.match(fs.readFileSync(outputFile, 'utf8'), /^state_corrupt=false$/m);
   const written = JSON.parse(fs.readFileSync(path.join(dir, 'merged.json'), 'utf8'));
-  assert.equal(written.length, 1500, 'the local state must be merged as-is');
+  assert.equal(written.length, 1501, 'the local state must be merged as-is (1500 keys + one marker)');
 });
 
 test('push-path fail-closed: an oversize side is red with the fixed validation line (merge-only CLI)', () => {

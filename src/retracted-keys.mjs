@@ -1,4 +1,12 @@
 // Keys mistakenly marked as posted due to N Season sequel dedup bug or JoJo sequel overflow
+//
+// One-time migration bookkeeping (owner decision 2026-11-23): the keys below
+// were purged from posted.json ONCE. RETRACTION_MARKER is persisted in the
+// state to record that fact, so the purge is NEVER re-applied on later loads
+// or merges — retracted keys are historical only and must not be re-erased
+// from a legitimate future release that happens to match a title key.
+export const RETRACTION_VERSION = 1;
+export const RETRACTION_MARKER = '__retraction_v1_applied__';
 export const RETRACTED_KEYS = new Set([
   "a_returner_s_magic_should_be_special_season_2_07",
   "a_wild_last_boss_appeared_season_2",

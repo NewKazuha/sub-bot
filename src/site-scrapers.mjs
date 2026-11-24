@@ -1,15 +1,24 @@
 import * as cheerio from 'cheerio';
 import { execFileSync } from 'node:child_process';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import { matchesEpisode, logSafe } from './cloud-folders.mjs';
 import { fetchRenderedHtml, isRocksDdlHost, isRocksHost } from './browser-fetch.mjs';
 import {
-  RECOVERY_CODES, RECOVERY_REDIRECT_MODE, isRecoveryRedirectOption, recoveryFatalCodeFor
+  RECOVERY_CODES, isRecoveryRedirectOption, recoveryFatalCodeFor
 } from './recovery.mjs';
+import {
+  UA, HTTP_TIMEOUT_MS, META_REFRESH_MAX_HOPS,
+  isStaticSafeUrl, isAllowedMetaRefreshTarget, cookieHeaderForRedirect, extractMetaRefreshTarget,
+  isPrivateAddress, fetchSafe,
+} from './url-safety.mjs';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
-const HTTP_TIMEOUT_MS = 60_000;
+// Re-export the safety helpers so existing importers of site-scrapers keep
+// resolving. The single implementation now lives in ./url-safety.mjs.
+export {
+  isPrivateAddress, isAllowedMetaRefreshTarget, cookieHeaderForRedirect, extractMetaRefreshTarget,
+};
 
 // X3 — the HOSTNAME of a link decides its provider (guarded for a malformed
 // href). A link that merely mentions "mediafire.com" in its query or in its
@@ -34,6 +43,83 @@ function isAnyHostOf(href, domains) {
 
 // M4: the host helpers are exported so the classification can be tested.
 export { isHostOf, isAnyHostOf };
+
+// ---------------------------------------------------------------------------
+// HTML meta-refresh guard.
+//
+// A remote page controls the `content="...url=..."` target of a
+// <meta http-equiv=refresh> tag. Fetching that target blindly would turn this
+// runner into an internal HTTP client (SSRF) and could hand the site Cookie to
+// a different host. The pure decision helpers now live in ./url-safety.mjs and
+// are imported/re-exported above; the DNS lookup is injectable there so the
+// decision can be unit-tested offline.
+//
+// A meta-refresh follow may itself be redirected. fetch's default
+// `redirect: 'follow'` would silently traverse an UNCHECKED second hop (a
+// public host 302-ing straight into an internal address), so every hop is
+// fetched with `redirect: 'manual'` and every Location is re-validated.
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch an already-validated meta-refresh URL and follow at most `maxHops`
+ * HTTP redirects, re-validating EACH hop with isAllowedMetaRefreshTarget and
+ * re-scoping the Cookie against the original site on every hop.
+ *
+ * Returns { html, url } only from a fully validated final (2xx) response —
+ * `html`/`pageUrl` at the call site must not be touched on any invalid hop.
+ * Returns null on any blocked/invalid hop, missing Location, hop-cap or fetch
+ * error. `fetchImpl` and `lookup` are injectable so the whole loop is testable
+ * offline.
+ */
+export async function fetchValidatedMetaRefreshChain(initialUrl, sourceUrl, cookieHeader, {
+  fetchImpl = (...args) => globalThis.fetch(...args),
+  lookup = dnsLookup,
+  maxHops = META_REFRESH_MAX_HOPS,
+} = {}) {
+  let currentUrl = initialUrl;
+  for (let hop = 0; hop <= maxHops; hop++) {
+    // Re-scope the Cookie on EVERY hop against the ORIGINAL site: it may only
+    // travel to the original host+scheme, never to a redirect target (even a
+    // redirect that leaves and later returns must not leak it).
+    const cookieHeaders = cookieHeaderForRedirect(cookieHeader, currentUrl, sourceUrl);
+    let res;
+    try {
+      res = await fetchImpl(currentUrl, {
+        headers: { 'User-Agent': UA, ...cookieHeaders },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      });
+    } catch {
+      return null;
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers?.get?.('location');
+      let nextUrl = null;
+      try {
+        if (loc) nextUrl = new URL(loc, currentUrl).toString();
+      } catch { nextUrl = null; }
+      try { await res.body?.cancel(); } catch { }
+      if (!nextUrl || hop >= maxHops || nextUrl === currentUrl) return null;
+      // NEVER follow an unchecked hop: validate the Location before fetching.
+      if (!(await isAllowedMetaRefreshTarget(nextUrl, currentUrl, lookup))) return null;
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (!res.ok) {
+      try { await res.body?.cancel(); } catch { }
+      return null;
+    }
+
+    try {
+      return { html: await res.text(), url: currentUrl };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 // Mugi-Subs publishes its subtitle folders through a public Cloudflare Worker
 // (a GoIndex-style browser over a shared Drive). The main site (mugi-subs.com)
@@ -449,13 +535,6 @@ export async function resolveMugiSubtitleFromWorker(releaseTitle, targetEp = nul
   }
 }
 
-// F4: the `recovery` marker is set ONLY by recovery-mode fetches. Login POSTs
-// in ensureSiteSession also use redirect:'manual' but carry no marker, so this
-// typed-3xx check can never change normal cron behaviour.
-function recoveryFetchExtras(recoveryMode) {
-  return recoveryMode ? { redirect: RECOVERY_REDIRECT_MODE, recovery: true } : {};
-}
-
 function typedRecoveryError(code, message) {
   const err = new Error(message);
   err.code = code;
@@ -687,21 +766,42 @@ const IGNORED_DOMAINS = [
   'policies.google.com'
 ];
 
-export async function followRedirectUrl(url, maxHops = 3) {
+export async function followRedirectUrl(url, options = {}) {
+  // Numeric second argument (the historical `maxHops`) stays supported.
+  if (typeof options === 'number') options = { maxHops: options };
+  const {
+    maxHops = 3,
+    lookup,
+    validateUrl = isStaticSafeUrl,
+    fetchImpl = (u, o) => fetchWithTimeout(u, o),
+  } = options;
   if (!url || !url.startsWith('http')) return url;
+  // N2: the INITIAL shortener URL was fetched (HEAD, then GET) before any
+  // validation. Location hops are re-checked below, but the first URL is
+  // remote-controlled too: refuse a private/metadata target BEFORE the first
+  // request and return it unchanged. `validateUrl` is injectable and a throwing
+  // validator fails closed.
+  let initialAllowed = false;
+  try {
+    initialAllowed = await validateUrl(url, url);
+  } catch { initialAllowed = false; }
+  if (!initialAllowed) {
+    console.warn(`Refusing unsafe shortener URL (host ${linkHost(url) || 'unknown'})`);
+    return url;
+  }
   let curr = url;
   for (let i = 0; i < maxHops; i++) {
     try {
       // Many link shorteners (including Blogger redirect pages) reject HEAD.
       // Try HEAD first, then use a redirect-only GET without downloading the body.
-      let res = await fetchWithTimeout(curr, {
+      let res = await fetchImpl(curr, {
         method: 'HEAD',
         redirect: 'manual',
         headers: { 'User-Agent': UA }
       });
       if (![301, 302, 303, 307, 308].includes(res.status)) {
         try { await res.body?.cancel(); } catch {}
-        res = await fetchWithTimeout(curr, {
+        res = await fetchImpl(curr, {
           method: 'GET',
           redirect: 'manual',
           headers: { 'User-Agent': UA, 'Range': 'bytes=0-0' }
@@ -709,7 +809,14 @@ export async function followRedirectUrl(url, maxHops = 3) {
       }
       const loc = res.headers.get('location');
       if (loc && (res.status >= 300 && res.status < 400)) {
-        curr = new URL(loc, curr).toString();
+        const nextUrl = new URL(loc, curr).toString();
+        // A public shortener must never 302 us into a private/metadata host;
+        // validate BEFORE the next request, and refuse without following it.
+        if (!(await isAllowedMetaRefreshTarget(nextUrl, curr, lookup))) {
+          try { await res.body?.cancel(); } catch {}
+          break;
+        }
+        curr = nextUrl;
       } else {
         break;
       }
@@ -744,9 +851,21 @@ function getLinkTarget($, el, pageUrl) {
   return normaliseLinkUrl(match?.[1], pageUrl);
 }
 
-export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { batch = false, redirect } = {}) {
+export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { batch = false, redirect, validateUrl = isStaticSafeUrl, lookup = dnsLookup } = {}) {
   const recoveryMode = isRecoveryRedirectOption(redirect);
-  const extras = recoveryFetchExtras(recoveryMode);
+
+  // N3: the directory URL comes from a scraped link and is POSTed to directly.
+  // Validate it before ANY request — the metadata/loopback host must never be
+  // reached. `validateUrl` is injectable; a throwing validator fails closed.
+  let urlAllowed = false;
+  try {
+    urlAllowed = await validateUrl(directoryUrl, directoryUrl);
+  } catch { urlAllowed = false; }
+  if (!urlAllowed) {
+    console.warn(`Refusing unsafe GoIndex directory URL (host ${linkHost(directoryUrl) || 'unknown'})`);
+    return null;
+  }
+
   try {
     const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
 
@@ -754,13 +873,20 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
 
     // 1. Try application/json (Mejaow / modern GoIndex workers)
     try {
-      const resJson = await fetchWithTimeout(directoryUrl, {
+      // N6: POST via fetchSafe — a 302 from a public worker is re-validated
+      // (DNS-aware) before any second request, so it can never reach an
+      // internal address. Recovery mode still throws a typed 3xx refusal.
+      const safeJson = await fetchSafe(directoryUrl, {
+        sourceUrl: directoryUrl,
         method: 'POST',
-        headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
         body: JSON.stringify({ page_token: null, page_index: 0 }),
-        ...extras
+        headers: { 'Content-Type': 'application/json' },
+        initialValidator: validateUrl,
+        lookup,
+        recovery: recoveryMode,
       });
-      if (resJson.ok) {
+      const resJson = safeJson?.response;
+      if (resJson) {
         const json = await resJson.json().catch(() => null);
         if (json?.data?.files) files = json.data.files;
       }
@@ -777,17 +903,18 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
         formParams.append('page_token', '');
         formParams.append('page_index', '0');
 
-        const resForm = await fetchWithTimeout(directoryUrl, {
+        const safeForm = await fetchSafe(directoryUrl, {
+          sourceUrl: directoryUrl,
           method: 'POST',
-          headers: {
-            'User-Agent': UA,
-            'Content-Type': 'application/x-www-form-urlencoded'
-          },
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: formParams.toString(),
-          ...extras
+          initialValidator: validateUrl,
+          lookup,
+          recovery: recoveryMode,
         });
 
-        if (resForm.ok) {
+        const resForm = safeForm?.response;
+        if (resForm) {
           const rawText = await resForm.text();
           let json = null;
           try {
@@ -860,7 +987,7 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
 // NO episode token is the whole batch and must be preferred; when the
 // directory holds only per-episode archives, the first one is used and the
 // limitation is logged.
-export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null, { batch = false, redirect } = {}) {
+export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null, { batch = false, redirect, validateUrl = isStaticSafeUrl, lookup = dnsLookup } = {}) {
   // Rocks-Team DDL is Cloudflare-protected: the listing only exists in a
   // browser, so it is rendered with headless Chromium instead of fetched.
   const isRocks = isRocksDdlHost(directoryUrl);
@@ -873,7 +1000,7 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
   }
 
   if (!isRocks && /(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) {
-    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp, { batch, redirect });
+    const goIndexFile = await resolveGoIndexSubtitle(directoryUrl, targetEp, { batch, redirect, validateUrl, lookup });
     if (goIndexFile) return goIndexFile;
   }
 
@@ -883,11 +1010,20 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
       html = await fetchRenderedHtml(directoryUrl);
       if (!html) return null;
     } else {
-      const res = await fetchWithTimeout(directoryUrl, {
-        headers: { 'User-Agent': UA },
-        ...recoveryFetchExtras(recoveryMode)
+      // N6: the directory URL is scraped input. Route the plain HTML fallback
+      // through fetchSafe too, so a 302 from a public host is re-validated
+      // (DNS-aware) before ANY second request — otherwise undici auto-follows
+      // it straight into an internal address. Recovery mode throws a typed
+      // RECOVERY_REDIRECT before the redirect target is fetched.
+      const safeGet = await fetchSafe(directoryUrl, {
+        sourceUrl: directoryUrl,
+        method: 'GET',
+        initialValidator: validateUrl,
+        lookup,
+        recovery: recoveryMode,
       });
-      if (!res.ok) return null;
+      const res = safeGet?.response;
+      if (!res?.ok) return null;
       const contentType = res.headers.get('content-type') || '';
       if (!/html|text\//i.test(contentType)) return null;
       html = await res.text();
@@ -961,19 +1097,46 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
   }
 }
 
-export async function resolveFontFromDirectory(directoryUrl) {
+export async function resolveFontFromDirectory(directoryUrl, options = {}) {
+  // F4: a marked recovery message must use the same no-redirect mode as its
+  // sibling subtitle resolver. fetchSafe with `recovery: true` throws a typed
+  // refusal on any 3xx before the redirect target can be fetched.
+  const recoveryMode = isRecoveryRedirectOption(options.redirect) || options.recovery === true;
+  const lookup = typeof options.lookup === 'function' ? options.lookup : dnsLookup;
   if (!directoryUrl || !/(?:workers\.dev|ddl\.[^/]+|\/0:)/i.test(directoryUrl)) return null;
+
+  // N3: validate the directory URL before the JSON / form / HTML fetches.
+  // A scraped metadata URL (e.g. http://169.254.169.254/0:/) would otherwise
+  // pass the shape check above and be fetched three times. Injectable and
+  // fail-closed, matching the subtitle resolver's pre-flight guard.
+  const validateUrl = typeof options.validateUrl === 'function' ? options.validateUrl : isStaticSafeUrl;
+  let urlAllowed = false;
+  try {
+    urlAllowed = await validateUrl(directoryUrl, directoryUrl);
+  } catch { urlAllowed = false; }
+  if (!urlAllowed) {
+    console.warn(`Refusing unsafe font directory URL (host ${linkHost(directoryUrl) || 'unknown'})`);
+    return null;
+  }
+
   const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
   const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
 
   // 1. Try application/json (Mejaow / modern GoIndex workers)
   try {
-    const resJson = await fetchWithTimeout(directoryUrl, {
+    // N6: every listing request goes through fetchSafe, including this POST,
+    // so a public worker's 302 is re-validated before a second request.
+    const safeJson = await fetchSafe(directoryUrl, {
+      sourceUrl: directoryUrl,
       method: 'POST',
-      headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
       body: JSON.stringify({ page_token: null, page_index: 0 }),
+      headers: { 'Content-Type': 'application/json' },
+      initialValidator: validateUrl,
+      lookup,
+      recovery: recoveryMode,
     });
-    if (resJson.ok) {
+    const resJson = safeJson?.response;
+    if (resJson) {
       let json = null;
       if (typeof resJson.json === 'function') {
         json = await resJson.json().catch(() => null);
@@ -986,17 +1149,26 @@ export async function resolveFontFromDirectory(directoryUrl) {
       const fontFile = files.find(f => isPureFont(f.name || '') && /\.(?:zip|rar|7z|ttf|otf)$/i.test(f.name || ''));
       if (fontFile) return `${base}${encodeURIComponent(fontFile.name)}`;
     }
-  } catch { }
+  } catch (e) {
+    // A typed recovery refusal (e.g. a 3xx on the no-redirect path) must fail
+    // fatal rather than being swallowed by this fallback attempt.
+    if (recoveryFatalCodeFor(e)) throw e;
+  }
 
   // 2. Try application/x-www-form-urlencoded (Rocks-Team / HashHackers GDI workers)
   try {
     const formParams = new URLSearchParams({ q: '', password: '', page_token: '', page_index: '0' });
-    const res = await fetchWithTimeout(directoryUrl, {
+    const safeForm = await fetchSafe(directoryUrl, {
+      sourceUrl: directoryUrl,
       method: 'POST',
-      headers: { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formParams.toString(),
+      initialValidator: validateUrl,
+      lookup,
+      recovery: recoveryMode,
     });
-    if (res.ok) {
+    const res = safeForm?.response;
+    if (res) {
       let json = null;
       if (typeof res.json === 'function') {
         json = await res.json().catch(() => null);
@@ -1015,11 +1187,22 @@ export async function resolveFontFromDirectory(directoryUrl) {
       const fontFile = files.find(f => isPureFont(f.name || '') && /\.(?:zip|rar|7z|ttf|otf)$/i.test(f.name || ''));
       if (fontFile) return `${base}${encodeURIComponent(fontFile.name)}`;
     }
-  } catch { }
+  } catch (e) {
+    // A typed recovery refusal must fail fatal, not fall through.
+    if (recoveryFatalCodeFor(e)) throw e;
+  }
 
   try {
-    const res = await fetchWithTimeout(directoryUrl, { headers: { 'User-Agent': UA } });
-    if (res.ok) {
+    // The HTML fallback GET is validated too — otherwise a worker that
+    // refuses both POSTs could still 302 us into an internal address here.
+    const safeHtml = await fetchSafe(directoryUrl, {
+      sourceUrl: directoryUrl,
+      initialValidator: validateUrl,
+      lookup,
+      recovery: recoveryMode,
+    });
+    const res = safeHtml?.response;
+    if (res) {
       const html = await res.text();
       const $ = cheerio.load(html);
       let fontHref = null;
@@ -1036,7 +1219,10 @@ export async function resolveFontFromDirectory(directoryUrl) {
       });
       return fontHref;
     }
-  } catch { }
+  } catch (e) {
+    // A typed recovery refusal must fail fatal, not become a null result.
+    if (recoveryFatalCodeFor(e)) throw e;
+  }
 
   return null;
 }
@@ -1045,6 +1231,19 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   // F2/F4: single mode decision for the whole page-scrape path. Normal callers
   // (no redirect option) are byte-identical to before.
   const recoveryMode = isRecoveryRedirectOption(options.redirect);
+
+  // V1: the FIRST page URL is remote-controlled too. Refuse private/loopback/
+  // metadata targets BEFORE any fetch path (browser, impersonation, Node fetch
+  // or curl) can run. `validateUrl` is injectable for offline tests; a throwing
+  // validator fails closed. Recovery mode keeps its own no-redirect rules.
+  let urlAllowed = false;
+  try {
+    urlAllowed = await (options.validateUrl || isStaticSafeUrl)(pageUrl, pageUrl);
+  } catch { urlAllowed = false; }
+  if (!urlAllowed) {
+    console.warn(`Refusing unsafe post page URL (host ${linkHost(pageUrl) || 'unknown'})`);
+    return null;
+  }
 
   // P1-1b: a URL that was already fetched and found to have NO download link
   // is answered from the negative cache — with NO network request at all —
@@ -1124,6 +1323,51 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
 
   const effectiveEp = targetEp || (pageUrl.match(/[-_](\d{1,4})(?:\.html)?$/i)?.[1]) || null;
 
+  // Post-process a VALIDATED page: Cloudflare challenge impersonation and an
+  // HTML <meta http-equiv=refresh> follow. Shared by the direct-2xx path and
+  // the final URL of a validated HTTP redirect chain so neither loses a
+  // release. The meta target is resolved against the validated current URL,
+  // re-checked with DNS-aware validation, and fetched only with manual,
+  // re-validated hops; html/currentUrl advance only on a validated final 2xx.
+  const postProcessPageHtml = async (currentHtml, currentUrl, responseStatus) => {
+    // If Cloudflare challenge returned (challenge page / 403 / 503), try impersonation fallback
+    if (currentHtml.includes('Just a moment...') || currentHtml.includes('cf-chl-') ||
+        responseStatus === 403 || responseStatus === 503) {
+      // F2: curl_cffi follows redirects internally — fail closed on the
+      // recovery path instead of bypassing the no-redirect policy.
+      if (recoveryMode) {
+        throw typedRecoveryError(RECOVERY_CODES.FETCH_UNSAFE, 'impersonation fallback refused on recovery path');
+      }
+      console.log(`   🛡️ Cloudflare challenge detected (${responseStatus}), attempting curl_cffi fallback...`);
+      const cfHtml = fetchHtmlWithImpersonation(currentUrl, cookieHeader);
+      if (cfHtml) currentHtml = cfHtml;
+    }
+
+    if (currentHtml && !recoveryMode) {
+      // Follow HTML meta refresh redirect (e.g. Staatic static site redirects on Cloudflare Pages).
+      // The target is remote-controlled: validate it before fetching, and only
+      // carry the site Cookie when the target host is the original page host.
+      const redirectTarget = extractMetaRefreshTarget(currentHtml);
+      if (redirectTarget) {
+        try {
+          const resolvedRedirect = new URL(redirectTarget, currentUrl).toString();
+          if (resolvedRedirect !== currentUrl &&
+              await isAllowedMetaRefreshTarget(resolvedRedirect, currentUrl, options.lookup)) {
+            console.log(`   🔀 HTML meta refresh detected: redirecting to ${resolvedRedirect}`);
+            const followed = await fetchValidatedMetaRefreshChain(
+              resolvedRedirect, currentUrl, cookieHeader, { lookup: options.lookup }
+            );
+            if (followed) {
+              currentHtml = followed.html;
+              currentUrl = followed.url;
+            }
+          }
+        } catch { }
+      }
+    }
+    return { html: currentHtml, pageUrl: currentUrl };
+  };
+
   let html = '';
   // Revive Subs is behind Cloudflare which blocks datacenter IPs.
   // Use curl_cffi with Chrome impersonation if available.
@@ -1146,49 +1390,34 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   }
 
   if (!html) {
+    // The first page URL is remote-controlled too. fetchSafe validates EVERY
+    // hop before fetching and never auto-follows a Location: the initial URL
+    // uses the same DNS-free `validateUrl` escape hatch as the pre-flight
+    // guard above (so the recovery test-local URL and `unsafe` test names keep
+    // working), while redirect hops remain DNS-aware via lookup. Recovery mode
+    // throws a typed RECOVERY_REDIRECT on any 3xx before a second request.
+    const pageUrlValidator = options.validateUrl || isStaticSafeUrl;
     try {
-      const res = await fetchWithTimeout(pageUrl, {
-        headers: { 'User-Agent': UA, 'Cookie': cookieHeader },
-        // C1/F4: default callers are unchanged (undefined → fetch's own
-        // 'follow' behaviour). Recovery callers get 'manual' + an internal
-        // marker so a 3xx is thrown as a typed RECOVERY_REDIRECT.
-        ...(options.redirect ? { redirect: options.redirect } : {}),
-        ...recoveryFetchExtras(recoveryMode)
+      const safe = await fetchSafe(pageUrl, {
+        sourceUrl: pageUrl,
+        cookieHeader,
+        lookup: options.lookup,
+        recovery: recoveryMode,
+        initialValidator: pageUrlValidator,
+        allowNonOk: true, // 403/503 Cloudflare challenges must reach postProcessPageHtml
       });
-      html = await res.text();
-      // If Cloudflare challenge returned (challenge page / 403 / 503), try impersonation fallback
-      if (html.includes('Just a moment...') || html.includes('cf-chl-') || res.status === 403 || res.status === 503) {
-        // F2: curl_cffi follows redirects internally — fail closed on the
-        // recovery path instead of bypassing the no-redirect policy.
-        if (recoveryMode) {
-          throw typedRecoveryError(RECOVERY_CODES.FETCH_UNSAFE, 'impersonation fallback refused on recovery path');
-        }
-        console.log(`   🛡️ Cloudflare challenge detected (${res.status}), attempting curl_cffi fallback...`);
-        const cfHtml = fetchHtmlWithImpersonation(pageUrl, cookieHeader);
-        if (cfHtml) html = cfHtml;
+
+      if (!safe) {
+        console.warn(`Refusing unsafe redirect from post page (host ${linkHost(pageUrl) || 'unknown'})`);
+        return null;
       }
 
-      if (html) {
-        // Follow HTML meta refresh redirect (e.g. Staatic static site redirects on Cloudflare Pages)
-        const metaRefreshMatch = html.match(/<meta[^>]*http-equiv=["']?refresh["']?[^>]*content=["']?[^"'>]*url=([^"'>\s]+)/i);
-        if (metaRefreshMatch && !recoveryMode) {
-          const redirectTarget = metaRefreshMatch[1].trim().replace(/^['"]|['"]$/g, '');
-          try {
-            const resolvedRedirect = new URL(redirectTarget, pageUrl).toString();
-            if (resolvedRedirect !== pageUrl) {
-              console.log(`   🔀 HTML meta refresh detected: redirecting to ${resolvedRedirect}`);
-              const res2 = await fetchWithTimeout(resolvedRedirect, {
-                headers: { 'User-Agent': UA, 'Cookie': cookieHeader },
-                ...(options.redirect ? { redirect: options.redirect } : {}),
-              });
-              if (res2.ok) {
-                html = await res2.text();
-                pageUrl = resolvedRedirect;
-              }
-            }
-          } catch { }
-        }
-      }
+      html = await safe.response.text();
+      // The validated final URL — whether a direct 2xx or the end of a
+      // re-validated redirect chain — may carry a meta refresh or a Cloudflare
+      // challenge. Apply the same post-processing to BOTH so neither loses a
+      // release.
+      ({ html, pageUrl } = await postProcessPageHtml(html, safe.url, safe.response.status));
     } catch (e) {
       // C1: on the recovery path NO fallback may follow a redirect or bypass
       // the check (curl uses a different redirect policy). Propagate so the
@@ -1428,7 +1657,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     if (resolvedFile) {
       directSubLink = resolvedFile;
       if (!fontsLink) {
-        const fontFile = await resolveFontFromDirectory(dirUrl);
+        const fontFile = await resolveFontFromDirectory(dirUrl, directoryOptions);
         if (fontFile) fontsLink = fontFile;
       }
     }
@@ -1521,11 +1750,16 @@ export async function resolveBuzzheavierDownloadUrl(buzzUrl) {
     let downloadPath = null;
     const command = process.platform === 'win32' ? 'curl.exe' : 'curl';
 
-    // 1. Fetch HTML of the buzzheavier page using curl with browser headers
+    // 1. Fetch HTML of the buzzheavier page using curl with browser headers.
+    // S1/SSRF: NO `-L` here. A 3xx is deliberately NOT followed: a public
+    // buzzheavier page must never be able to redirect this process into an
+    // internal/metadata address. The host guard above already refuses any
+    // lookalike hostname before curl is spawned; the download endpoint below
+    // uses `-I` (no -L) and validates every hx-redirect/location itself.
     let html = '';
     try {
       html = execFileSync(command, [
-        '-s', '-L',
+        '-s',
         '--max-time', '30',
         '--user-agent', UA,
         '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',

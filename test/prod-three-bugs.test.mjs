@@ -435,8 +435,8 @@ test('N Season regression: computeReleaseKeySet attaches episode token to canoni
   }
 });
 
-test('RETRACTED_KEYS eviction: false sequel dedup keys are filtered in load and merge', async () => {
-  const { RETRACTED_KEYS } = await import('../src/retracted-keys.mjs');
+test('RETRACTED_KEYS one-time eviction: filtered only while the version marker is absent', async () => {
+  const { RETRACTED_KEYS, RETRACTION_MARKER } = await import('../src/retracted-keys.mjs');
   const { mergePostedIds } = await import('../scripts/merge-posted-state.mjs');
   const { loadPostedIds } = tc;
 
@@ -451,18 +451,30 @@ test('RETRACTED_KEYS eviction: false sequel dedup keys are filtered in load and 
   assert.ok(RETRACTED_KEYS.has('tg_-1002084152036_11464'));
   assert.ok(RETRACTED_KEYS.has('tg_-1001031770723_25377'));
 
-  // Test mergePostedIds excludes RETRACTED_KEYS
+  // No marker: mergePostedIds filters RETRACTED_KEYS once and records the marker.
   const mergeResult = mergePostedIds(
     ['tg_-1002084152036_11486', 'legit_key_1'],
     ['tg_-1002084152036_11484', 'legit_key_2']
   );
-  assert.deepEqual(mergeResult.merged.sort(), ['legit_key_1', 'legit_key_2']);
+  assert.deepEqual(mergeResult.merged.sort(), [RETRACTION_MARKER, 'legit_key_1', 'legit_key_2']);
 
-  // Test loadPostedIds excludes RETRACTED_KEYS from loaded set
+  // No marker: loadPostedIds filters once and adds the marker to the set.
   fs.mkdirSync('data', { recursive: true });
   fs.writeFileSync('data/posted.json', JSON.stringify(['tg_-1002084152036_11490', 'clean_saved_key']));
   const loaded = loadPostedIds();
   assert.equal(loaded.has('clean_saved_key'), true);
   assert.equal(loaded.has('tg_-1002084152036_11490'), false);
-  assert.equal(loaded.size, 1);
+  assert.equal(loaded.has(RETRACTION_MARKER), true);
+  assert.equal(loaded.size, 2);
+
+  // Marker present: the migration is already applied — keys are preserved and
+  // the marker stays in the set so the next save persists the version record.
+  fs.writeFileSync('data/posted.json', JSON.stringify([
+    'tg_-1002084152036_11490', 'clean_saved_key', RETRACTION_MARKER,
+  ]));
+  const loadedAgain = loadPostedIds();
+  assert.equal(loadedAgain.has('clean_saved_key'), true);
+  assert.equal(loadedAgain.has('tg_-1002084152036_11490'), true);
+  assert.equal(loadedAgain.has(RETRACTION_MARKER), true);
+  assert.equal(loadedAgain.size, 3);
 });

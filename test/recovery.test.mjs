@@ -362,7 +362,7 @@ test('redirect option defaults to current behaviour for other callers', async ()
   }, async () => {
     await ss.scrapePostPage(GOOD_URL, null, null, 'Test Release Title');
   });
-  assert.equal(seen.redirect, undefined, 'no redirect override for normal callers');
+  assert.equal(seen.redirect, 'manual', 'first page fetch never auto-follows a redirect');
 });
 
 // ===========================================================================
@@ -461,7 +461,7 @@ test('F3: browser-rendered directory refuses FETCH_UNSAFE on recovery path', asy
   assert.equal(fetched, false, 'no fetch at all on the browser-only recovery path');
 });
 
-test('F3: normal directory callers are byte-identical (no redirect options)', async () => {
+test('F3: normal directory callers get manual redirects without a recovery marker', async () => {
   const seen = [];
   await withFetch(async (_url, opts) => {
     seen.push(opts);
@@ -472,7 +472,9 @@ test('F3: normal directory callers are byte-identical (no redirect options)', as
     await ss.resolveSubtitleFromDirectory('https://example.workers.dev/dir', null);
   });
   assert.ok(seen.length >= 1);
-  assert.ok(seen.every(o => o.redirect === undefined && o.recovery === undefined), 'no option leak to normal callers');
+  // All directory fetches (GoIndex POSTs and the HTML fallback) go through fetchSafe with redirect:manual; no caller may leak a recovery marker.
+  assert.ok(seen.every(o => o.recovery === undefined), 'no recovery-marker leak to normal callers');
+  assert.ok(seen.filter(o => o.method === 'POST').every(o => o.redirect === 'manual'), 'normal directory POSTs use manual redirects');
 });
 
 test('F4: a real local 302 becomes typed RECOVERY_REDIRECT (fatal), no page result', async () => {
@@ -484,7 +486,7 @@ test('F4: a real local 302 becomes typed RECOVERY_REDIRECT (fatal), no page resu
   const { port } = server.address();
   try {
     await assert.rejects(
-      () => ss.scrapePostPage(`http://127.0.0.1:${port}/post-f4`, null, null, 'Release F4', { redirect: r.RECOVERY_REDIRECT_MODE }),
+      () => ss.scrapePostPage(`http://127.0.0.1:${port}/post-f4`, null, null, 'Release F4', { redirect: r.RECOVERY_REDIRECT_MODE, validateUrl: () => true }),
       (e) => e.code === r.RECOVERY_CODES.REDIRECT,
     );
     assert.equal(r.recoveryFatalCodeFor({ code: r.RECOVERY_CODES.REDIRECT }), r.RECOVERY_CODES.REDIRECT);
