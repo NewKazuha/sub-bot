@@ -666,8 +666,9 @@ test('scrapePostPage follows HTML meta refresh redirect', async () => {
   }
 });
 
-test('resolveGoIndexSubtitle prefers batch archive when batch: true', async () => {
+test('resolveGoIndexSubtitle prefers a numeric-range batch archive over a hyphenated episode archive', async () => {
   const realFetch = globalThis.fetch;
+  const batchName = '[Group] Show - 01 ~ 12 [Subs + Fonts].zip';
   globalThis.fetch = async () => ({
     ok: true,
     status: 200,
@@ -675,7 +676,8 @@ test('resolveGoIndexSubtitle prefers batch archive when batch: true', async () =
     json: async () => ({
       data: {
         files: [
-          { name: '[Group] Show - 01 ~ 12 [Subs + Fonts].zip', size: 1024 },
+          { name: '[Group] Show - 01.zip', size: 1024 },
+          { name: batchName, size: 4096 },
           { name: '[Group] Show - 01.ass', size: 50 },
           { name: '[Group] Show - 02.ass', size: 50 }
         ]
@@ -685,7 +687,7 @@ test('resolveGoIndexSubtitle prefers batch archive when batch: true', async () =
 
   try {
     const res = await ss.resolveGoIndexSubtitle('https://example.workers.dev/0:/Show/', null, { batch: true });
-    assert.ok(res.includes('%5BGroup%5D%20Show%20-%2001%20~%2012%20%5BSubs%20%2B%20Fonts%5D.zip'), 'chose the batch archive');
+    assert.equal(res, `https://example.workers.dev/0:/Show/${encodeURIComponent(batchName)}`, 'chose the batch archive');
   } finally {
     globalThis.fetch = realFetch;
   }

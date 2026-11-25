@@ -1619,11 +1619,22 @@ export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpiso
 
     const isBatch = targetSubs.length > 1;
     const hasFonts = fontFiles.length > 0;
+    const fontCount = fontFiles.length;
 
     if (isBatch || hasFonts) {
-      console.log(`   📦 [Drive Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontFiles.length} font(s)). Downloading and packing to .zip...`);
+      console.log(`   📦 [Drive Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontCount} font(s)). Downloading and packing to .zip...`);
       // The cap is checked BEFORE the first download (M6): the file count
       // (subtitles AND fonts) and the total size are refused up-front.
+      // A narrowed single-episode folder must reach the caller's no-font fallback.
+      const narrowed = batch !== true && Boolean(targetEpisode) && targetSubs.length < subFiles.length;
+      const seriesFolderCounts = `${targetSubs.length} sub(s) + ${fontCount} font(s) > ${CLOUD_CAP_LIMITS.MAX_FILES}`;
+      if (narrowed && targetSubs.length + fontCount > CLOUD_CAP_LIMITS.MAX_FILES) {
+        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
+      }
+      // Fonts alone can exhaust the cap even with one selected subtitle.
+      if (targetSubs.length === 1 && fontCount >= CLOUD_CAP_LIMITS.MAX_FILES) {
+        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
+      }
       assertCloudBatchCaps(targetSubs, fontFiles);
 
       const unpackDir = path.join(destDir, nextTempTag('drive_unpack'));

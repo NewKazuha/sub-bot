@@ -1521,6 +1521,77 @@ test('T60 — a narrowed 1-sub + 20-fonts series folder throws SERIES_FOLDER_BAT
   assert.deepEqual(entriesOf(dest), []);
 });
 
+test('T60b — a narrowed Drive series folder over the font cap uses the fallback code', async () => {
+  const dest = tmpDir('cloud-t60b-');
+  const listed = [
+    ...seriesSubs(7).map((f, i) => ({ name: f.name, id: `driveid${i}`, isFolder: false })),
+    ...Array.from({ length: 20 }, (_, i) => ({ name: `Font${i + 1}.ttf`, id: `fontid${i}`, isFolder: false }))
+  ];
+  const downloaded = [];
+  const downloadFile = async (_id, destPath, name) => {
+    downloaded.push(name);
+    fs.writeFileSync(destPath, 'fake');
+    return true;
+  };
+
+  await rejectsWithCode(
+    cf.downloadDriveFolderRelease(
+      'https://drive.google.com/drive/folders/drivefolderid1234567890',
+      dest,
+      '7',
+      null,
+      'Horemajo - 07',
+      { listedFiles: listed, batch: false, downloadFile }
+    ),
+    'SERIES_FOLDER_BATCH'
+  );
+  assert.deepEqual(downloaded, [], 'the cap refusal happens before the first download');
+  assert.deepEqual(entriesOf(dest), []);
+
+  const release = await cf.downloadDriveFolderRelease(
+    'https://drive.google.com/drive/folders/drivefolderid1234567890',
+    dest,
+    '7',
+    null,
+    'Horemajo - 07',
+    { listedFiles: listed, batch: false, skipFonts: true, downloadFile }
+  );
+  assert.equal(release.type, 'subtitle');
+  assert.deepEqual(downloaded, ['Horemajo - 07.ass'], 'the fallback downloads only the requested subtitle');
+  assert.equal(fs.existsSync(release.filePath), true);
+});
+
+test('T60c — a narrowed Drive folder with too many matching subtitles uses the fallback code', async () => {
+  const dest = tmpDir('cloud-t60c-');
+  const listed = [
+    ...Array.from({ length: 21 }, (_, i) => ({
+      name: `Horemajo - 07 [${i + 1}].ass`,
+      id: `driveid${i}`,
+      isFolder: false
+    })),
+    { name: 'Horemajo - 08.ass', id: 'driveid08', isFolder: false }
+  ];
+  let downloaderCalls = 0;
+
+  await rejectsWithCode(
+    cf.downloadDriveFolderRelease(
+      'https://drive.google.com/drive/folders/drivefolderid1234567890',
+      dest,
+      '7',
+      null,
+      'Horemajo - 07',
+      {
+        listedFiles: listed,
+        batch: false,
+        downloadFile: async () => { downloaderCalls += 1; }
+      }
+    ),
+    'SERIES_FOLDER_BATCH'
+  );
+  assert.equal(downloaderCalls, 0);
+  assert.deepEqual(entriesOf(dest), []);
+});
+
 test('T61 — the narrowed release still packs its fonts under Fonts/', async () => {
   const dest = tmpDir('cloud-t61-');
   const fonts = [

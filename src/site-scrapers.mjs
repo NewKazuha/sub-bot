@@ -964,8 +964,9 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
       // For batch releases, prefer the batch archive (.zip/.rar/.7z)
       const archives = candidateFiles.filter(f => /\.(zip|rar|7z)$/i.test(f.name || ''));
       if (archives.length > 0) {
-        // If an archive carries a range (e.g. 01 ~ 13) or batch keyword, pick it
-        chosen = archives.find(f => /[-~–]|\bbatch\b|\bcomplete\b/i.test(f.name || '')) || archives[0];
+        // A lone hyphen also appears in per-episode names; require a numeric range.
+        const batchArchivePattern = /\b\d{1,4}\s*(?:~|–|—|-)\s*\d{1,4}\b|\bbatch\b|\bcomplete\b/i;
+        chosen = archives.find(f => batchArchivePattern.test(f.name || '')) || archives[0];
       }
     }
 
