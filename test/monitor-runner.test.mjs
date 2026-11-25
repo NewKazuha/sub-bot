@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { runLoop, classifyCycle, resolveMaxConsecutiveCycleFailures, runSinglePass, runContinuousMonitor } from '../src/action-runner.mjs';
+import { runLoop, classifyCycle, resolveMaxConsecutiveCycleFailures, runSinglePass, runContinuousMonitor, teardownTelegramClient } from '../src/action-runner.mjs';
 import { checkNewReleases } from '../src/feed-monitor.mjs';
 import { runCheckCycle, reportCycleVerdict } from '../src/index.mjs';
 
@@ -722,6 +722,106 @@ console.log('EXITCODE=' + process.exitCode);
     const src = fs.readFileSync(path.join(REPO_ROOT, 'src', 'action-runner.mjs'), 'utf8');
     const withoutComments = src.split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
     assert.equal(/process\.exit\(/.test(withoutComments), false, 'the runner must never call process.exit()');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('teardownTelegramClient disarms reconnects, clears Map timers, and bounds stuck destroy()', async () => {
+  let socketClosed = false;
+  let clientDestroyed = false;
+  let reconnectFired = false;
+  const sender = {
+    userDisconnected: false,
+    _userConnected: true,
+    _autoReconnect: true,
+    _reconnectRetries: Infinity,
+    _retries: 5,
+    _delay: 2000,
+    reconnect() { reconnectFired = true; },
+    async _reconnect() { reconnectFired = true; },
+    _cancelLoops() {},
+    _connection: {
+      // Simulates an in-flight _reconnect() handshake where Connection.disconnect() would return early.
+      _connected: false,
+      socket: {
+        close() { socketClosed = true; },
+        client: { destroy() { clientDestroyed = true; }, unref() {} },
+      },
+    },
+  };
+
+  let timerCleared = true;
+  const leakedTimer = setTimeout(() => { timerCleared = false; }, 200);
+  const client = {
+    _destroyed: false,
+    _sender: sender,
+    _exportedSenderReleaseTimeouts: new Map([[2, leakedTimer]]),
+    // Simulate a stuck GramJS destroy() promise that never resolves on its own.
+    destroy() { return new Promise(() => {}); },
+  };
+
+  await teardownTelegramClient(client, { timeoutMs: 50 });
+  await new Promise((r) => setTimeout(r, 80));
+
+  assert.equal(client._destroyed, true);
+  assert.equal(sender.userDisconnected, true);
+  assert.equal(sender._userConnected, false);
+  assert.equal(sender._autoReconnect, false);
+  assert.equal(sender._retries, 0);
+  assert.equal(sender._delay, 0);
+  assert.equal(socketClosed, true);
+  assert.equal(clientDestroyed, true);
+  assert.equal(timerCleared, true, 'Map-based release timers must be cleared');
+
+  // Calling the old reconnect hooks after teardown must be a no-op.
+  sender.reconnect();
+  await sender._reconnect();
+  assert.equal(reconnectFired, false);
+});
+
+test('teardownTelegramClient releases a refed in-flight TCP socket so Node exits naturally', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-teardown-exit-'));
+  try {
+    const code = `
+import net from 'node:net';
+const { teardownTelegramClient } = await import(${JSON.stringify(RUNNER_URL)});
+
+const server = net.createServer((sock) => { sock.on('error', () => {}); });
+server.listen(0, '127.0.0.1', async () => {
+  const port = server.address().port;
+  const rawSocket = net.connect(port, '127.0.0.1');
+  rawSocket.on('error', () => {});
+  // Simulate GramJS _reconnect() with _connected === false while socket is live.
+  const client = {
+    _destroyed: false,
+    _sender: {
+      userDisconnected: false,
+      _userConnected: false,
+      _autoReconnect: true,
+      _retries: 5,
+      _connection: {
+        _connected: false,
+        socket: { client: rawSocket, close() { rawSocket.destroy(); rawSocket.unref(); } },
+      },
+    },
+    async destroy() {
+      // Mimic GramJS Connection.disconnect() early-return when _connected is false!
+      this._destroyed = true;
+      if (!this._sender._connection._connected) return;
+      this._sender._connection.socket.close();
+    },
+  };
+  await teardownTelegramClient(client, { timeoutMs: 100 });
+  server.close();
+  console.log('TEARDOWN_DONE');
+});
+`;
+    const res = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000,
+    });
+    assert.equal(res.status, 0, `subprocess failed or timed out: status=${res.status}, signal=${res.signal}, stderr=${res.stderr}`);
+    assert.match(res.stdout, /TEARDOWN_DONE/, res.stdout);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

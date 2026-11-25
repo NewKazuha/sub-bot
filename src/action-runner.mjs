@@ -491,6 +491,99 @@ export async function runSinglePass({
   return { summary: s, verdict, failed };
 }
 
+/**
+ * Permanently tear down a persistent GramJS client at the end of a monitor run.
+ *
+ * GramJS has two shutdown traps that keep the Node event loop alive after
+ * `client.disconnect()` returns (which stalled CI until the 45-minute timeout):
+ * 1. `disconnect()` does not set `client._destroyed = true`, so `_updateLoop`
+ *    keeps scheduling pings/reconnects forever.
+ * 2. If `MTProtoSender._reconnect()` has a TCP handshake in flight when
+ *    `disconnect()` runs, `Connection._connected` is still `false`, so
+ *    `Connection.disconnect()` returns early without closing the socket;
+ *    moments later the handshake completes and starts `_sendLoop`/`_recvLoop`
+ *    on an orphaned, ref'd `net.Socket`.
+ */
+export async function teardownTelegramClient(client, { timeoutMs = 5000 } = {}) {
+  if (!client) return;
+
+  const stopSender = (sender) => {
+    if (!sender) return;
+    sender.userDisconnected = true;
+    sender._userConnected = false;
+    sender._autoReconnect = false;
+    sender._reconnectRetries = 0;
+    sender._retries = 0;
+    sender._delay = 0;
+    sender.reconnect = () => {};
+    sender._reconnect = async () => {};
+    try { sender._cancelLoops?.(); } catch { }
+    try { sender._sendQueue?.rejectAll?.(); } catch { }
+
+    const conn = sender._connection;
+    if (conn) {
+      conn._connected = false;
+      try { void conn._recvArray?.push?.(undefined); } catch { }
+      try { conn.socket?.close?.(); } catch { }
+      try { conn.socket?.client?.destroy?.(); } catch { }
+      try { conn.socket?.client?.unref?.(); } catch { }
+    }
+  };
+
+  const stopSenderContainer = (container) => {
+    if (!container) return;
+    const items = container instanceof Map ? container.values() : Object.values(container);
+    for (const item of items) {
+      if (item && typeof item.then === 'function') {
+        item.then(stopSender).catch(() => { });
+      } else if (item && typeof item === 'object') {
+        stopSenderContainer(item);
+      }
+    }
+  };
+
+  const clearTimeoutContainer = (container) => {
+    if (!container) return;
+    const items = container instanceof Map ? container.values() : Object.values(container);
+    for (const item of items) {
+      if (typeof item === 'number' || (item && typeof item[Symbol.toPrimitive] === 'function') || item?._onTimeout) {
+        clearTimeout(item);
+      } else if (item && typeof item === 'object') {
+        clearTimeoutContainer(item);
+      }
+    }
+  };
+
+  try {
+    client._destroyed = true;
+    stopSender(client._sender);
+    stopSenderContainer(client._exportedSenderPromises);
+    stopSenderContainer(client._borrowedSenderPromises);
+    clearTimeoutContainer(client._exportedSenderReleaseTimeouts);
+  } catch { }
+
+  const closeCall = typeof client.destroy === 'function'
+    ? client.destroy()
+    : (typeof client.disconnect === 'function' ? client.disconnect() : Promise.resolve());
+
+  let timerId;
+  try {
+    await Promise.race([
+      Promise.resolve(closeCall).catch(() => { }),
+      new Promise((resolve) => {
+        timerId = setTimeout(resolve, timeoutMs);
+        if (typeof timerId.unref === 'function') timerId.unref();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timerId);
+    // Final sweep in case an in-flight connection crossed the boundary above.
+    try {
+      stopSender(client._sender);
+    } catch { }
+  }
+}
+
 export async function runContinuousMonitor() {
   try {
     return await runContinuousMonitorInner();
@@ -559,10 +652,16 @@ async function runContinuousMonitorInner() {
       const CYCLE_TIMEOUT_MS = parseInt(process.env.CYCLE_TIMEOUT_MS || String(10 * 60 * 1000), 10);
       const TEARDOWN_TIMEOUT_MS = 30 * 1000;
 
-      const timeoutGuard = (promise, ms, desc) => Promise.race([
-        promise,
-        new Promise((_, rej) => setTimeout(() => rej(new Error(`${desc} timed out after ${ms / 1000}s`)), ms))
-      ]);
+      const timeoutGuard = (promise, ms, desc) => {
+        let timerId;
+        return Promise.race([
+          promise,
+          new Promise((_, rej) => {
+            timerId = setTimeout(() => rej(new Error(`${desc} timed out after ${ms / 1000}s`)), ms);
+            if (typeof timerId.unref === 'function') timerId.unref();
+          })
+        ]).finally(() => clearTimeout(timerId));
+      };
 
       windowResult = await runLoop({
         windowMs: RUN_DURATION_MINUTES * 60 * 1000,
@@ -623,7 +722,7 @@ async function runContinuousMonitorInner() {
     fatal = e;
   } finally {
     if (client) {
-      try { await client.disconnect(); } catch { }
+      await teardownTelegramClient(client);
       console.log('📡 Persistent Telegram connection closed.');
     }
     // Always release the shared headless browser, on success and on failure.
