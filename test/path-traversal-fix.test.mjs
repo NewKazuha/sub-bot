@@ -7,7 +7,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveSafeSubtitleDestination, safeMoveFile } from '../src/telegram-client.mjs';
+import AdmZip from 'adm-zip';
+import { resolveSafeSubtitleDestination, safeMoveFile, packFolderToZip } from '../src/telegram-client.mjs';
 
 let workDir;
 let nestedWorkDir;
@@ -29,6 +30,70 @@ test('plain subtitle name resolves inside the work dir with its original basenam
   assert.ok(result);
   assert.ok(inside(result, workDir), `expected inside work dir, got ${result}`);
   assert.equal(path.basename(result), 'Episode.01.ass');
+});
+
+test('signed DDL URL uses the resolver-provided subtitle name instead of download.aspx', () => {
+  const originalName = '[Celestial Dragons] Steel Ball Run - JoJo no Kimyou na Bouken - 01.ass';
+  const result = resolveSafeSubtitleDestination(
+    'https://subs.celestial-dragons.com/download.aspx?file=episode.ass&expiry=1&mac=SECRET',
+    workDir,
+    '.ass',
+    originalName,
+  );
+  assert.ok(result);
+  assert.ok(inside(result, workDir));
+  assert.equal(path.basename(result), originalName);
+});
+
+test('signed DDL fallback keeps a subtitle extension when no original name is available', () => {
+  const result = resolveSafeSubtitleDestination(
+    'https://subs.celestial-dragons.com/download.aspx?file=episode.ass&expiry=1&mac=SECRET',
+    workDir,
+    '.ass',
+  );
+  assert.ok(result);
+  assert.ok(inside(result, workDir));
+  assert.equal(path.basename(result), 'download.aspx.ass');
+});
+
+test('resolver-provided names are reduced to one component and receive the detected extension', () => {
+  const result = resolveSafeSubtitleDestination(
+    'https://subs.celestial-dragons.com/download.aspx?file=episode&expiry=1&mac=SECRET',
+    workDir,
+    '.ass',
+    '../../outside',
+  );
+  assert.ok(result);
+  assert.ok(inside(result, workDir));
+  assert.equal(path.basename(result), 'outside.ass');
+});
+
+test('signed subtitle and fonts package contains both the ASS file and font files', () => {
+  const packageDir = path.join(workDir, 'signed-package');
+  fs.mkdirSync(packageDir, { recursive: true });
+  try {
+    const originalName = '[Celestial Dragons] Steel Ball Run - JoJo no Kimyou na Bouken - 01.ass';
+    const signedUrl = 'https://subs.celestial-dragons.com/download.aspx?file=episode.ass&expiry=1&mac=SECRET';
+    const tempSubtitle = path.join(packageDir, 'direct_123');
+    fs.writeFileSync(tempSubtitle, '[Script Info]\nDialogue: signed subtitle fixture with enough content\n');
+
+    const properSubtitle = resolveSafeSubtitleDestination(signedUrl, packageDir, '.ass', originalName);
+    assert.ok(properSubtitle);
+    assert.strictEqual(safeMoveFile(tempSubtitle, properSubtitle), true);
+
+    const fontsDir = path.join(packageDir, 'Fonts');
+    fs.mkdirSync(fontsDir);
+    fs.writeFileSync(path.join(fontsDir, 'font.ttf'), 'font fixture');
+
+    const zipPath = path.join(packageDir, 'release.zip');
+    packFolderToZip(packageDir, zipPath);
+    const entries = new AdmZip(zipPath).getEntries().map(entry => entry.entryName);
+    assert.ok(entries.includes(originalName), `subtitle missing from ZIP: ${entries.join(', ')}`);
+    assert.ok(entries.includes('Fonts/font.ttf'), `font missing from ZIP: ${entries.join(', ')}`);
+    assert.ok(!entries.some(entry => entry === 'download.aspx'), 'signed endpoint name must not replace the subtitle');
+  } finally {
+    fs.rmSync(packageDir, { recursive: true, force: true });
+  }
 });
 
 test('query string and fragment are stripped from the URL basename', () => {

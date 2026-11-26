@@ -213,15 +213,21 @@ export function safeMoveFile(src, dest) {
 // result stays inside workDir before the caller renames the temp file there.
 // Returns null on any doubt so the caller can keep the file under its temp
 // name instead of writing outside the work directory.
-export function resolveSafeSubtitleDestination(directUrl, workDir, ext) {
-  const rawName = path.basename(String(directUrl ?? '')).split(/[?#]/)[0];
+export function resolveSafeSubtitleDestination(directUrl, workDir, ext, originalName = '') {
+  const hasOriginalName = Boolean(String(originalName ?? '').trim());
+  const rawName = hasOriginalName
+    ? String(originalName)
+    : path.basename(String(directUrl ?? '')).split(/[?#]/)[0];
   let decoded = rawName;
-  try {
-    decoded = decodeURIComponent(rawName);
-  } catch {
-    // Malformed percent-encoding: fall back to the raw (still sanitized) name.
+  if (!hasOriginalName) {
+    try {
+      decoded = decodeURIComponent(rawName);
+    } catch {
+      // Malformed percent-encoding: fall back to the raw (still sanitized) name.
+    }
   }
-  const safeName = safeRemoteBaseName(decoded, `subtitle${ext}`);
+  let safeName = safeRemoteBaseName(decoded, `subtitle${ext}`);
+  if (!safeName.toLowerCase().endsWith(ext.toLowerCase())) safeName += ext;
   const result = path.join(workDir, safeName);
   return isInsideDir(result, workDir) ? result : null;
 }
@@ -4935,24 +4941,28 @@ export async function checkTelegramChannels(existingClient = null) {
                             } else {
                               // Name the sub file with its extension so the zip holds a recognizable subtitle.
                               // The remote-controlled basename is decoded and sanitized before any move.
-                              const properSubPath = resolveSafeSubtitleDestination(directUrl, fansubWorkDir, magic.ext);
+                              const properSubPath = resolveSafeSubtitleDestination(directUrl, fansubWorkDir, magic.ext, pageData.fileName);
+                              let subtitleReady = false;
                               if (properSubPath) {
                                 if (tempDest === properSubPath || safeMoveFile(tempDest, properSubPath)) {
                                   // B1: keep downloadedFilePath in sync with the
                                   // renamed file; downstream fallbacks are gated
                                   // on this path and would otherwise be suppressed.
                                   downloadedFilePath = properSubPath;
+                                  subtitleReady = true;
                                 } else {
-                                  console.warn(`   ⚠️ Could not rename downloaded subtitle; publishing under its temporary name.`);
+                                  console.warn(`   ⚠️ Could not rename downloaded subtitle; publishing subtitle without fonts bundle.`);
                                 }
                               } else {
-                                console.warn(`   ⚠️ Unsafe subtitle filename in download URL; publishing under its temporary name.`);
+                                console.warn(`   ⚠️ Unsafe subtitle filename; publishing subtitle without fonts bundle.`);
                               }
-                              const repacked = path.join(fansubWorkDir, 'release.zip');
-                              packFolderToZip(fansubWorkDir, repacked);
-                              if (fs.existsSync(repacked) && fs.statSync(repacked).size > 100) {
-                                downloadedFilePath = repacked;
-                                console.log(`   📦 Packaged standalone subtitle + fonts into ZIP: ${logSafe(path.basename(repacked))}`);
+                              if (subtitleReady) {
+                                const repacked = path.join(fansubWorkDir, 'release.zip');
+                                packFolderToZip(fansubWorkDir, repacked);
+                                if (fs.existsSync(repacked) && fs.statSync(repacked).size > 100) {
+                                  downloadedFilePath = repacked;
+                                  console.log(`   📦 Packaged standalone subtitle + fonts into ZIP: ${logSafe(path.basename(repacked))}`);
+                                }
                               }
                             }
                           }

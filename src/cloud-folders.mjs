@@ -220,8 +220,13 @@ export function redactUrl(url) {
     return logSafe(raw.split('#')[0]);
   }
   parsed.hash = '';
+  parsed.username = '';
+  parsed.password = '';
+  const signedDownload = /\/download\.aspx$/i.test(parsed.pathname);
   for (const key of [...parsed.searchParams.keys()]) {
-    if (/key|token|sig|auth|password/i.test(key)) parsed.searchParams.delete(key);
+    if (/key|token|sig|auth|password|expiry|expires|mac/i.test(key) || (signedDownload && /^file$/i.test(key))) {
+      parsed.searchParams.delete(key);
+    }
   }
   return parsed.toString();
 }

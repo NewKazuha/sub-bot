@@ -24,6 +24,10 @@ const {
   isMugiHost,
   __setFetchImpl,
   __resetMugiWorkerState,
+  __setCelestialFetchImpl,
+  __resetCelestialIndexState,
+  resolveCelestialSubtitleFromIndex,
+  isCelestialHost,
   __resetNegativeCache,
   __getNegativeCacheStats,
   __setNowImpl,
@@ -119,6 +123,7 @@ function installStub({ root = rootListing, s4 = s4Listing, calls = [], options =
 
 beforeEach(() => {
   __resetMugiWorkerState();
+  __resetCelestialIndexState();
   __resetNegativeCache();
 });
 
@@ -144,6 +149,13 @@ test('mugiNormalizeTokens keeps 2-digit numeric titles', () => {
   assert.deepEqual(
     mugiNormalizeTokens('86 - Eighty Six', '12'),
     ['86', 'eighty', 'six'],
+  );
+});
+
+test('mugiNormalizeTokens drops zero-padded episode tokens', () => {
+  assert.deepEqual(
+    mugiNormalizeTokens('[Celestial Dragons] Steel Ball Run - 01', '01'),
+    ['steel', 'ball', 'run'],
   );
 });
 
@@ -724,7 +736,7 @@ test('resolveFontFromDirectory finds font archive in directory', async () => {
     data: {
       files: [
         { name: '[Skibidi-Subs] Umamusume Road to The Rop MOVIE Arabic.ass', size: 18664652 },
-        { name: 'Uma_Fonts.zip', size: 1677721 }
+        { name: 'Uma_Fonts.zip', size: 1677721, link: '/download.aspx?file=Uma_Fonts.zip&expiry=1&mac=SECRET' }
       ]
     }
   };
@@ -738,10 +750,200 @@ test('resolveFontFromDirectory finds font archive in directory', async () => {
 
   try {
     const font = await ss.resolveFontFromDirectory('https://ddl.skibidisubs.workers.dev/0:/Uma/');
-    assert.ok(font && font.includes('Uma_Fonts.zip'), 'found font archive');
+    assert.equal(font, 'https://ddl.skibidisubs.workers.dev/download.aspx?file=Uma_Fonts.zip&expiry=1&mac=SECRET', 'used the signed font link');
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('resolveGoIndexSubtitle uses a same-origin signed link instead of reconstructing the file path', async () => {
+  const realFetch = globalThis.fetch;
+  const signed = '/download.aspx?file=episode.ass&expiry=1893456000&mac=SECRET';
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ data: { files: [{ name: 'episode.ass', link: signed }] } })
+  });
+
+  try {
+    const res = await ss.resolveGoIndexSubtitle('https://example.workers.dev/0:/Show/', '12');
+    assert.equal(res, `https://example.workers.dev${signed}`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('resolveGoIndexSubtitle rejects a cross-origin link and keeps the safe fallback path', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({
+      data: { files: [{ name: 'episode.ass', link: 'https://evil.example/download.aspx?file=episode.ass' }] }
+    })
+  });
+
+  try {
+    const res = await ss.resolveGoIndexSubtitle('https://example.workers.dev/0:/Show/', '12');
+    assert.equal(res, 'https://example.workers.dev/0:/Show/episode.ass');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('resolveFontFromDirectory uses a signed font link from the form API', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  const signed = '/download.aspx?file=Fonts.zip&expiry=1893456000&mac=FONTSECRET';
+  globalThis.fetch = async () => {
+    calls++;
+    const payload = calls === 1
+      ? { data: { files: [] } }
+      : { data: { files: [{ name: 'Fonts.zip', link: signed }] } };
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => payload,
+      text: async () => JSON.stringify(payload)
+    };
+  };
+
+  try {
+    const font = await ss.resolveFontFromDirectory('https://example.workers.dev/0:/Show/');
+    assert.equal(font, `https://example.workers.dev${signed}`);
+    assert.equal(calls, 2, 'used the form API after the JSON API returned no fonts');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+const CELESTIAL_ROOT = 'https://subs.celestial-dragons.com/0:/';
+const CELESTIAL_CURRENT = `${CELESTIAL_ROOT}${encodeURIComponent('الأعمال الحالية')}/`;
+const CELESTIAL_COMPLETED = `${CELESTIAL_ROOT}${encodeURIComponent('الأعمال المكتملة')}/`;
+const CELESTIAL_SERIES = `${CELESTIAL_CURRENT}${encodeURIComponent('Steel Ball Run')}/`;
+const CELESTIAL_WEB = `${CELESTIAL_SERIES}${encodeURIComponent('WEB')}/`;
+const CELESTIAL_SUB_SIGNED = '/download.aspx?file=Steel%20Ball%20Run%2012.ass&expiry=1893456000&mac=SUBSECRET';
+const CELESTIAL_FONT_SIGNED = '/download.aspx?file=Fonts%5Bv2%5D.zip&expiry=1893456000&mac=FONTSECRET';
+
+function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, webFiles, paginateCurrent = false } = {}) {
+  const calls = [];
+  const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
+  const current = currentFiles || [folder('Steel Ball Run')];
+  const series = seriesFiles || [
+    folder('WEB'),
+    { name: 'Fonts[v2].zip', mimeType: 'application/zip', link: CELESTIAL_FONT_SIGNED }
+  ];
+  const web = webFiles || [
+    { name: '[Celestial] Steel Ball Run - 11.ass', mimeType: 'text/plain', link: '/download.aspx?file=11.ass&expiry=1&mac=A' },
+    { name: '[Celestial] Steel Ball Run - 12.ass', mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }
+  ];
+  const listings = new Map([
+    ['/0:/', [folder('الأعمال الحالية'), folder('الأعمال المكتملة')]],
+    [`/0:/${'الأعمال الحالية'}/`, current],
+    [`/0:/${'الأعمال المكتملة'}/`, completedFiles],
+    [`/0:/${'الأعمال الحالية'}/Steel Ball Run/`, series],
+    [`/0:/${'الأعمال الحالية'}/Steel Ball Run/WEB/`, web],
+  ]);
+  __setCelestialFetchImpl(async (url, opts) => {
+    calls.push({ url, opts });
+    if (!ss.isCelestialIndexHost(url)) throw new Error(`unexpected Celestial host: ${url}`);
+    const pathname = decodeURIComponent(new URL(url).pathname);
+    let payload;
+    if (paginateCurrent && pathname === `/0:/${'الأعمال الحالية'}/`) {
+      const body = JSON.parse(opts.body);
+      payload = body.page_index === 0
+        ? { nextPageToken: 'next-current', curPageIndex: 0, data: { files: current } }
+        : { nextPageToken: null, curPageIndex: 1, data: { files: [] } };
+    } else {
+      const files = listings.get(pathname);
+      if (!files) throw new Error(`unexpected Celestial path: ${pathname}`);
+      payload = { nextPageToken: null, curPageIndex: 0, data: { files } };
+    }
+    return jsonResponse(payload);
+  });
+  return { calls };
+}
+
+test('Celestial resolver traverses current/completed folders, paginates, and returns signed subtitle/font links', async () => {
+  const { calls } = installCelestialStub({ paginateCurrent: true });
+  const result = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run - 12', '12');
+  assert.ok(result, 'expected a Celestial resolution');
+  assert.equal(result.url, `https://subs.celestial-dragons.com${CELESTIAL_SUB_SIGNED}`);
+  assert.equal(result.fontsUrl, `https://subs.celestial-dragons.com${CELESTIAL_FONT_SIGNED}`);
+  assert.equal(result.fileName, '[Celestial] Steel Ball Run - 12.ass');
+  assert.equal(result.folderName, 'Steel Ball Run');
+  assert.equal(result.category, 'الأعمال الحالية');
+  assert.ok(calls.some(call => call.url === CELESTIAL_COMPLETED), 'searched completed works too');
+  assert.ok(calls.some(call => call.url === CELESTIAL_WEB), 'entered the nested WEB folder');
+  assert.ok(calls.some(call => {
+    if (call.url !== CELESTIAL_CURRENT) return false;
+    try { return JSON.parse(call.opts.body).page_index === 1; } catch { return false; }
+  }), 'followed nextPageToken with page_index 1');
+
+  const callCount = calls.length;
+  const cached = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run - 11', '11');
+  assert.ok(cached, 'listing cache still resolves another episode');
+  assert.equal(calls.length, callCount, 'reused cached directory listings');
+});
+
+test('scrapePostPage routes Celestial through the index without fetching the blocked blog', async () => {
+  const { calls } = installCelestialStub();
+  const pageData = await scrapePostPage(
+    'https://www.celestial-dragons.com/steel-ball-run-12/',
+    null,
+    '12',
+    '[Celestial] Steel Ball Run - 12',
+  );
+  assert.ok(pageData, 'expected pageData');
+  assert.equal(pageData.source, 'celestial-index');
+  assert.equal(pageData.bestDownloadUrl, `https://subs.celestial-dragons.com${CELESTIAL_SUB_SIGNED}`);
+  assert.equal(pageData.fileName, '[Celestial] Steel Ball Run - 12.ass');
+  assert.equal(pageData.videoLinks.directSub, pageData.bestDownloadUrl);
+  assert.equal(pageData.videoLinks.fonts, `https://subs.celestial-dragons.com${CELESTIAL_FONT_SIGNED}`);
+  assert.ok(calls.every(call => ss.isCelestialIndexHost(call.url)), 'must not fetch the WordPress blog');
+});
+
+test('Celestial resolver refuses ambiguous series folders', async () => {
+  const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
+  installCelestialStub({ currentFiles: [folder('Steel Ball Run Movie'), folder('Steel Ball Run Anime')] });
+  const result = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run - 12', '12');
+  assert.equal(result, null);
+});
+
+test('Celestial resolver prefers a unique exact folder over partial title matches', async () => {
+  const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
+  installCelestialStub({ currentFiles: [folder('Steel Ball Run Movie'), folder('Steel Ball Run')] });
+  const result = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run - 12', '12');
+  assert.ok(result);
+  assert.equal(result.folderName, 'Steel Ball Run');
+});
+
+test('Celestial resolver refuses multiple episode files when no target episode is supplied', async () => {
+  installCelestialStub();
+  const result = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run', null);
+  assert.equal(result, null);
+});
+
+test('Celestial resolver opens its circuit breaker after repeated transport failures', async () => {
+  let calls = 0;
+  __setCelestialFetchImpl(async () => {
+    calls++;
+    throw new Error('network unavailable');
+  });
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
+  assert.equal(calls, 3, 'the fourth lookup does not hammer the unavailable index');
+});
+
+test('Celestial host matching rejects lookalike domains', () => {
+  assert.equal(isCelestialHost('https://www.celestial-dragons.com/post'), true);
+  assert.equal(isCelestialHost('https://celestial-dragons.com.evil.example/post'), false);
+  assert.equal(isCelestialHost('https://notcelestial-dragons.com/post'), false);
 });
 
 test('scrapePostPage ignores Blogger <article data-url> container and selects real directSub link', async () => {

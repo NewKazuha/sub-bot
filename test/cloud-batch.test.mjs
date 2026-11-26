@@ -489,6 +489,16 @@ test('T29 — redactUrl strips the Mega key and the token parameters', async () 
   assert.ok(mediafire.includes('keep=1'), 'the harmless parameters survive');
 });
 
+test('redactUrl strips Celestial signed download parameters and URL credentials', () => {
+  const redacted = cf.redactUrl('https://user:password@subs.celestial-dragons.com/download.aspx?file=Steel%20Ball%20Run.ass&expiry=1893456000&mac=SECRET&keep=1');
+  assert.ok(!redacted.includes('file='), 'the file parameter must not survive');
+  assert.ok(!redacted.includes('expiry='), 'the expiry parameter must not survive');
+  assert.ok(!redacted.includes('mac='), 'the MAC must not survive');
+  assert.ok(!redacted.includes('SECRET'), 'the signed secret must not survive');
+  assert.ok(!redacted.includes('user:password'), 'URL credentials must not survive');
+  assert.ok(redacted.includes('keep=1'), 'harmless parameters survive');
+});
+
 // ---------------------------------------------------------------------------
 // C9 — the streamed caps of the download sinks (T30, T31)
 // ---------------------------------------------------------------------------
@@ -1004,6 +1014,10 @@ test('T38 — the call sites pass the new options (m6, m7)', () => {
   assert.ok(
     client.includes('resolveSubtitleFromDirectory(directUrl, targetEp, { batch: isCollectionTitle(titleLine) })'),
     'the fansub DDL directory resolution passes the batch option'
+  );
+  assert.ok(
+    client.includes('resolveSafeSubtitleDestination(directUrl, fansubWorkDir, magic.ext, pageData.fileName)'),
+    'the fonts bundle preserves the resolver-provided subtitle name'
   );
 });
 

@@ -4,6 +4,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import { matchesEpisode, logSafe } from './cloud-folders.mjs';
+import { getCachedCanonical } from './title-identity.mjs';
 import { fetchRenderedHtml, isRocksDdlHost, isRocksHost } from './browser-fetch.mjs';
 import {
   RECOVERY_CODES, isRecoveryRedirectOption, recoveryFatalCodeFor
@@ -305,7 +306,7 @@ export function mugiNormalizeTokens(input, targetEp = '') {
 
   return tokens.filter(t => {
     if (/(?:19|20)\d{2}/.test(t)) return false;
-    if (epNorm && t === epNorm) return false;
+    if (epNorm && (t.replace(/^0+/, '') || '0') === epNorm) return false;
     if (t === 'episode' || t === 'ep' || t === 'e') return false;
     if (fileTokenRegex.test(t)) return false;
     if (seasonTokenRegex.test(t)) return false;
@@ -531,6 +532,375 @@ export async function resolveMugiSubtitleFromWorker(releaseTitle, targetEp = nul
     return null;
   } catch (e) {
     console.warn(`   ⚠️ Mugi worker fallback failed for "${releaseTitle}": ${e.message}`);
+    return null;
+  }
+}
+
+const CELESTIAL_INDEX_BASE = 'https://subs.celestial-dragons.com/0:/';
+const CELESTIAL_CATEGORY_FOLDERS = ['الأعمال الحالية', 'الأعمال المكتملة'];
+const CELESTIAL_TIMEOUT_MS = 15_000;
+const CELESTIAL_LISTING_TTL_MS = 120_000;
+const CELESTIAL_MAX_PAGES = 5;
+const CELESTIAL_MAX_JSON_BYTES = 2_000_000;
+const CELESTIAL_MAX_NAME_LENGTH = 1_024;
+const CELESTIAL_MAX_CACHE_ENTRIES = 32;
+const CELESTIAL_MAX_TREE_FOLDERS = 12;
+const CELESTIAL_MAX_TREE_DEPTH = 2;
+const CELESTIAL_BREAKER_THRESHOLD = 3;
+const CELESTIAL_BREAKER_COOLDOWN_MS = 60_000;
+
+let celestialFetchImpl = (...args) => globalThis.fetch(...args);
+const celestialListingCache = new Map();
+let celestialConsecutiveFailures = 0;
+let celestialBreakerOpenedAt = 0;
+let celestialBreakerWarned = false;
+
+export function isCelestialHost(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'celestial-dragons.com' || host.endsWith('.celestial-dragons.com');
+  } catch {
+    return false;
+  }
+}
+
+export function isCelestialIndexHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase() === 'subs.celestial-dragons.com';
+  } catch {
+    return false;
+  }
+}
+
+export function __setCelestialFetchImpl(fn) {
+  celestialFetchImpl = fn;
+}
+
+export function __resetCelestialIndexState() {
+  celestialListingCache.clear();
+  celestialConsecutiveFailures = 0;
+  celestialBreakerOpenedAt = 0;
+  celestialBreakerWarned = false;
+  celestialFetchImpl = (...args) => globalThis.fetch(...args);
+}
+
+function isSafeCelestialName(name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= CELESTIAL_MAX_NAME_LENGTH &&
+    !/[\/\\\0-\x1f]/.test(name) && !name.includes('..');
+}
+
+function isCelestialFolderEntry(entry) {
+  return entry?.mimeType === 'application/vnd.google-apps.folder' || entry?.type === 'folder' || entry?.isFolder === true;
+}
+
+function isPureCelestialFontName(name) {
+  return /(?:^|[_\s.\[\]-])fonts?(?=[_\s.\[\]-]|$)|(?:^|[_\s.\[\]-])خطوط(?=[_\s.\[\]-]|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
+}
+
+function celestialChildUrl(parentUrl, name) {
+  if (!isSafeCelestialName(name)) return null;
+  const base = parentUrl.endsWith('/') ? parentUrl : parentUrl + '/';
+  return `${base}${encodeURIComponent(name)}/`;
+}
+
+function recordCelestialFailure(message) {
+  celestialConsecutiveFailures++;
+  if (celestialConsecutiveFailures === CELESTIAL_BREAKER_THRESHOLD) celestialBreakerOpenedAt = Date.now();
+  console.warn(`   ⚠️ Celestial index: ${logSafe(message)}`);
+}
+
+async function fetchCelestialListing(directoryUrl, options = {}) {
+  const now = Date.now();
+  const cached = celestialListingCache.get(directoryUrl);
+  if (cached && now - cached.ts < CELESTIAL_LISTING_TTL_MS) return cached.entries;
+
+  const deadline = options.deadline || Date.now() + 60_000;
+  const timeoutMs = options.timeoutMs || CELESTIAL_TIMEOUT_MS;
+  const validateUrl = options.validateUrl || isStaticSafeUrl;
+  const lookup = options.lookup || dnsLookup;
+  const fetchImpl = options.fetchImpl || celestialFetchImpl;
+  const recoveryMode = isRecoveryRedirectOption(options.redirect);
+  const entries = [];
+  const seenNames = new Set();
+  let pageToken = null;
+  let pageIndex = 0;
+  let hasMore = false;
+
+  try {
+    for (let page = 0; page < CELESTIAL_MAX_PAGES; page++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        recordCelestialFailure(`deadline exceeded while listing ${directoryUrl}`);
+        return null;
+      }
+      const body = page === 0
+        ? { page_token: null, page_index: 0 }
+        : { page_token: pageToken, page_index: pageIndex };
+      const safe = await fetchSafe(directoryUrl, {
+        sourceUrl: directoryUrl,
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+        initialValidator: validateUrl,
+        lookup,
+        fetchImpl,
+        timeoutMs: Math.min(timeoutMs, Math.max(1, remaining)),
+        recovery: recoveryMode,
+      });
+      const res = safe?.response;
+      if (!res) {
+        recordCelestialFailure(`listing request failed for ${directoryUrl}`);
+        return null;
+      }
+      const declaredLength = Number(res.headers?.get?.('content-length'));
+      if (Number.isFinite(declaredLength) && declaredLength > CELESTIAL_MAX_JSON_BYTES) {
+        try { await res.body?.cancel(); } catch { }
+        recordCelestialFailure(`listing response exceeded the size cap for ${directoryUrl}`);
+        return null;
+      }
+
+      let rawText = '';
+      if (typeof res.text === 'function') rawText = await res.text();
+      else if (typeof res.json === 'function') rawText = JSON.stringify(await res.json());
+      else {
+        recordCelestialFailure(`listing response was unreadable for ${directoryUrl}`);
+        return null;
+      }
+      if (Buffer.byteLength(rawText, 'utf8') > CELESTIAL_MAX_JSON_BYTES) {
+        recordCelestialFailure(`listing response exceeded the size cap for ${directoryUrl}`);
+        return null;
+      }
+
+      let json;
+      try {
+        json = JSON.parse(rawText);
+      } catch {
+        recordCelestialFailure(`listing response was not valid JSON for ${directoryUrl}`);
+        return null;
+      }
+      const files = json?.data?.files;
+      if (!Array.isArray(files)) {
+        recordCelestialFailure(`listing response had no files array for ${directoryUrl}`);
+        return null;
+      }
+
+      let added = 0;
+      for (const entry of files) {
+        if (!entry || !isSafeCelestialName(entry.name) || seenNames.has(entry.name)) continue;
+        seenNames.add(entry.name);
+        entries.push(entry);
+        added++;
+      }
+      if (page > 0 && added === 0) {
+        hasMore = false;
+        break;
+      }
+
+      const nextToken = json.nextPageToken ?? json.data?.nextPageToken;
+      hasMore = Boolean(nextToken && nextToken !== pageToken);
+      if (!hasMore) break;
+      pageToken = nextToken;
+      pageIndex = (json.curPageIndex ?? json.data?.curPageIndex ?? pageIndex) + 1;
+    }
+
+    if (hasMore) {
+      console.warn(`   ⚠️ Celestial index listing reached the page cap for ${directoryUrl}`);
+    }
+    celestialConsecutiveFailures = 0;
+    celestialBreakerOpenedAt = 0;
+    celestialBreakerWarned = false;
+    celestialListingCache.set(directoryUrl, { ts: now, entries });
+    while (celestialListingCache.size > CELESTIAL_MAX_CACHE_ENTRIES) {
+      celestialListingCache.delete(celestialListingCache.keys().next().value);
+    }
+    return entries;
+  } catch (error) {
+    if (recoveryFatalCodeFor(error)) throw error;
+    recordCelestialFailure(`listing request failed for ${directoryUrl}: ${error.message}`);
+    return null;
+  }
+}
+
+function celestialTitleTokenSets(releaseTitle, targetEp) {
+  const titles = [releaseTitle];
+  const canonical = getCachedCanonical(releaseTitle);
+  if (canonical?.romaji) titles.push(canonical.romaji);
+  if (canonical?.english) titles.push(canonical.english);
+  const sets = [];
+  const seen = new Set();
+  for (const title of titles) {
+    const tokens = mugiNormalizeTokens(title, targetEp || '');
+    if (!tokens.length) continue;
+    const key = tokens.join(' ');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sets.push(tokens);
+  }
+  return sets;
+}
+
+function celestialFolderMatch(name, tokenSets) {
+  if (!isSafeCelestialName(name)) return null;
+  const folderTokens = mugiNormalizeTokens(name, '');
+  if (!folderTokens.length) return null;
+  for (const tokens of tokenSets) {
+    if (tokens.length === 1) {
+      if (folderTokens.length === 1 && folderTokens[0] === tokens[0]) return 'exact';
+      continue;
+    }
+    if (tokens.every(token => folderTokens.includes(token))) {
+      return folderTokens.length === tokens.length ? 'exact' : 'partial';
+    }
+  }
+  return null;
+}
+
+async function findCelestialSeriesFolder(releaseTitle, targetEp, options) {
+  const tokenSets = celestialTitleTokenSets(releaseTitle, targetEp);
+  if (!tokenSets.length) return null;
+  const root = await fetchCelestialListing(CELESTIAL_INDEX_BASE, options);
+  if (!root) return null;
+
+  const categoryUrls = new Map();
+  for (const entry of root) {
+    if (!isCelestialFolderEntry(entry)) continue;
+    const category = String(entry.name).trim();
+    if (!CELESTIAL_CATEGORY_FOLDERS.includes(category)) continue;
+    const url = celestialChildUrl(CELESTIAL_INDEX_BASE, category);
+    if (url) categoryUrls.set(category, url);
+  }
+
+  const candidates = [];
+  const seenUrls = new Set();
+  for (const category of CELESTIAL_CATEGORY_FOLDERS) {
+    const categoryUrl = categoryUrls.get(category);
+    if (!categoryUrl) continue;
+    const entries = await fetchCelestialListing(categoryUrl, options);
+    if (!entries) continue;
+    for (const entry of entries) {
+      if (!isCelestialFolderEntry(entry)) continue;
+      const match = celestialFolderMatch(entry.name, tokenSets);
+      if (!match) continue;
+      const url = celestialChildUrl(categoryUrl, entry.name);
+      if (!url || seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      candidates.push({ name: entry.name, url, category, exact: match === 'exact' });
+      if (candidates.length > 8) return null;
+    }
+  }
+
+  const exact = candidates.filter(candidate => candidate.exact);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1 || candidates.length > 1) {
+    console.warn(`   ⚠️ Celestial index: ambiguous series folders for ${logSafe(releaseTitle)}`);
+    return null;
+  }
+  return candidates[0] || null;
+}
+
+async function scanCelestialFolderTree(rootUrl, options) {
+  const queue = [{ url: rootUrl, pathNames: [], depth: 0 }];
+  const visited = new Set();
+  const files = [];
+  let foldersFetched = 0;
+
+  while (queue.length && foldersFetched < CELESTIAL_MAX_TREE_FOLDERS) {
+    const current = queue.shift();
+    if (visited.has(current.url)) continue;
+    visited.add(current.url);
+    const entries = await fetchCelestialListing(current.url, options);
+    foldersFetched++;
+    if (!entries) continue;
+
+    for (const entry of entries) {
+      if (!isSafeCelestialName(entry.name)) continue;
+      if (isCelestialFolderEntry(entry)) {
+        if (current.depth >= CELESTIAL_MAX_TREE_DEPTH) continue;
+        const childUrl = celestialChildUrl(current.url, entry.name);
+        if (childUrl && !visited.has(childUrl)) {
+          queue.push({ url: childUrl, pathNames: [...current.pathNames, entry.name], depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (/\.(?:ass|srt|zip|rar|7z|ttf|otf)$/i.test(entry.name)) {
+        files.push({ entry, directoryUrl: current.url, pathNames: current.pathNames });
+      }
+    }
+  }
+  return files;
+}
+
+function pickCelestialSubtitle(files, targetEp, batch) {
+  const candidates = files.filter(file =>
+    /\.(?:ass|srt|zip|rar|7z)$/i.test(file.entry.name) &&
+    !isPureCelestialFontName(file.entry.name) &&
+    !file.pathNames.some(isPureCelestialFontName)
+  );
+  let matched = candidates;
+  if (targetEp != null && String(targetEp) !== '') {
+    matched = candidates.filter(file => matchesEpisode(file.entry.name, String(targetEp)));
+  } else if (batch) {
+    const archives = candidates.filter(file => /\.(?:zip|rar|7z)$/i.test(file.entry.name));
+    const batchArchives = archives.filter(file => /\b\d{1,4}\s*(?:~|–|—|-)\s*\d{1,4}\b|\bbatch\b|\bcomplete\b/i.test(file.entry.name));
+    matched = batchArchives.length === 1 ? batchArchives : [];
+  } else {
+    matched = candidates.length === 1 ? candidates : [];
+  }
+  if (!matched.length) return null;
+
+  for (const extension of ['ass', 'srt', 'zip', 'rar', '7z']) {
+    const extensionMatches = matched.filter(file => new RegExp(`\\.${extension}$`, 'i').test(file.entry.name));
+    if (extensionMatches.length === 1) return extensionMatches[0];
+  }
+  return matched.length === 1 ? matched[0] : null;
+}
+
+function pickCelestialFont(files) {
+  const fonts = files.filter(file =>
+    /\.(?:zip|rar|7z|ttf|otf)$/i.test(file.entry.name) &&
+    (isPureCelestialFontName(file.entry.name) || file.pathNames.some(isPureCelestialFontName))
+  );
+  const archives = fonts.filter(file => /\.(?:zip|rar|7z)$/i.test(file.entry.name));
+  if (archives.length === 1) return archives[0];
+  if (fonts.length === 1) return fonts[0];
+  return null;
+}
+
+export async function resolveCelestialSubtitleFromIndex(releaseTitle, targetEp = null, options = {}) {
+  try {
+    if (celestialConsecutiveFailures >= CELESTIAL_BREAKER_THRESHOLD) {
+      if (Date.now() - celestialBreakerOpenedAt >= CELESTIAL_BREAKER_COOLDOWN_MS) {
+        celestialConsecutiveFailures = 0;
+        celestialBreakerOpenedAt = 0;
+        celestialBreakerWarned = false;
+      } else {
+        if (!celestialBreakerWarned) {
+          celestialBreakerWarned = true;
+          console.warn('   ⚠️ Celestial index circuit breaker open after consecutive failures; skipping resolution');
+        }
+        return null;
+      }
+    }
+    const context = { ...options, deadline: options.deadline || Date.now() + 60_000 };
+    const folder = await findCelestialSeriesFolder(releaseTitle, targetEp, context);
+    if (!folder) return null;
+    const files = await scanCelestialFolderTree(folder.url, context);
+    const subtitle = pickCelestialSubtitle(files, targetEp, options.batch === true);
+    if (!subtitle) {
+      console.warn(`   ⚠️ Celestial index: no unambiguous subtitle for ${logSafe(releaseTitle)} ep ${logSafe(targetEp ?? '')}`);
+      return null;
+    }
+    const font = pickCelestialFont(files);
+    return {
+      url: goIndexEntryUrl(subtitle.directoryUrl, subtitle.entry),
+      fontsUrl: font ? goIndexEntryUrl(font.directoryUrl, font.entry) : null,
+      fileName: subtitle.entry.name,
+      folderName: folder.name,
+      category: folder.category,
+    };
+  } catch (error) {
+    if (recoveryFatalCodeFor(error)) throw error;
+    console.warn(`   ⚠️ Celestial index resolver failed: ${logSafe(error.message)}`);
     return null;
   }
 }
@@ -838,6 +1208,20 @@ function normaliseLinkUrl(rawUrl, pageUrl) {
   }
 }
 
+function goIndexEntryUrl(directoryUrl, entry) {
+  const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
+  if (entry?.link) {
+    try {
+      const linked = new URL(entry.link, base);
+      const source = new URL(directoryUrl);
+      if (/^https?:$/i.test(linked.protocol) && linked.origin === source.origin && !linked.username && !linked.password) {
+        return linked.toString();
+      }
+    } catch { }
+  }
+  return `${base}${encodeURIComponent(entry?.name || '')}`;
+}
+
 function getLinkTarget($, el, pageUrl) {
   // Some Arabic fansub themes place the target in a data attribute or an
   // onclick handler instead of href. Support both forms used by their buttons.
@@ -867,8 +1251,6 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
   }
 
   try {
-    const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
-
     let files = [];
 
     // 1. Try application/json (Mejaow / modern GoIndex workers)
@@ -947,7 +1329,7 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
     const subFiles = files.filter(f => /\.(ass|srt|zip|rar|7z)$/i.test(f.name || ''));
     if (!subFiles.length) return null;
 
-    const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
+    const isPureFont = (name) => /(?:^|[_\s.\[\]-])fonts?(?=[_\s.\[\]-]|$)|(?:^|[_\s.\[\]-])خطوط(?=[_\s.\[\]-]|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
     const nonFontSubFiles = subFiles.filter(f => !isPureFont(f.name || ''));
     const candidateFiles = nonFontSubFiles.length > 0 ? nonFontSubFiles : subFiles;
 
@@ -975,7 +1357,7 @@ export async function resolveGoIndexSubtitle(directoryUrl, targetEp = null, { ba
       chosen = archives.length > 0 ? archives[archives.length - 1] : candidateFiles[candidateFiles.length - 1];
     }
 
-    return `${base}${encodeURIComponent(chosen.name)}`;
+    return goIndexEntryUrl(directoryUrl, chosen);
   } catch (e) {
     // F3/F4: a typed recovery refusal must never be turned into a null result.
     if (recoveryFatalCodeFor(e)) throw e;
@@ -1062,7 +1444,7 @@ export async function resolveSubtitleFromDirectory(directoryUrl, targetEp = null
 
     // m7: a BATCH directory without an episode — prefer the archive that
     // carries NO episode token (the whole batch in one archive).
-    const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
+    const isPureFont = (name) => /(?:^|[_\s.\[\]-])fonts?(?=[_\s.\[\]-]|$)|(?:^|[_\s.\[\]-])خطوط(?=[_\s.\[\]-]|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
     const nonFontCandidates = candidates.filter(u => {
       let decoded = u;
       try { decoded = decodeURIComponent(u); } catch { }
@@ -1120,8 +1502,7 @@ export async function resolveFontFromDirectory(directoryUrl, options = {}) {
     return null;
   }
 
-  const isPureFont = (name) => /(?:^|[_\s.-])fonts?(?:[_\s.-]|\.|$)|(?:^|[_\s.-])خطوط(?:[_\s.-]|\.|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
-  const base = directoryUrl.endsWith('/') ? directoryUrl : directoryUrl + '/';
+  const isPureFont = (name) => /(?:^|[_\s.\[\]-])fonts?(?=[_\s.\[\]-]|$)|(?:^|[_\s.\[\]-])خطوط(?=[_\s.\[\]-]|$)/i.test(name) && !/(?:sub|ترجم)/i.test(name);
 
   // 1. Try application/json (Mejaow / modern GoIndex workers)
   try {
@@ -1148,7 +1529,7 @@ export async function resolveFontFromDirectory(directoryUrl, options = {}) {
       }
       const files = json?.data?.files || [];
       const fontFile = files.find(f => isPureFont(f.name || '') && /\.(?:zip|rar|7z|ttf|otf)$/i.test(f.name || ''));
-      if (fontFile) return `${base}${encodeURIComponent(fontFile.name)}`;
+      if (fontFile) return goIndexEntryUrl(directoryUrl, fontFile);
     }
   } catch (e) {
     // A typed recovery refusal (e.g. a 3xx on the no-redirect path) must fail
@@ -1186,7 +1567,7 @@ export async function resolveFontFromDirectory(directoryUrl, options = {}) {
       }
       const files = json?.data?.files || [];
       const fontFile = files.find(f => isPureFont(f.name || '') && /\.(?:zip|rar|7z|ttf|otf)$/i.test(f.name || ''));
-      if (fontFile) return `${base}${encodeURIComponent(fontFile.name)}`;
+      if (fontFile) return goIndexEntryUrl(directoryUrl, fontFile);
     }
   } catch (e) {
     // A typed recovery refusal must fail fatal, not fall through.
@@ -1244,6 +1625,53 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   if (!urlAllowed) {
     console.warn(`Refusing unsafe post page URL (host ${linkHost(pageUrl) || 'unknown'})`);
     return null;
+  }
+
+  if (isCelestialHost(pageUrl)) {
+    let effectiveTitle = releaseTitle;
+    if (!effectiveTitle) {
+      const segments = pageUrl.split(/[?#]/)[0].split('/').filter(Boolean);
+      const rawSegment = segments[segments.length - 1] || '';
+      const spaced = rawSegment.replace(/[-_]/g, ' ');
+      try {
+        effectiveTitle = decodeURIComponent(spaced);
+      } catch {
+        effectiveTitle = spaced;
+      }
+    }
+    const effectiveEp = targetEp ?? (pageUrl.match(/[-_](\d{1,4})(?:\.html)?\/?(?:[?#]|$)/)?.[1] ?? null);
+    const resolved = await resolveCelestialSubtitleFromIndex(effectiveTitle, effectiveEp, {
+      redirect: options.redirect,
+      validateUrl: options.validateUrl,
+      lookup: options.lookup,
+      fetchImpl: options.fetchImpl,
+      batch: options.batch,
+    });
+    if (!resolved) {
+      console.warn(`   ⚠️ Celestial index fallback found no subtitle for ${pageUrl}`);
+      return null;
+    }
+    return {
+      title: effectiveTitle,
+      pageUrl,
+      bestDownloadUrl: resolved.url,
+      fileName: resolved.fileName,
+      source: 'celestial-index',
+      videoLinks: {
+        directSub: resolved.url,
+        fonts: resolved.fontsUrl,
+        top4top: null,
+        mediafire: null,
+        mega: null,
+        drive: null,
+        proton: null,
+        pixeldrain: null,
+        torrent: null,
+        buzzheavier: null,
+        hevc: null,
+        h264: null
+      }
+    };
   }
 
   // P1-1b: a URL that was already fetched and found to have NO download link
