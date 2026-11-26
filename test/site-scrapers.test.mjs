@@ -828,10 +828,11 @@ const CELESTIAL_WEB = `${CELESTIAL_SERIES}${encodeURIComponent('WEB')}/`;
 const CELESTIAL_SUB_SIGNED = '/download.aspx?file=Steel%20Ball%20Run%2012.ass&expiry=1893456000&mac=SUBSECRET';
 const CELESTIAL_FONT_SIGNED = '/download.aspx?file=Fonts%5Bv2%5D.zip&expiry=1893456000&mac=FONTSECRET';
 
-function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, webFiles, paginateCurrent = false } = {}) {
+function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, webFiles, paginateCurrent = false, seriesName = 'Steel Ball Run' } = {}) {
+  __resetCelestialIndexState();
   const calls = [];
   const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
-  const current = currentFiles || [folder('Steel Ball Run')];
+  const current = currentFiles || [folder(seriesName)];
   const series = seriesFiles || [
     folder('WEB'),
     { name: 'Fonts[v2].zip', mimeType: 'application/zip', link: CELESTIAL_FONT_SIGNED }
@@ -840,12 +841,13 @@ function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, 
     { name: '[Celestial] Steel Ball Run - 11.ass', mimeType: 'text/plain', link: '/download.aspx?file=11.ass&expiry=1&mac=A' },
     { name: '[Celestial] Steel Ball Run - 12.ass', mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }
   ];
+  const seriesPath = `/0:/${'الأعمال الحالية'}/${seriesName}/`;
   const listings = new Map([
     ['/0:/', [folder('الأعمال الحالية'), folder('الأعمال المكتملة')]],
     [`/0:/${'الأعمال الحالية'}/`, current],
     [`/0:/${'الأعمال المكتملة'}/`, completedFiles],
-    [`/0:/${'الأعمال الحالية'}/Steel Ball Run/`, series],
-    [`/0:/${'الأعمال الحالية'}/Steel Ball Run/WEB/`, web],
+    [seriesPath, series],
+    [`${seriesPath}WEB/`, web],
   ]);
   __setCelestialFetchImpl(async (url, opts) => {
     calls.push({ url, opts });
@@ -921,6 +923,101 @@ test('Celestial resolver prefers a unique exact folder over partial title matche
   assert.equal(result.folderName, 'Steel Ball Run');
 });
 
+test('Celestial resolver keeps Part 2 distinct from the completed base series', async () => {
+  const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
+  const seriesName = 'Chitose-kun wa Ramune Bin no Naka Part 2';
+  installCelestialStub({
+    currentFiles: [folder(seriesName)],
+    completedFiles: [folder('Chitose-kun wa Ramune Bin no Naka')],
+    seriesName,
+    seriesFiles: [folder('WEB')],
+    webFiles: [{ name: '[Celestial] Chitose-kun wa Ramune Bin no Naka Part 2 - 07.ass', mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }]
+  });
+  const result = await resolveCelestialSubtitleFromIndex(
+    '[Celestial] Chitose-kun wa Ramune Bin no Naka Part 2 – 07',
+    '7',
+    { browserFetchImpl: async () => null }
+  );
+  assert.ok(result);
+  assert.equal(result.folderName, seriesName);
+  assert.equal(result.category, 'الأعمال الحالية');
+});
+
+test('Celestial resolver treats 2nd Cour as Part 2 and keeps S2 distinct', async () => {
+  const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
+  const partSeries = 'Chitose-kun wa Ramune Bin no Naka Part 2';
+  installCelestialStub({
+    currentFiles: [folder(partSeries)],
+    completedFiles: [folder('Chitose-kun wa Ramune Bin no Naka')],
+    seriesName: partSeries,
+    seriesFiles: [folder('WEB')],
+    webFiles: [{ name: '[Celestial] Chitose-kun wa Ramune Bin no Naka Part 2 - 07.ass', mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }]
+  });
+  const courResult = await resolveCelestialSubtitleFromIndex(
+    '[Celestial] Chitose-kun wa Ramune Bin no Naka 2nd Cour – 07',
+    '7',
+    { browserFetchImpl: async () => null }
+  );
+  assert.ok(courResult);
+  assert.equal(courResult.folderName, partSeries);
+
+  const seasonSeries = 'Ao no Hako S2';
+  installCelestialStub({
+    currentFiles: [folder(seasonSeries)],
+    completedFiles: [folder('Ao no Hako')],
+    seriesName: seasonSeries,
+    seriesFiles: [folder('WEB')],
+    webFiles: [{ name: '[Celestial] Ao no Hako S2 - 07.ass', mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }]
+  });
+  const seasonResult = await resolveCelestialSubtitleFromIndex(
+    '[Celestial] Ao no Hako S2 – 07',
+    '7',
+    { browserFetchImpl: async () => null }
+  );
+  assert.ok(seasonResult);
+  assert.equal(seasonResult.folderName, seasonSeries);
+});
+
+test('Celestial resolver falls back to Chromium when the primary listing is blocked', async () => {
+  const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
+  const seriesName = 'Steel Ball Run';
+  const listings = new Map([
+    ['/0:/', [folder('الأعمال الحالية'), folder('الأعمال المكتملة')]],
+    [`/0:/${'الأعمال الحالية'}/`, [folder(seriesName)]],
+    [`/0:/${'الأعمال المكتملة'}/`, []],
+    [`/0:/${'الأعمال الحالية'}/${seriesName}/`, [folder('WEB')]],
+    [`/0:/${'الأعمال الحالية'}/${seriesName}/WEB/`, [
+      { name: '[Celestial] Steel Ball Run - 12.ass', mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }
+    ]]
+  ]);
+  let primaryCalls = 0;
+  const browserCalls = [];
+  __setCelestialFetchImpl(async () => {
+    primaryCalls++;
+    return {
+      ok: false,
+      status: 403,
+      headers: { get: () => 'text/html' },
+      body: { cancel: async () => { } },
+      text: async () => 'blocked'
+    };
+  });
+  const result = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run - 12', '12', {
+    browserFetchImpl: async (url, options) => {
+      browserCalls.push({ url, options });
+      const pathname = decodeURIComponent(new URL(url).pathname);
+      const files = listings.get(pathname);
+      if (!files) return null;
+      return { status: 200, text: JSON.stringify({ data: { files } }) };
+    }
+  });
+  assert.ok(result);
+  assert.equal(result.fileName, '[Celestial] Steel Ball Run - 12.ass');
+  assert.ok(primaryCalls > 0);
+  assert.ok(browserCalls.length >= primaryCalls);
+  assert.ok(browserCalls.every(call => ss.isCelestialIndexHost(call.url)));
+});
+
 test('Celestial resolver refuses multiple episode files when no target episode is supplied', async () => {
   installCelestialStub();
   const result = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run', null);
@@ -933,10 +1030,11 @@ test('Celestial resolver opens its circuit breaker after repeated transport fail
     calls++;
     throw new Error('network unavailable');
   });
-  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
-  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
-  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
-  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12'), null);
+  const options = { browserFetchImpl: async () => null };
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12', options), null);
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12', options), null);
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12', options), null);
+  assert.equal(await resolveCelestialSubtitleFromIndex('Steel Ball Run', '12', options), null);
   assert.equal(calls, 3, 'the fourth lookup does not hammer the unavailable index');
 });
 

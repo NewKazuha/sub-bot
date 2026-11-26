@@ -122,6 +122,95 @@ export async function fetchRenderedHtml(url, { timeoutMs = 60000 } = {}) {
   return null;
 }
 
+export async function postJsonViaBrowser(url, body, { timeoutMs = 60000, maxBytes = 2_000_000 } = {}) {
+  let page = null;
+  let label = 'request';
+  try {
+    const target = new URL(url);
+    if (target.protocol !== 'https:' && target.protocol !== 'http:') return null;
+    if (target.username || target.password) return null;
+    label = `${target.host}${target.pathname}`;
+    const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 60000);
+
+    const context = await getContext();
+    page = await context.newPage();
+    await page.goto(`${target.origin}/`, { waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - Date.now()) });
+    await page.waitForFunction(
+      () => !/just a moment|attention required/i.test(document.title),
+      null,
+      { timeout: Math.min(10_000, Math.max(1, deadline - Date.now())) }
+    ).catch(() => { });
+
+    const requestTimeoutMs = deadline - Date.now();
+    if (requestTimeoutMs <= 0) return null;
+    const result = await page.evaluate(async ({ target: requestUrl, payload, limit, timeoutMs: requestTimeout }) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(1, requestTimeout));
+      try {
+        const response = await fetch(requestUrl, {
+          method: 'POST',
+          credentials: 'same-origin',
+          redirect: 'manual',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+        const reader = response.body?.getReader();
+        const chunks = [];
+        let total = 0;
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > limit) {
+              await reader.cancel();
+              return {
+                status: response.status,
+                responseUrl: response.url,
+                contentType: response.headers.get('content-type'),
+                text: '',
+                tooLarge: true
+              };
+            }
+            chunks.push(value);
+          }
+        }
+        const bytes = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return {
+          status: response.status,
+          responseUrl: response.url,
+          contentType: response.headers.get('content-type'),
+          text: new TextDecoder().decode(bytes),
+          tooLarge: false
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    }, { target: target.toString(), payload: body, limit: maxBytes, timeoutMs: requestTimeoutMs });
+
+    if (!result || result.tooLarge) return null;
+    if (result.status < 200 || result.status >= 300) {
+      console.warn(`[browser-fetch] JSON POST failed for ${label}: HTTP ${result.status}`);
+      return null;
+    }
+    let finalUrl;
+    try { finalUrl = new URL(result.responseUrl); } catch { return null; }
+    if (finalUrl.origin !== target.origin) return null;
+    return result;
+  } catch (e) {
+    console.warn(`[browser-fetch] JSON POST failed for ${label}:`, e.message);
+    return null;
+  } finally {
+    if (page) { try { await page.close(); } catch { } }
+  }
+}
+
 /**
  * Download a file through Chromium's real download pipeline (the browser's own
  * TLS/HTTP stack with its full fingerprint, so Cloudflare lets it through).
