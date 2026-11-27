@@ -7,7 +7,7 @@ import path from 'node:path';
 // Isolation: temp cwd BEFORE importing src modules so nothing touches data/**.
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'download-redirect-guard-'));
 process.chdir(tempDir);
-const { downloadFileToDisk } = await import('../src/telegram-client.mjs');
+const { downloadFileToDisk, shouldDownloadViaBrowser } = await import('../src/telegram-client.mjs');
 
 after(() => {
   try { process.chdir(os.tmpdir()); } catch { }
@@ -153,4 +153,13 @@ test('V3-g: an async validateUrl returning false is awaited (no fail-open)', asy
   );
   assert.equal(calls, 0, 'a resolved Promise must not be treated as a truthy validation result');
   assert.equal(fs.existsSync(dest('g.bin')), false);
+});
+
+test('V3-h: browser downloads are restricted to exact provider hosts', () => {
+  assert.equal(shouldDownloadViaBrowser('https://ddl.rocks-team.net/file.ass'), true);
+  assert.equal(shouldDownloadViaBrowser('https://subs.celestial-dragons.com/download.aspx?file=x&mac=y'), true);
+  assert.equal(shouldDownloadViaBrowser('https://subs.celestial-dragons.com.evil.example/file.ass'), false);
+  assert.equal(shouldDownloadViaBrowser('https://ddl.rocks-team.net.evil.example/file.ass'), false);
+  assert.equal(shouldDownloadViaBrowser('https://example.workers.dev/file.ass'), false);
+  assert.equal(shouldDownloadViaBrowser('not a URL'), false);
 });

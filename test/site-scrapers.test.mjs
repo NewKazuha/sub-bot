@@ -828,7 +828,7 @@ const CELESTIAL_WEB = `${CELESTIAL_SERIES}${encodeURIComponent('WEB')}/`;
 const CELESTIAL_SUB_SIGNED = '/download.aspx?file=Steel%20Ball%20Run%2012.ass&expiry=1893456000&mac=SUBSECRET';
 const CELESTIAL_FONT_SIGNED = '/download.aspx?file=Fonts%5Bv2%5D.zip&expiry=1893456000&mac=FONTSECRET';
 
-function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, webFiles, paginateCurrent = false, seriesName = 'Steel Ball Run' } = {}) {
+function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, webFiles, paginateCurrent = false, paginateCompleted = false, searchFiles = [], fallbackListings = {}, seriesName = 'Steel Ball Run' } = {}) {
   __resetCelestialIndexState();
   const calls = [];
   const folder = name => ({ name, mimeType: 'application/vnd.google-apps.folder' });
@@ -853,11 +853,21 @@ function installCelestialStub({ currentFiles, completedFiles = [], seriesFiles, 
     calls.push({ url, opts });
     if (!ss.isCelestialIndexHost(url)) throw new Error(`unexpected Celestial host: ${url}`);
     const pathname = decodeURIComponent(new URL(url).pathname);
+    const body = JSON.parse(opts.body);
     let payload;
-    if (paginateCurrent && pathname === `/0:/${'الأعمال الحالية'}/`) {
-      const body = JSON.parse(opts.body);
+    if (pathname === '/0:search') {
+      payload = { nextPageToken: null, curPageIndex: 0, data: { files: searchFiles } };
+    } else if (pathname === '/0:fallback') {
+      const files = fallbackListings[body.id];
+      if (!files) throw new Error(`unexpected Celestial fallback id: ${body.id}`);
+      payload = { nextPageToken: null, curPageIndex: body.page_index, data: { files } };
+    } else if (paginateCurrent && pathname === `/0:/${'الأعمال الحالية'}/`) {
       payload = body.page_index === 0
         ? { nextPageToken: 'next-current', curPageIndex: 0, data: { files: current } }
+        : { nextPageToken: null, curPageIndex: 1, data: { files: [] } };
+    } else if (paginateCompleted && pathname === `/0:/${'الأعمال المكتملة'}/`) {
+      payload = body.page_index === 0
+        ? { nextPageToken: 'next-completed', curPageIndex: 0, data: { files: completedFiles } }
         : { nextPageToken: null, curPageIndex: 1, data: { files: [] } };
     } else {
       const files = listings.get(pathname);
@@ -889,6 +899,79 @@ test('Celestial resolver traverses current/completed folders, paginates, and ret
   const cached = await resolveCelestialSubtitleFromIndex('[Celestial] Steel Ball Run - 11', '11');
   assert.ok(cached, 'listing cache still resolves another episode');
   assert.equal(calls.length, callCount, 'reused cached directory listings');
+});
+
+test('Celestial resolver uses GoIndex search after stale category pagination', async t => {
+  const folderName = 'Meitantei Conan Movie 29 - Highway no Datenshi';
+  const subtitleName = `${folderName} [BD].ass`;
+  const warnings = [];
+  t.mock.method(console, 'warn', message => warnings.push(String(message)));
+  const { calls } = installCelestialStub({
+    currentFiles: [],
+    completedFiles: [],
+    paginateCompleted: true,
+    searchFiles: [
+      { name: folderName, id: 'encrypted-folder-a', mimeType: 'application/vnd.google-apps.folder' },
+      { name: folderName, id: 'encrypted-folder-a', mimeType: 'application/vnd.google-apps.folder' },
+      { name: folderName, id: 'encrypted-folder-b', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    fallbackListings: {
+      'encrypted-folder-a': [
+        { name: 'BD', id: 'encrypted-bd-video', mimeType: 'application/vnd.google-apps.folder' },
+        { name: 'Missing id', mimeType: 'application/vnd.google-apps.folder' },
+      ],
+      'encrypted-bd-video': [
+        { name: 'x264', id: 'encrypted-x264', mimeType: 'application/vnd.google-apps.folder' },
+      ],
+      'encrypted-x264': [
+        { name: `${folderName} [BD][1080p].mkv`, mimeType: 'video/x-matroska', link: '/download.aspx?file=movie.mkv&expiry=1&mac=A' },
+      ],
+      'encrypted-folder-b': [
+        { name: 'BD', id: 'encrypted-bd-subtitle', mimeType: 'application/vnd.google-apps.folder' },
+        { name: 'Fonts.zip', mimeType: 'application/zip', link: CELESTIAL_FONT_SIGNED },
+      ],
+      'encrypted-bd-subtitle': [
+        { name: subtitleName, mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED },
+      ],
+    },
+  });
+
+  const result = await resolveCelestialSubtitleFromIndex(folderName, null, {
+    browserFetchImpl: async () => null,
+  });
+
+  assert.ok(result, 'search fallback resolves the movie folder');
+  assert.equal(result.url, `https://subs.celestial-dragons.com${CELESTIAL_SUB_SIGNED}`);
+  assert.equal(result.fontsUrl, `https://subs.celestial-dragons.com${CELESTIAL_FONT_SIGNED}`);
+  assert.equal(result.fileName, subtitleName);
+  assert.equal(result.folderName, folderName);
+  assert.equal(result.category, 'search');
+  assert.equal(calls.filter(call => call.url === 'https://subs.celestial-dragons.com/0:fallback').length, 5,
+    'scanned both same-name folders once while ignoring video-only contents');
+  assert.ok(warnings.some(message => message.includes('pagination') && message.includes('returned no new names')),
+    'reported stale pagination');
+});
+
+test('Celestial resolver refuses same-name search folders when both contain subtitles', async () => {
+  const folderName = 'Meitantei Conan Movie 29 - Highway no Datenshi';
+  const { calls } = installCelestialStub({
+    currentFiles: [],
+    searchFiles: [
+      { name: folderName, id: 'subtitle-folder-a', mimeType: 'application/vnd.google-apps.folder' },
+      { name: folderName, id: 'subtitle-folder-b', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    fallbackListings: {
+      'subtitle-folder-a': [{ name: `${folderName} Version A.ass`, mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }],
+      'subtitle-folder-b': [{ name: `${folderName} Version B.ass`, mimeType: 'text/plain', link: CELESTIAL_SUB_SIGNED }],
+    },
+  });
+
+  const result = await resolveCelestialSubtitleFromIndex(folderName, null, {
+    browserFetchImpl: async () => null,
+  });
+
+  assert.equal(result, null, 'must not choose arbitrarily between two subtitle-bearing folders');
+  assert.equal(calls.filter(call => call.url === 'https://subs.celestial-dragons.com/0:fallback').length, 2);
 });
 
 test('scrapePostPage routes Celestial through the index without fetching the blocked blog', async () => {

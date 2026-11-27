@@ -537,6 +537,8 @@ export async function resolveMugiSubtitleFromWorker(releaseTitle, targetEp = nul
 }
 
 const CELESTIAL_INDEX_BASE = 'https://subs.celestial-dragons.com/0:/';
+const CELESTIAL_SEARCH_URL = 'https://subs.celestial-dragons.com/0:search';
+const CELESTIAL_FALLBACK_URL = 'https://subs.celestial-dragons.com/0:fallback';
 const CELESTIAL_CATEGORY_FOLDERS = ['الأعمال الحالية', 'الأعمال المكتملة'];
 const CELESTIAL_TIMEOUT_MS = 15_000;
 const CELESTIAL_LISTING_TTL_MS = 120_000;
@@ -646,6 +648,23 @@ function celestialChildUrl(parentUrl, name) {
   return `${base}${encodeURIComponent(name)}/`;
 }
 
+function celestialSearchQuery(tokenSets) {
+  for (const tokens of tokenSets) {
+    const query = tokens
+      .filter(token => !/^(?:part|season)\d{1,2}$/.test(token))
+      .join(' ')
+      .slice(0, 200)
+      .trim();
+    if (query) return query;
+  }
+  return '';
+}
+
+function isSafeCelestialFolderId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 4096 &&
+    !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 function recordCelestialFailure(message) {
   celestialConsecutiveFailures++;
   if (celestialConsecutiveFailures === CELESTIAL_BREAKER_THRESHOLD) celestialBreakerOpenedAt = Date.now();
@@ -654,7 +673,8 @@ function recordCelestialFailure(message) {
 
 async function fetchCelestialListing(directoryUrl, options = {}) {
   const now = Date.now();
-  const cached = celestialListingCache.get(directoryUrl);
+  const cacheKey = options.cacheKey || directoryUrl;
+  const cached = celestialListingCache.get(cacheKey);
   if (cached && now - cached.ts < CELESTIAL_LISTING_TTL_MS) return cached.entries;
 
   const deadline = options.deadline || Date.now() + 60_000;
@@ -663,6 +683,10 @@ async function fetchCelestialListing(directoryUrl, options = {}) {
   const lookup = options.lookup || dnsLookup;
   const fetchImpl = options.fetchImpl || celestialFetchImpl;
   const recoveryMode = isRecoveryRedirectOption(options.redirect);
+  const searchQuery = typeof options.searchQuery === 'string' ? options.searchQuery.trim() : '';
+  const folderId = typeof options.folderId === 'string' ? options.folderId : '';
+  const requestUrl = searchQuery ? CELESTIAL_SEARCH_URL : (folderId ? CELESTIAL_FALLBACK_URL : directoryUrl);
+  const label = options.label || directoryUrl;
   const entries = [];
   const seenNames = new Set();
   let pageToken = null;
@@ -673,16 +697,21 @@ async function fetchCelestialListing(directoryUrl, options = {}) {
     for (let page = 0; page < CELESTIAL_MAX_PAGES; page++) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        recordCelestialFailure(`deadline exceeded while listing ${directoryUrl}`);
+        recordCelestialFailure(`deadline exceeded while listing ${label}`);
         return null;
       }
       const body = page === 0
         ? { page_token: null, page_index: 0 }
         : { page_token: pageToken, page_index: pageIndex };
+      if (searchQuery) body.q = searchQuery;
+      if (folderId) {
+        body.id = folderId;
+        body.type = 'folder';
+      }
       let safe = null;
       try {
-        safe = await fetchSafe(directoryUrl, {
-          sourceUrl: directoryUrl,
+        safe = await fetchSafe(requestUrl, {
+          sourceUrl: requestUrl,
           method: 'POST',
           body: JSON.stringify(body),
           headers: { 'Content-Type': 'application/json' },
@@ -701,7 +730,7 @@ async function fetchCelestialListing(directoryUrl, options = {}) {
       if (res && !res.ok) {
         const status = Number(res.status) || 0;
         try { await res.body?.cancel(); } catch { }
-        console.warn(`   ⚠️ Celestial index: primary listing returned HTTP ${status} for ${directoryUrl}`);
+        console.warn(`   ⚠️ Celestial index: primary listing returned HTTP ${status} for ${label}`);
         res = null;
       }
 
@@ -710,40 +739,40 @@ async function fetchCelestialListing(directoryUrl, options = {}) {
         const declaredLength = Number(res.headers?.get?.('content-length'));
         if (Number.isFinite(declaredLength) && declaredLength > CELESTIAL_MAX_JSON_BYTES) {
           try { await res.body?.cancel(); } catch { }
-          recordCelestialFailure(`listing response exceeded the size cap for ${directoryUrl}`);
+          recordCelestialFailure(`listing response exceeded the size cap for ${label}`);
           return null;
         }
         if (typeof res.text === 'function') rawText = await res.text();
         else if (typeof res.json === 'function') rawText = JSON.stringify(await res.json());
         else {
-          recordCelestialFailure(`listing response was unreadable for ${directoryUrl}`);
+          recordCelestialFailure(`listing response was unreadable for ${label}`);
           return null;
         }
       } else {
         const browserRemaining = deadline - Date.now();
         if (browserRemaining <= 0) {
-          recordCelestialFailure(`deadline exceeded before browser fallback for ${directoryUrl}`);
+          recordCelestialFailure(`deadline exceeded before browser fallback for ${label}`);
           return null;
         }
         const browserFetchImpl = options.browserFetchImpl || postJsonViaBrowser;
-        const browserResult = await browserFetchImpl(directoryUrl, {
+        const browserResult = await browserFetchImpl(requestUrl, {
           body,
           timeoutMs: Math.min(timeoutMs, browserRemaining),
           maxBytes: CELESTIAL_MAX_JSON_BYTES,
         });
         if (!browserResult) {
-          recordCelestialFailure(`listing request failed for ${directoryUrl}`);
+          recordCelestialFailure(`listing request failed for ${label}`);
           return null;
         }
         const browserStatus = Number(browserResult.status ?? 200);
         if (browserStatus < 200 || browserStatus >= 300) {
-          recordCelestialFailure(`browser listing returned HTTP ${browserStatus} for ${directoryUrl}`);
+          recordCelestialFailure(`browser listing returned HTTP ${browserStatus} for ${label}`);
           return null;
         }
         rawText = String(browserResult.text ?? '');
       }
       if (Buffer.byteLength(rawText, 'utf8') > CELESTIAL_MAX_JSON_BYTES) {
-        recordCelestialFailure(`listing response exceeded the size cap for ${directoryUrl}`);
+        recordCelestialFailure(`listing response exceeded the size cap for ${label}`);
         return null;
       }
 
@@ -751,23 +780,28 @@ async function fetchCelestialListing(directoryUrl, options = {}) {
       try {
         json = JSON.parse(rawText);
       } catch {
-        recordCelestialFailure(`listing response was not valid JSON for ${directoryUrl}`);
+        recordCelestialFailure(`listing response was not valid JSON for ${label}`);
         return null;
       }
       const files = json?.data?.files;
       if (!Array.isArray(files)) {
-        recordCelestialFailure(`listing response had no files array for ${directoryUrl}`);
+        recordCelestialFailure(`listing response had no files array for ${label}`);
         return null;
       }
 
       let added = 0;
       for (const entry of files) {
-        if (!entry || !isSafeCelestialName(entry.name) || seenNames.has(entry.name)) continue;
-        seenNames.add(entry.name);
+        if (!entry || !isSafeCelestialName(entry.name)) continue;
+        const entryKey = isCelestialFolderEntry(entry) && isSafeCelestialFolderId(entry.id)
+          ? `id:${entry.id}`
+          : `name:${entry.name}`;
+        if (seenNames.has(entryKey)) continue;
+        seenNames.add(entryKey);
         entries.push(entry);
         added++;
       }
       if (page > 0 && added === 0) {
+        console.warn(`   ⚠️ Celestial index: pagination for ${label} returned no new names on page ${page + 1}; stopping`);
         hasMore = false;
         break;
       }
@@ -780,19 +814,19 @@ async function fetchCelestialListing(directoryUrl, options = {}) {
     }
 
     if (hasMore) {
-      console.warn(`   ⚠️ Celestial index listing reached the page cap for ${directoryUrl}`);
+      console.warn(`   ⚠️ Celestial index listing reached the page cap for ${label}`);
     }
     celestialConsecutiveFailures = 0;
     celestialBreakerOpenedAt = 0;
     celestialBreakerWarned = false;
-    celestialListingCache.set(directoryUrl, { ts: now, entries });
+    celestialListingCache.set(cacheKey, { ts: now, entries });
     while (celestialListingCache.size > CELESTIAL_MAX_CACHE_ENTRIES) {
       celestialListingCache.delete(celestialListingCache.keys().next().value);
     }
     return entries;
   } catch (error) {
     if (recoveryFatalCodeFor(error)) throw error;
-    recordCelestialFailure(`listing request failed for ${directoryUrl}: ${error.message}`);
+    recordCelestialFailure(`listing request failed for ${label}: ${error.message}`);
     return null;
   }
 }
@@ -838,11 +872,11 @@ function celestialFolderMatch(name, tokenSets) {
   return null;
 }
 
-async function findCelestialSeriesFolder(releaseTitle, targetEp, options) {
+async function findCelestialSeriesFolders(releaseTitle, targetEp, options) {
   const tokenSets = celestialTitleTokenSets(releaseTitle, targetEp);
-  if (!tokenSets.length) return null;
+  if (!tokenSets.length) return [];
   const root = await fetchCelestialListing(CELESTIAL_INDEX_BASE, options);
-  if (!root) return null;
+  if (!root) return [];
 
   const categoryUrls = new Map();
   for (const entry of root) {
@@ -855,11 +889,13 @@ async function findCelestialSeriesFolder(releaseTitle, targetEp, options) {
 
   const candidates = [];
   const seenUrls = new Set();
+  let listedCategory = false;
   for (const category of CELESTIAL_CATEGORY_FOLDERS) {
     const categoryUrl = categoryUrls.get(category);
     if (!categoryUrl) continue;
     const entries = await fetchCelestialListing(categoryUrl, options);
     if (!entries) continue;
+    listedCategory = true;
     for (const entry of entries) {
       if (!isCelestialFolderEntry(entry)) continue;
       const match = celestialFolderMatch(entry.name, tokenSets);
@@ -868,30 +904,73 @@ async function findCelestialSeriesFolder(releaseTitle, targetEp, options) {
       if (!url || seenUrls.has(url)) continue;
       seenUrls.add(url);
       candidates.push({ name: entry.name, url, category, exact: match === 'exact' });
-      if (candidates.length > 8) return null;
+      if (candidates.length > 8) return [];
+    }
+  }
+
+  if (!candidates.length && listedCategory) {
+    const query = celestialSearchQuery(tokenSets);
+    if (query) {
+      console.log(`   ℹ️ Celestial index: category listing found no series folder; trying GoIndex search for "${logSafe(query)}"`);
+      const searchEntries = await fetchCelestialListing(CELESTIAL_SEARCH_URL, {
+        ...options,
+        searchQuery: query,
+        cacheKey: `${CELESTIAL_SEARCH_URL}?q=${encodeURIComponent(query)}`,
+        label: 'Celestial search',
+      });
+      if (searchEntries) {
+        const seenFolderIds = new Set();
+        for (const entry of searchEntries) {
+          if (!isCelestialFolderEntry(entry) || !isSafeCelestialFolderId(entry.id) || seenFolderIds.has(entry.id)) continue;
+          seenFolderIds.add(entry.id);
+          const match = celestialFolderMatch(entry.name, tokenSets);
+          if (!match) continue;
+          candidates.push({
+            name: entry.name,
+            url: CELESTIAL_FALLBACK_URL,
+            folderId: entry.id,
+            category: 'search',
+            exact: match === 'exact',
+          });
+          if (candidates.length > 8) return [];
+        }
+        console.log(`   ℹ️ Celestial index: search returned ${searchEntries.length} entries and ${candidates.length} matching folder(s)`);
+      }
     }
   }
 
   const exact = candidates.filter(candidate => candidate.exact);
-  if (exact.length === 1) return exact[0];
+  if (exact.length === 1) return exact;
+  if (!exact.length && candidates.length === 1) return candidates;
+  if (exact.length > 1 && exact.every(candidate =>
+    candidate.category === 'search' && candidate.name === exact[0].name
+  )) return exact;
   if (exact.length > 1 || candidates.length > 1) {
     console.warn(`   ⚠️ Celestial index: ambiguous series folders for ${logSafe(releaseTitle)}`);
-    return null;
   }
-  return candidates[0] || null;
+  return [];
 }
 
-async function scanCelestialFolderTree(rootUrl, options) {
-  const queue = [{ url: rootUrl, pathNames: [], depth: 0 }];
+async function scanCelestialFolderTree(rootUrl, options, rootFolderId = null) {
+  const queue = [{ url: rootUrl, folderId: rootFolderId, pathNames: [], depth: 0 }];
   const visited = new Set();
   const files = [];
   let foldersFetched = 0;
 
   while (queue.length && foldersFetched < CELESTIAL_MAX_TREE_FOLDERS) {
     const current = queue.shift();
-    if (visited.has(current.url)) continue;
-    visited.add(current.url);
-    const entries = await fetchCelestialListing(current.url, options);
+    const currentKey = current.folderId ? `id:${current.folderId}` : current.url;
+    if (visited.has(currentKey)) continue;
+    visited.add(currentKey);
+    const listingOptions = current.folderId
+      ? {
+        ...options,
+        folderId: current.folderId,
+        cacheKey: `${CELESTIAL_FALLBACK_URL}#${encodeURIComponent(current.folderId)}`,
+        label: 'Celestial search folder',
+      }
+      : options;
+    const entries = await fetchCelestialListing(current.url, listingOptions);
     foldersFetched++;
     if (!entries) continue;
 
@@ -899,9 +978,12 @@ async function scanCelestialFolderTree(rootUrl, options) {
       if (!isSafeCelestialName(entry.name)) continue;
       if (isCelestialFolderEntry(entry)) {
         if (current.depth >= CELESTIAL_MAX_TREE_DEPTH) continue;
-        const childUrl = celestialChildUrl(current.url, entry.name);
-        if (childUrl && !visited.has(childUrl)) {
-          queue.push({ url: childUrl, pathNames: [...current.pathNames, entry.name], depth: current.depth + 1 });
+        if (current.folderId && !isSafeCelestialFolderId(entry.id)) continue;
+        const childFolderId = current.folderId ? entry.id : null;
+        const childUrl = current.folderId ? CELESTIAL_FALLBACK_URL : celestialChildUrl(current.url, entry.name);
+        const childKey = childFolderId ? `id:${childFolderId}` : childUrl;
+        if (childUrl && childKey && !visited.has(childKey)) {
+          queue.push({ url: childUrl, folderId: childFolderId, pathNames: [...current.pathNames, entry.name], depth: current.depth + 1 });
         }
         continue;
       }
@@ -965,22 +1047,25 @@ export async function resolveCelestialSubtitleFromIndex(releaseTitle, targetEp =
       }
     }
     const context = { ...options, deadline: options.deadline || Date.now() + 60_000 };
-    const folder = await findCelestialSeriesFolder(releaseTitle, targetEp, context);
-    if (!folder) return null;
-    const files = await scanCelestialFolderTree(folder.url, context);
-    const subtitle = pickCelestialSubtitle(files, targetEp, options.batch === true);
-    if (!subtitle) {
-      console.warn(`   ⚠️ Celestial index: no unambiguous subtitle for ${logSafe(releaseTitle)} ep ${logSafe(targetEp ?? '')}`);
-      return null;
+    const folders = await findCelestialSeriesFolders(releaseTitle, targetEp, context);
+    if (!folders.length) return null;
+    const matches = [];
+    for (const folder of folders) {
+      const files = await scanCelestialFolderTree(folder.url, context, folder.folderId || null);
+      const subtitle = pickCelestialSubtitle(files, targetEp, options.batch === true);
+      if (!subtitle) continue;
+      const font = pickCelestialFont(files);
+      matches.push({
+        url: goIndexEntryUrl(subtitle.directoryUrl, subtitle.entry),
+        fontsUrl: font ? goIndexEntryUrl(font.directoryUrl, font.entry) : null,
+        fileName: subtitle.entry.name,
+        folderName: folder.name,
+        category: folder.category,
+      });
     }
-    const font = pickCelestialFont(files);
-    return {
-      url: goIndexEntryUrl(subtitle.directoryUrl, subtitle.entry),
-      fontsUrl: font ? goIndexEntryUrl(font.directoryUrl, font.entry) : null,
-      fileName: subtitle.entry.name,
-      folderName: folder.name,
-      category: folder.category,
-    };
+    if (matches.length === 1) return matches[0];
+    console.warn(`   ⚠️ Celestial index: no unambiguous subtitle for ${logSafe(releaseTitle)} ep ${logSafe(targetEp ?? '')}`);
+    return null;
   } catch (error) {
     if (recoveryFatalCodeFor(error)) throw error;
     console.warn(`   ⚠️ Celestial index resolver failed: ${logSafe(error.message)}`);

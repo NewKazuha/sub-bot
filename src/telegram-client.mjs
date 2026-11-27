@@ -10,7 +10,7 @@ import { finished, pipeline } from 'node:stream/promises';
 import AdmZip from 'adm-zip';
 import SevenZip from '7zip-bin';
 import { CONFIG } from './config.mjs';
-import { scrapePostPage as baseScrapePostPage, resolveSubtitleFromDirectory as baseResolveSubtitleFromDirectory, resolveBuzzheavierDownloadUrl } from './site-scrapers.mjs';
+import { scrapePostPage as baseScrapePostPage, resolveSubtitleFromDirectory as baseResolveSubtitleFromDirectory, resolveBuzzheavierDownloadUrl, isCelestialIndexHost } from './site-scrapers.mjs';
 import { sendDocument, escapeHtml } from './telegram.mjs';
 import {
   findBestFileInMegaFolder,
@@ -79,6 +79,10 @@ export function isUrlHostOf(url, domain) {
   const d = String(domain || '').trim().toLowerCase().replace(/^\./, '').replace(/\.$/, '');
   if (!host || !d) return false;
   return host === d || host.endsWith(`.${d}`);
+}
+
+export function shouldDownloadViaBrowser(url) {
+  return isRocksDdlHost(url) || isCelestialIndexHost(url);
 }
 
 // Extract the FIRST URL in `text` whose hostname is one of `domains`. The
@@ -4908,8 +4912,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     // X4: a direct (non-subtitle) payload is bounded by the
                     // 4 GiB ceiling.
                     dlOptions.maxBytes = CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES;
-                    if (isRocksDdlHost(directUrl)) {
-                      // Rocks-Team DDL needs the browser's Cloudflare cookie.
+                    if (shouldDownloadViaBrowser(directUrl)) {
                       const ok = await downloadViaBrowser(directUrl, tempDest);
                       if (!ok) throw new Error('Browser download failed');
                     } else {
@@ -4922,7 +4925,12 @@ export async function checkTelegramChannels(existingClient = null) {
                         try {
                           const fontsTemp = path.join(fansubWorkDir, `fonts_${Date.now()}`);
                           console.log(`   📥 Downloading accompanying fonts bundle: ${redactUrl(pageData.videoLinks.fonts)}`);
-                          await downloadFileToDisk(pageData.videoLinks.fonts, fontsTemp, { Referer: postPageUrl });
+                          if (shouldDownloadViaBrowser(pageData.videoLinks.fonts)) {
+                            const ok = await downloadViaBrowser(pageData.videoLinks.fonts, fontsTemp);
+                            if (!ok) throw new Error('Browser font download failed');
+                          } else {
+                            await downloadFileToDisk(pageData.videoLinks.fonts, fontsTemp, { Referer: postPageUrl });
+                          }
                           if (fs.existsSync(fontsTemp)) {
                             const fontsFolder = path.join(fansubWorkDir, 'Fonts');
                             fs.mkdirSync(fontsFolder, { recursive: true });

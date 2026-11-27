@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { redactUrl } from './cloud-folders.mjs';
 
 // Rocks-Team DDL (ddl.rocks-team.net) sits behind a Cloudflare challenge that
 // rejects plain HTTP clients, so the listing must be rendered by a real browser
@@ -33,6 +34,12 @@ export function isRocksDdlHost(url) {
   } catch {
     return false;
   }
+}
+
+function redactUrlInMessage(message, url) {
+  const rawUrl = String(url ?? '');
+  if (!rawUrl) return String(message ?? '');
+  return String(message ?? '').split(rawUrl).join(redactUrl(rawUrl));
 }
 
 // Every host owned by Rocks-Team: the blog (www.rocks-team.net) and the DDL
@@ -107,18 +114,18 @@ export async function fetchRenderedHtml(url, { timeoutMs = 60000 } = {}) {
         { timeout: timeoutMs }
       );
       const html = await page.content();
-      console.log(`[browser-fetch] rendered on attempt ${attempt}/${RENDER_ATTEMPTS} for ${url}`);
+      console.log(`[browser-fetch] rendered on attempt ${attempt}/${RENDER_ATTEMPTS} for ${redactUrl(url)}`);
       return html;
     } catch (e) {
       lastError = e;
-      console.warn(`[browser-fetch] attempt ${attempt}/${RENDER_ATTEMPTS} failed for ${url}: ${e.message}`);
+      console.warn(`[browser-fetch] attempt ${attempt}/${RENDER_ATTEMPTS} failed for ${redactUrl(url)}: ${redactUrlInMessage(e.message, url)}`);
     } finally {
       if (page) {
         try { await page.close(); } catch { }
       }
     }
   }
-  console.warn(`[browser-fetch] Could not render ${url} after ${RENDER_ATTEMPTS} attempts:`, lastError?.message);
+  console.warn(`[browser-fetch] Could not render ${redactUrl(url)} after ${RENDER_ATTEMPTS} attempts:`, redactUrlInMessage(lastError?.message, url));
   return null;
 }
 
@@ -228,7 +235,7 @@ export async function downloadViaBrowser(url, destPath) {
     ]);
     const failure = await download.failure();
     if (failure) {
-      console.warn(`[browser-fetch] Download failed for ${url}: ${failure}`);
+      console.warn(`[browser-fetch] Download failed for ${redactUrl(url)}: ${failure}`);
       return false;
     }
     await download.saveAs(destPath);
@@ -239,13 +246,13 @@ export async function downloadViaBrowser(url, destPath) {
       const buf = Buffer.alloc(8);
       const { bytesRead } = await fh.read(buf, 0, 8, 0);
       if (bytesRead < 4) {
-        console.warn(`[browser-fetch] Refusing empty/truncated download for ${url}`);
+        console.warn(`[browser-fetch] Refusing empty/truncated download for ${redactUrl(url)}`);
         await fs.unlink(destPath).catch(() => {});
         return false;
       }
       const head = buf.subarray(0, bytesRead).toString('latin1').trimStart();
       if (head.startsWith('<')) {
-        console.warn(`[browser-fetch] Refusing HTML download for ${url} (starts with ${JSON.stringify(head.slice(0, 8))})`);
+        console.warn(`[browser-fetch] Refusing HTML download for ${redactUrl(url)} (starts with ${JSON.stringify(head.slice(0, 8))})`);
         await fs.unlink(destPath).catch(() => {});
         return false;
       }
@@ -254,7 +261,7 @@ export async function downloadViaBrowser(url, destPath) {
     }
     return true;
   } catch (e) {
-    console.warn(`[browser-fetch] Browser download failed for ${url}:`, e.message);
+    console.warn(`[browser-fetch] Browser download failed for ${redactUrl(url)}:`, redactUrlInMessage(e.message, url));
     return false;
   } finally {
     if (page) { try { await page.close(); } catch { } }
