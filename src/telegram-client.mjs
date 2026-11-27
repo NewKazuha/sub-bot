@@ -18,15 +18,21 @@ import {
   downloadMegaFolderRelease,
   downloadDriveFolderRelease,
   downloadGoogleDriveFileToDisk,
+  listDriveFolder,
   tryBundleMatchingFonts,
   isDriveFolderUrl,
   findBestFileInMediafire,
   findBestFileInDrive,
+  findBestFileInPcloud,
+  downloadPcloudEntryToDisk,
+  downloadPcloudFolderRelease,
+  isPcloudPublinkUrl,
   resolveMediafireDirectDownload,
   extractExplicitEpisodeRange,
   orderCloudSources,
   listingOffersSubtitles,
   listCloudFolderFiles,
+  readResponseTextCapped,
   cloudKindOfUrl,
   isProviderHostUrl,
   SUBTITLE_FILE_RE,
@@ -41,7 +47,8 @@ import {
   isCloudCapError,
   isCloudCapCooldownActive,
   markCloudCapCooldown,
-  CLOUD_CAP_LIMITS
+  CLOUD_CAP_LIMITS,
+  CLOUD_LISTING_MAX_BYTES
 } from './cloud-folders.mjs';
 import { safeRemoteBaseName, isInsideDir } from './path-safety.mjs';
 import { downloadViaBrowser, isRocksDdlHost } from './browser-fetch.mjs';
@@ -2134,6 +2141,18 @@ export function formatCleanCaption(title, isZip = false, isOfficial = false, has
   return clean;
 }
 
+function trimTruncatedTitlePart(text, maxLen) {
+  if (text.length <= maxLen) return text;
+  let sliced = text.slice(0, maxLen);
+  if (/[A-Za-z0-9\p{L}]$/u.test(sliced) && /^[A-Za-z0-9\p{L}]/u.test(text.slice(maxLen))) {
+    const lastSep = Math.max(sliced.lastIndexOf(' '), sliced.lastIndexOf('-'));
+    if (lastSep >= Math.floor(maxLen * 0.5)) {
+      sliced = sliced.slice(0, lastSep);
+    }
+  }
+  return sliced.replace(/[\s\-–—_.,:;~+]+$/u, '').trim();
+}
+
 export function getSafeTelegramFileName(name, ext = '.ass') {
   let clean = stripEmojisAndDecorations(sanitizeBrokenChars(name))
     // M2: the C0 control characters (NUL, ESC, …) can never reach a
@@ -2143,7 +2162,7 @@ export function getSafeTelegramFileName(name, ext = '.ass') {
     .replace(/[\p{Extended_Pictographic}\u2600-\u26FF\u2700-\u27BF\u25A0-\u25FF\u{1F1E6}-\u{1F1FF}✦✧★☆✪✵✹✸✷✶◆◇■□▲▼▶◀●○•※⚜〽][\uFE00-\uFE0F\u200D\u{1F3FB}-\u{1F3FF}]*/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
-  const maxBaseLen = 55 - ext.length;
+  const maxBaseLen = 72 - ext.length;
 
   if (clean.length > maxBaseLen) {
     const prefixMatch = clean.match(/^(\[[^\]]+\]\s*)/);
@@ -2156,9 +2175,10 @@ export function getSafeTelegramFileName(name, ext = '.ass') {
 
     const targetMiddleLen = maxBaseLen - prefix.length - suffix.length;
     if (targetMiddleLen > 5) {
-      clean = `${prefix}${middle.slice(0, targetMiddleLen).trim()}${suffix}`;
+      const shortenedMiddle = trimTruncatedTitlePart(middle, targetMiddleLen);
+      clean = `${prefix}${shortenedMiddle}${suffix}`;
     } else {
-      clean = clean.slice(0, maxBaseLen).trim();
+      clean = trimTruncatedTitlePart(clean, maxBaseLen);
     }
   }
 
@@ -3401,7 +3421,7 @@ export async function buildPostCloudSources(videoLinks = {}, options = {}) {
   const vl = videoLinks || {};
 
   // m12: a post without any cloud link is not inspected at all.
-  if (!vl.mediafire && !vl.mega && !vl.drive && !vl.directSub) return [];
+  if (!vl.mediafire && !vl.mega && !vl.drive && !vl.pcloud && !vl.directSub) return [];
 
   const candidates = [];
   const add = (kind, url, offersSubtitles = false) => {
@@ -3427,7 +3447,7 @@ export async function buildPostCloudSources(videoLinks = {}, options = {}) {
   // X3: the provider of a field is decided by its HOSTNAME — a field that
   // points somewhere else (a hostile link that merely mentions
   // "mediafire.com") is DROPPED instead of being fetched server-side.
-  for (const [kind, value] of [['mediafire', vl.mediafire], ['mega', vl.mega], ['drive', vl.drive]]) {
+  for (const [kind, value] of [['mediafire', vl.mediafire], ['mega', vl.mega], ['drive', vl.drive], ['pcloud', vl.pcloud]]) {
     if (!value) continue;
     if (!isProviderHostUrl(value, kind)) {
       console.warn(`   ⚠️ ${kind} link ignored: it is not hosted by ${kind} (${redactUrl(value)})`);
@@ -3475,6 +3495,7 @@ export async function downloadCloudSubtitleSelection(selection, destDir, referer
   const {
     downloadNode = downloadMegaNode,
     downloadFile = downloadFileToDisk,
+    downloadPcloud = downloadPcloudEntryToDisk,
     packFolder = packFolderToZip,
   } = options || {};
 
@@ -3507,6 +3528,7 @@ export async function downloadCloudSubtitleSelection(selection, destDir, referer
     try {
       if (single.node) await downloadNode(single.node, dest, destDir, { maxBytes });
       else if (single.directUrl) await downloadFile(single.directUrl, dest, { Referer: referer }, { maxBytes });
+      else if (single.fileid != null && single.code) await downloadPcloud(single, dest, { maxBytes });
       else return null;
     } catch (e) {
       // The partial file NEVER survives a failed download (M7).
@@ -3538,7 +3560,8 @@ export async function downloadCloudSubtitleSelection(selection, destDir, referer
     await mapWithConcurrency(targets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
       const f = t.file;
       if (f.node) await downloadNode(f.node, t.dest, unpackDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-      else await downloadFile(f.directUrl, t.dest, { Referer: referer }, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+      else if (f.directUrl) await downloadFile(f.directUrl, t.dest, { Referer: referer }, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+      else if (f.fileid != null && f.code) await downloadPcloud(f, t.dest, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
     });
     // C7c: the listing of a direct-URL source carries no reliable size, so
     // the batch total is checked AFTER the download (a stat of the files).
@@ -3563,6 +3586,273 @@ export async function downloadCloudSubtitleSelection(selection, destDir, referer
     // not on a failure in the middle of the loop.
     try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch { }
   }
+}
+
+// ====================================================================
+// Erai-Raws Nyaa Arabic fallback (handles delayed HEVC Arabic re-uploads)
+// ====================================================================
+
+const ERAI_NON_ARABIC_COOLDOWN_MS = 15 * 60 * 1000;
+const ERAI_NON_ARABIC_MAX_AGE_SEC = 48 * 60 * 60;
+const ERAI_NON_ARABIC_MAX_COOLDOWN_ENTRIES = 500;
+const ERAI_ARABIC_DESC_RE = /(?:^|[^a-z])arabic(?=$|[^a-z])|العربية|عربي|عربى|🇸🇦/i;
+const eraiNonArabicCooldowns = new Map();
+
+function pruneEraiNonArabicCooldowns(now) {
+  for (const [key, until] of eraiNonArabicCooldowns) {
+    if (now >= until) eraiNonArabicCooldowns.delete(key);
+  }
+}
+
+export function isEraiNonArabicCooldownActive(msgKey, now = Date.now()) {
+  const until = eraiNonArabicCooldowns.get(msgKey);
+  if (!until) return false;
+  if (now >= until) {
+    eraiNonArabicCooldowns.delete(msgKey);
+    return false;
+  }
+  return true;
+}
+
+export function markEraiNonArabicCooldown(msgKey, now = Date.now()) {
+  pruneEraiNonArabicCooldowns(now);
+  eraiNonArabicCooldowns.delete(msgKey);
+  eraiNonArabicCooldowns.set(msgKey, now + ERAI_NON_ARABIC_COOLDOWN_MS);
+  while (eraiNonArabicCooldowns.size > ERAI_NON_ARABIC_MAX_COOLDOWN_ENTRIES) {
+    const oldest = eraiNonArabicCooldowns.keys().next().value;
+    if (oldest === undefined) break;
+    eraiNonArabicCooldowns.delete(oldest);
+  }
+}
+
+export function __resetEraiNonArabicCooldowns() {
+  for (const key of [...eraiNonArabicCooldowns.keys()]) {
+    eraiNonArabicCooldowns.delete(key);
+  }
+}
+
+function stripEraiBracketTags(raw) {
+  return String(raw || '')
+    .replace(/^\s*\[?\s*erai-?raws\s*\]?\s*/i, '')
+    .replace(/\s*\.(?:mkv|mp4|ass|torrent)\s*$/i, '')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\([^)]*(?:1080p|720p|480p|hevc|avc|x264|x265|aac|flac|web|cr|amzn|nf|hidive|multiple|subtitle|dual)[^)]*\)/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeEraiSeriesStem(core) {
+  return String(core || '')
+    .replace(/\s*(?:-|–|~)\s*\d{1,4}(?:\s*[~-]\s*\d{1,4})?(?:\s*v\d+)?\s*$/i, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .toLowerCase()
+    .trim();
+}
+
+function canonicalNyaaViewUrl(raw) {
+  try {
+    const parsed = new URL(String(raw || ''));
+    if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'nyaa.si') return null;
+    const match = parsed.pathname.match(/^\/view\/(\d+)\/?$/);
+    return match ? `https://nyaa.si/view/${match[1]}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Queries Nyaa RSS for a matching `[Erai-raws]` release whose view description
+ * lists Arabic subtitles (for when AVC omitted CR_Arabic and HEVC adds it later).
+ */
+export async function resolveEraiArabicFallbackFromNyaa(eraiData, options = {}) {
+  const { fetchFn = null, recovery = false, maxViewChecks = 3 } = options || {};
+  if (!eraiData || !eraiData.title) return null;
+
+  const targetCore = stripEraiBracketTags(eraiData.title);
+  if (!targetCore) return null;
+  const targetBatch = extractBatchRange(targetCore);
+  const targetEp = targetBatch ? '' : extractEpisodeNumber(targetCore);
+  const targetStem = normalizeEraiSeriesStem(targetCore);
+  if (!targetStem) return null;
+
+  const fetchTextSafe = async (url) => {
+    if (fetchFn) {
+      const res = await fetchFn(url, { headers: { 'User-Agent': 'AnimeSubBot/1.0' } });
+      if (!res || !res.ok) return null;
+      return await readResponseTextCapped(res, CLOUD_LISTING_MAX_BYTES);
+    }
+    const safe = await fetchSafe(url, {
+      sourceUrl: url,
+      initialValidator: isStaticSafeUrl,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AnimeSubBot/1.0)' },
+      timeoutMs: 8_000,
+      recovery,
+    });
+    const res = safe?.response;
+    if (!res || !res.ok) return null;
+    return await readResponseTextCapped(res, CLOUD_LISTING_MAX_BYTES);
+  };
+
+  const rssUrl = `https://nyaa.si/?page=rss&c=1_2&q=${encodeURIComponent(`[Erai-raws] ${targetCore}`)}`;
+  let rssXml;
+  try {
+    rssXml = await fetchTextSafe(rssUrl);
+  } catch {
+    return null;
+  }
+  if (!rssXml) return null;
+
+  const $rss = cheerio.load(rssXml, { xmlMode: true });
+  const currentViewUrl = canonicalNyaaViewUrl(eraiData.nyaaUrl);
+  const candidates = [];
+  $rss('item').each((_, el) => {
+    const itemTitle = $rss(el).find('title').first().text().trim();
+    const rawLink = $rss(el).find('link').first().text().trim();
+    const rawGuid = $rss(el).find('guid').first().text().trim();
+    if (!/\[erai-?raws\]/i.test(itemTitle)) return;
+
+    const candCore = stripEraiBracketTags(itemTitle);
+    const candBatch = extractBatchRange(candCore);
+    const candEp = candBatch ? '' : extractEpisodeNumber(candCore);
+    const candStem = normalizeEraiSeriesStem(candCore);
+    if (!candStem || candStem !== targetStem) return;
+    if (targetBatch) {
+      if (!candBatch || candBatch[0] !== targetBatch[0] || candBatch[1] !== targetBatch[1]) return;
+    } else if (candBatch) {
+      return;
+    } else if (targetEp) {
+      if (candEp !== targetEp) return;
+    } else if (candEp) {
+      return;
+    }
+
+    const viewUrl = canonicalNyaaViewUrl(rawGuid) || canonicalNyaaViewUrl(rawLink);
+    if (!viewUrl) return;
+    const torrentCandidate = rawLink.includes('.torrent') ? rawLink : '';
+    if (!torrentCandidate || !isUrlHostOf(torrentCandidate, 'nyaa.si')) return;
+    try {
+      validateTorrentUrl(torrentCandidate, { recovery });
+    } catch {
+      return;
+    }
+    candidates.push({
+      title: itemTitle,
+      viewUrl,
+      torrentUrl: torrentCandidate,
+      isCurrent: Boolean(currentViewUrl && viewUrl === currentViewUrl),
+    });
+  });
+
+  // Check alternate releases (e.g. HEVC uploaded later) before re-checking the original view
+  const ordered = candidates.sort((a, b) => Number(a.isCurrent) - Number(b.isCurrent)).slice(0, maxViewChecks);
+  for (const cand of ordered) {
+    try {
+      const html = await fetchTextSafe(cand.viewUrl);
+      if (!html) continue;
+      const $view = cheerio.load(html);
+      const desc = $view('#torrent-description').text() || '';
+      if (ERAI_ARABIC_DESC_RE.test(desc)) {
+        return {
+          torrentUrl: cand.torrentUrl,
+          nyaaUrl: cand.viewUrl,
+          title: cand.title,
+        };
+      }
+    } catch { }
+  }
+  return null;
+}
+
+const FONT_FILE_EXT_RE = /\.(ttf|otf|woff2?|ttc)$/i;
+
+/**
+ * Re-downloads a cloud release with skipFonts and attaches only the matched fonts
+ * referenced by the downloaded subtitles (supporting both folder fonts and separate Drive fonts URLs).
+ */
+async function resolveCloudSeriesFontFallback(ref, { fansubWorkDir, titleLine, fontsUrl }) {
+  const isBatch = isCollectionTitle(titleLine);
+  const listingFonts = Array.isArray(ref.listing)
+    ? ref.listing.filter(f => FONT_FILE_EXT_RE.test(f.name || ''))
+    : [];
+
+  if (ref.source.kind === 'mega') {
+    const megaRelease = await downloadMegaFolderRelease(
+      ref.source.url,
+      fansubWorkDir,
+      ref.targetEp,
+      { rawTitle: titleLine, listedFiles: ref.listing, batch: isBatch, skipFonts: true }
+    );
+    if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
+      return await tryBundleMatchingFonts(
+        megaRelease.filePath,
+        listingFonts,
+        fansubWorkDir,
+        async (font, dest, dir) => {
+          if (font.node) {
+            await downloadMegaNode(font.node, dest, dir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+          }
+        }
+      );
+    }
+    return null;
+  }
+
+  if (ref.source.kind === 'drive') {
+    const driveRelease = await downloadDriveFolderRelease(
+      ref.source.url,
+      fansubWorkDir,
+      ref.targetEp,
+      null,
+      titleLine,
+      { listedFiles: ref.listing, batch: isBatch, skipFonts: true }
+    );
+    if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
+      const fontFiles = [...listingFonts];
+      if (fontsUrl && isDriveFolderUrl(fontsUrl)) {
+        try {
+          const extraFonts = await listDriveFolder(fontsUrl);
+          for (const f of extraFonts) {
+            if (FONT_FILE_EXT_RE.test(f.name || '')) fontFiles.push(f);
+          }
+        } catch (e) {
+          console.warn(`   ⚠️ Separate Drive fonts listing failed during fallback: ${logSafe(e && e.message)}`);
+        }
+      }
+      return await tryBundleMatchingFonts(
+        driveRelease.filePath,
+        fontFiles,
+        fansubWorkDir,
+        async (font, dest) => {
+          if (font.id) {
+            await downloadGoogleDriveFileToDisk(font.id, dest, font.name, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+          }
+        }
+      );
+    }
+    return null;
+  }
+
+  if (ref.source.kind === 'pcloud') {
+    const pcloudRelease = await downloadPcloudFolderRelease(
+      ref.source.url,
+      fansubWorkDir,
+      ref.targetEp,
+      { rawTitle: titleLine, listedFiles: ref.listing, batch: isBatch, skipFonts: true }
+    );
+    if (pcloudRelease && pcloudRelease.filePath && fs.existsSync(pcloudRelease.filePath)) {
+      return await tryBundleMatchingFonts(
+        pcloudRelease.filePath,
+        listingFonts,
+        fansubWorkDir,
+        async (font, dest) => {
+          if (font.code) {
+            await downloadPcloudEntryToDisk(font, dest, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+          }
+        }
+      );
+    }
+  }
+  return null;
 }
 
 // ====================================================================
@@ -3835,8 +4125,9 @@ export async function checkTelegramChannels(existingClient = null) {
         console.log(`\n🔍 Checking: "${chat.title}" (ID: ${chat.id})`);
         // Sources can publish a batch far larger than one scheduled interval.
         // Keep enough history to retry a failed batch instead of losing it once
-        // newer messages push it beyond the old 15-message window.
-        const windowMsgs = await client.getMessages(chat.id, { limit: 15 });
+        // newer messages push it beyond the old 15-message window (wider for
+        // Erai-Raws where Arabic subtitles often appear hours later via HEVC).
+        const windowMsgs = await client.getMessages(chat.id, { limit: isErai ? 25 : 15 });
         const chatRecoveryTasks = recoveryTasks.filter(t => String(t.chatId) === idStr);
         const { msgs, fatal: recoveryFatal } = await withRecoveryMessages({
           chat, windowMsgs, posted, tasks: chatRecoveryTasks, fetchByIds, log: recoveryLog,
@@ -3866,21 +4157,53 @@ export async function checkTelegramChannels(existingClient = null) {
           // SOURCE 1: Erai-Raws (Official Subtitles via Torrent - Strictly .ass)
           // ==============================================================
           if (isErai) {
-            const eraiData = parseEraiMessage(msg);
+            let eraiData = parseEraiMessage(msg);
             if (!eraiData) {
               countSkipped(msgKey); // unparsable message
-              continue;
-            }
-
-            if (!eraiData.hasArabic) {
-              countSkipped(msgKey); // non-Arabic release
-              markReleaseAsPosted(posted, msgKey);
               continue;
             }
 
             const formattedTitle = eraiData.title.startsWith(`[${eraiData.sourceName}]`)
               ? eraiData.title
               : (eraiData.title.startsWith('[') ? eraiData.title : `[${eraiData.sourceName}] ${eraiData.title}`);
+
+            if (!eraiData.hasArabic) {
+              const quickPhase1 = computeReleaseKeySet(formattedTitle, { isOfficial: true });
+              if (isReleaseAlreadyPostedOrDispatched(posted, quickPhase1.keys, { season: quickPhase1.season })) {
+                markReleaseAsKnown(posted, msgKey, quickPhase1.keys, { season: quickPhase1.season });
+                countSkipped(msgKey);
+                continue;
+              }
+              const msgDateSec = Number(msg.date);
+              const ageSec = Number.isFinite(msgDateSec) && msgDateSec > 0
+                ? Math.max(0, Math.floor(Date.now() / 1000) - msgDateSec)
+                : 0;
+              let resolvedFallback = null;
+              if (!isEraiNonArabicCooldownActive(msgKey)) {
+                resolvedFallback = await resolveEraiArabicFallbackFromNyaa(eraiData, { recovery: isRecoveryMessage(msg) });
+                if (!resolvedFallback?.torrentUrl) {
+                  markEraiNonArabicCooldown(msgKey);
+                }
+              }
+              if (resolvedFallback?.torrentUrl) {
+                eraiData = {
+                  ...eraiData,
+                  hasArabic: true,
+                  torrentUrl: resolvedFallback.torrentUrl,
+                  nyaaUrl: resolvedFallback.nyaaUrl || eraiData.nyaaUrl,
+                };
+                console.log(`   ✨ [Erai-Raws] Arabic subtitle detected via Nyaa fallback for "${logSafe(formattedTitle)}"!`);
+              } else {
+                // Only permanently retire non-Arabic messages after 48h; fresher
+                // announcements remain retryable in case HEVC adds Arabic later.
+                if (ageSec >= ERAI_NON_ARABIC_MAX_AGE_SEC) {
+                  markReleaseAsPosted(posted, msgKey);
+                }
+                countSkipped(msgKey);
+                continue;
+              }
+            }
+
             const eraiResolved = await resolveCanonicalTitle(formattedTitle);
             const phase1 = computeReleaseKeySet(formattedTitle, { isOfficial: true, resolved: eraiResolved });
 
@@ -4886,6 +5209,7 @@ export async function checkTelegramChannels(existingClient = null) {
 
               try {
                 let downloadedFilePath = null;
+                let downloadedVideoSource = null;
 
                 // 1. Direct or Top4Top download
                 let directUrl = pageData.videoLinks?.directSub || (/\.(ass|srt|zip|rar|7z)$/i.test(pageData.bestDownloadUrl) ? pageData.bestDownloadUrl : null);
@@ -4904,7 +5228,8 @@ export async function checkTelegramChannels(existingClient = null) {
                 // Skip folder URLs from direct single-file HTTP download
                 // (hostname-based: "mega.nz" in a query is not a Mega folder).
                 if (directUrl && !isDriveFolderUrl(directUrl) &&
-                    !isUrlHostOf(directUrl, 'mega.nz') && !isUrlHostOf(directUrl, 'mega.co.nz')) {
+                    !isUrlHostOf(directUrl, 'mega.nz') && !isUrlHostOf(directUrl, 'mega.co.nz') &&
+                    !isPcloudPublinkUrl(directUrl)) {
                   try {
                     console.log(`   📥 Direct download: ${redactUrl(directUrl)}`);
                     const tempDest = path.join(fansubWorkDir, `direct_${Date.now()}`);
@@ -4921,7 +5246,7 @@ export async function checkTelegramChannels(existingClient = null) {
                     if (fs.existsSync(tempDest)) {
                       downloadedFilePath = tempDest;
                       const magic = validateFileMagic(tempDest);
-                      if (magic && !magic.isArchive && pageData.videoLinks?.fonts) {
+                      if (magic && !magic.isArchive && pageData.videoLinks?.fonts && !isDriveFolderUrl(pageData.videoLinks.fonts)) {
                         try {
                           const fontsTemp = path.join(fansubWorkDir, `fonts_${Date.now()}`);
                           console.log(`   📥 Downloading accompanying fonts bundle: ${redactUrl(pageData.videoLinks.fonts)}`);
@@ -4984,36 +5309,66 @@ export async function checkTelegramChannels(existingClient = null) {
                   }
                 }
 
-                // 2-4. Cloud sources (Mediafire / Mega / Google Drive).
+                // 2-4. Cloud sources (Mediafire / Mega / Google Drive / pCloud).
                 //      F2c: a SUBTITLE-bearing source is tried BEFORE a video
                 //      source — the subtitles are ~100x lighter and a folder of
-                //      them can be published whole as ONE package, while a
-                //      folder of videos can only be published one episode at a
-                //      time (the production log picked the Mega MKV folder and
-                //      published episode 001 only).
-                //      F2d: a multi-subtitle selection is packed into ONE release.
-                //      M1: the listing of every source is carried by the source
-                //      (the folder is NOT listed a second time) — and the cloud
-                //      resolution is skipped entirely when the file is already
-                //      downloaded.
+                //      them can be published whole as ONE package.
+                //      When a subtitle source overflows MAX_FILES only because
+                //      of fonts (fontOverflow / SERIES_FOLDER_BATCH), its
+                //      selective-font fallback runs BEFORE any video-only source.
                 const cloudSources = downloadedFilePath ? [] : await buildPostCloudSources(pageData.videoLinks);
-                // M4: only an EXPLICIT episode range narrows a cloud folder — a
-                // title with a single episode number never narrows a
-                // multi-episode folder (m9).
                 const titleEps = extractExplicitEpisodeRange(titleLine || '');
-                const CLOUD_LABEL = { mediafire: 'Mediafire', mega: 'Mega', drive: 'Google Drive' };
+                const CLOUD_LABEL = { mediafire: 'Mediafire', mega: 'Mega', drive: 'Google Drive', pcloud: 'pCloud' };
                 const seriesFolderRefusals = [];
+                const runPendingSeriesFallbacks = async () => {
+                  for (const ref of seriesFolderRefusals) {
+                    if (downloadedFilePath) break;
+                    if (ref.fallbackTried) continue;
+                    ref.fallbackTried = true;
+                    console.log(`   🔄 Fallback: downloading subtitle package with selective fonts from ${ref.sourceLabel}...`);
+                    let fallbackCapHandled = false;
+                    try {
+                      const resultPath = await resolveCloudSeriesFontFallback(ref, {
+                        fansubWorkDir,
+                        titleLine,
+                        fontsUrl: pageData.videoLinks?.fonts,
+                      });
+                      if (resultPath && fs.existsSync(resultPath)) {
+                        downloadedFilePath = resultPath;
+                      }
+                    } catch (fbErr) {
+                      console.warn(`   ⚠️ ${ref.sourceLabel} fallback failed: ${logSafe(fbErr && fbErr.message)}`);
+                      if (ref.fontOverflow) {
+                        handleCloudCapRefusal(isCloudCapError(fbErr) ? fbErr : ref.error, {
+                          kind: ref.source.kind,
+                          url: ref.source.url,
+                          label: ref.sourceLabel,
+                        });
+                        fallbackCapHandled = true;
+                      }
+                    }
+                    if (!downloadedFilePath && ref.fontOverflow && !fallbackCapHandled) {
+                      handleCloudCapRefusal(ref.error, {
+                        kind: ref.source.kind,
+                        url: ref.source.url,
+                        label: ref.sourceLabel,
+                      });
+                    }
+                  }
+                };
+
                 for (const source of cloudSources) {
                   if (downloadedFilePath) break;
+                  if (!source.offersSubtitles && seriesFolderRefusals.some(r => !r.fallbackTried)) {
+                    await runPendingSeriesFallbacks();
+                    if (downloadedFilePath) break;
+                  }
                   const sourceLabel = CLOUD_LABEL[source.kind] || source.kind;
-                  // M6: a source that already refused a cap is in cooldown
-                  // (6 h) — it is not retried on every cycle.
+                  // M6: a source that already refused a cap is in cooldown (6 h)
                   if (isCloudCapCooldownActive(source.kind, source.url)) {
                     console.warn(`   ⏳ ${sourceLabel} skipped: a cap refusal is in cooldown for ${redactUrl(source.url)}`);
                     continue;
                   }
-                  // The listing of the source (M1) — it is passed to the
-                  // downloader so the folder is listed ONCE per post.
                   const listing = (Array.isArray(source.listing) && source.listing.length > 0) ? source.listing : null;
                   console.log(`   📥 Resolving ${sourceLabel}: ${redactUrl(source.url)}`);
                   try {
@@ -5024,10 +5379,10 @@ export async function checkTelegramChannels(existingClient = null) {
                           const mfLabel = mfBest.name || `${mfBest.files.length} subtitle(s)`;
                           console.log(`   📥 Downloading from Mediafire (${mfBest.type}): ${logSafe(mfLabel)}`);
                           downloadedFilePath = await downloadCloudSubtitleSelection(mfBest, fansubWorkDir, postPageUrl);
+                          if (downloadedFilePath && mfBest.type === 'mkv') {
+                            downloadedVideoSource = { kind: source.kind, url: source.url, label: sourceLabel };
+                          }
                         } else {
-                          // DEFERRED — the media tools are missing, so the release
-                          // is postponed (never a failure) and is NOT marked as
-                          // posted, so it is retried once the tools exist.
                           countDeferred(msgKey);
                           console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
                         }
@@ -5036,6 +5391,9 @@ export async function checkTelegramChannels(existingClient = null) {
                       const megaRelease = await downloadMegaFolderRelease(source.url, fansubWorkDir, targetEp, { rawTitle: titleLine, listedFiles: listing, batch: isCollectionTitle(titleLine) });
                       if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
                         downloadedFilePath = megaRelease.filePath;
+                        if (megaRelease.type === 'mkv') {
+                          downloadedVideoSource = { kind: source.kind, url: source.url, label: sourceLabel };
+                        }
                       }
                     } else if (source.kind === 'drive') {
                       if (isDriveFolderUrl(source.url)) {
@@ -5049,6 +5407,9 @@ export async function checkTelegramChannels(existingClient = null) {
                         );
                         if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
                           downloadedFilePath = driveRelease.filePath;
+                          if (driveRelease.type === 'mkv') {
+                            downloadedVideoSource = { kind: source.kind, url: source.url, label: sourceLabel };
+                          }
                         }
                       }
 
@@ -5059,92 +5420,54 @@ export async function checkTelegramChannels(existingClient = null) {
                             const driveLabel = driveBest.name || `${driveBest.files.length} subtitle(s)`;
                             console.log(`   📥 Downloading from Drive (${driveBest.type}): ${logSafe(driveLabel)}`);
                             downloadedFilePath = await downloadCloudSubtitleSelection(driveBest, fansubWorkDir, postPageUrl);
+                            if (downloadedFilePath && driveBest.type === 'mkv') {
+                              downloadedVideoSource = { kind: source.kind, url: source.url, label: sourceLabel };
+                            }
                           } else {
-                            // DEFERRED — tools missing; NOT marked as posted.
                             countDeferred(msgKey);
                             console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
                           }
                         }
                       }
+                    } else if (source.kind === 'pcloud') {
+                      const pcloudRelease = await downloadPcloudFolderRelease(
+                        source.url,
+                        fansubWorkDir,
+                        targetEp,
+                        { rawTitle: titleLine, listedFiles: listing, batch: isCollectionTitle(titleLine) }
+                      );
+                      if (pcloudRelease && pcloudRelease.filePath && fs.existsSync(pcloudRelease.filePath)) {
+                        downloadedFilePath = pcloudRelease.filePath;
+                        if (pcloudRelease.type === 'mkv') {
+                          downloadedVideoSource = { kind: source.kind, url: source.url, label: sourceLabel };
+                        }
+                      }
                     }
                   } catch (e) {
-                    // M6: a cap refusal is a REFUSAL, not a soft failure: the
-                    // source goes into a 6 h cooldown (the key carries the
-                    // REDACTED url — a Mega key never ends up in a log), EXCEPT
-                    // for a SERIES_FOLDER_BATCH refusal — there the loop simply
-                    // continues to the next source. No state key is written,
-                    // so the message ends `skipped` via the safety net below.
-                    if (e && e.code === 'SERIES_FOLDER_BATCH') {
-                      seriesFolderRefusals.push({ source, targetEp, listing, sourceLabel });
+                    if (e && (e.code === 'SERIES_FOLDER_BATCH' || (e.code === 'TOO_MANY_FILES' && e.fontOverflow))) {
+                      const isFontOverflow = Boolean(e.code === 'TOO_MANY_FILES' && e.fontOverflow);
+                      seriesFolderRefusals.push({
+                        source,
+                        targetEp,
+                        listing,
+                        sourceLabel,
+                        error: e,
+                        fontOverflow: isFontOverflow,
+                        fallbackTried: false,
+                      });
+                      if (!isFontOverflow) {
+                        handleCloudCapRefusal(e, { kind: source.kind, url: source.url, label: sourceLabel });
+                      } else {
+                        console.warn(`   ⚠️ ${sourceLabel} font cap overflow (${logSafe(e.message)}) — queued for selective font fallback.`);
+                      }
+                    } else {
+                      handleCloudCapRefusal(e, { kind: source.kind, url: source.url, label: sourceLabel });
                     }
-                    handleCloudCapRefusal(e, { kind: source.kind, url: source.url, label: sourceLabel });
                   }
                 }
 
-                // Fallback for single-episode series folder refusal: if no other cloud source
-                // provided the subtitle, download the single subtitle from the series folder
-                // (skipping or matching fonts so the cap is not exceeded).
-                if (!downloadedFilePath && seriesFolderRefusals.length > 0) {
-                  for (const ref of seriesFolderRefusals) {
-                    if (downloadedFilePath) break;
-                    console.log(`   🔄 Fallback: downloading single subtitle from ${ref.sourceLabel}...`);
-                    try {
-                      if (ref.source.kind === 'mega') {
-                        const megaRelease = await downloadMegaFolderRelease(
-                          ref.source.url,
-                          fansubWorkDir,
-                          ref.targetEp,
-                          {
-                            rawTitle: titleLine,
-                            listedFiles: ref.listing,
-                            batch: isCollectionTitle(titleLine),
-                            skipFonts: true,
-                          }
-                        );
-                        if (megaRelease && megaRelease.filePath && fs.existsSync(megaRelease.filePath)) {
-                          const fontFiles = Array.isArray(ref.listing) ? ref.listing.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name || '')) : [];
-                          downloadedFilePath = await tryBundleMatchingFonts(
-                            megaRelease.filePath,
-                            fontFiles,
-                            fansubWorkDir,
-                            async (font, dest, dir) => {
-                              if (font.node) {
-                                await downloadMegaNode(font.node, dest, dir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-                              }
-                            }
-                          );
-                        }
-                      } else if (ref.source.kind === 'drive') {
-                        const driveRelease = await downloadDriveFolderRelease(
-                          ref.source.url,
-                          fansubWorkDir,
-                          ref.targetEp,
-                          null,
-                          titleLine,
-                          {
-                            listedFiles: ref.listing,
-                            batch: isCollectionTitle(titleLine),
-                            skipFonts: true,
-                          }
-                        );
-                        if (driveRelease && driveRelease.filePath && fs.existsSync(driveRelease.filePath)) {
-                          const fontFiles = Array.isArray(ref.listing) ? ref.listing.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name || '')) : [];
-                          downloadedFilePath = await tryBundleMatchingFonts(
-                            driveRelease.filePath,
-                            fontFiles,
-                            fansubWorkDir,
-                            async (font, dest) => {
-                              if (font.id) {
-                                await downloadGoogleDriveFileToDisk(font.id, dest, font.name, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-                              }
-                            }
-                          );
-                        }
-                      }
-                    } catch (fbErr) {
-                      console.warn(`   ⚠️ ${ref.sourceLabel} fallback failed: ${logSafe(fbErr && fbErr.message)}`);
-                    }
-                  }
+                if (!downloadedFilePath && seriesFolderRefusals.some(r => !r.fallbackTried)) {
+                  await runPendingSeriesFallbacks();
                 }
 
                 // 3. Mega (Direct file or Folder via pure JS megajs) and
@@ -5154,7 +5477,9 @@ export async function checkTelegramChannels(existingClient = null) {
 
                 // 5. Buzzheavier (Direct video file via HX-Redirect or token on GitHub Actions)
                 if (!downloadedFilePath && pageData.videoLinks?.buzzheavier) {
-                  if (!toolsAvailable) {
+                  if (isCloudCapCooldownActive('buzzheavier', pageData.videoLinks.buzzheavier)) {
+                    console.warn(`   ⏳ Buzzheavier skipped: a previous download/hardsub is in cooldown for ${redactUrl(pageData.videoLinks.buzzheavier)}`);
+                  } else if (!toolsAvailable) {
                     // DEFERRED — tools missing; NOT marked as posted.
                     countDeferred(msgKey);
                     console.warn(`   ⏸️ DEFERRED (tools missing): "${logSafe(titleLine)}" – NOT marked as posted`);
@@ -5197,6 +5522,11 @@ export async function checkTelegramChannels(existingClient = null) {
                         }
                         if (size > 1024) {
                           downloadedFilePath = tempDest;
+                          downloadedVideoSource = {
+                            kind: 'buzzheavier',
+                            url: pageData.videoLinks.buzzheavier,
+                            label: 'Buzzheavier',
+                          };
                         }
                       }
                     } catch (e) {
@@ -5301,6 +5631,13 @@ export async function checkTelegramChannels(existingClient = null) {
                     }
 
                     fs.rmSync(finalPath, { force: true });
+                  } else {
+                    console.warn(`   ⚠️ No usable subtitle found in downloaded file: ${logSafe(path.basename(downloadedFilePath))}`);
+                    try { fs.rmSync(downloadedFilePath, { force: true }); } catch { }
+                    if (downloadedVideoSource) {
+                      markCloudCapCooldown(downloadedVideoSource.kind, downloadedVideoSource.url);
+                      console.warn(`   ⏳ ${downloadedVideoSource.label} marked in cooldown after subtitleless/hardsub video: ${redactUrl(downloadedVideoSource.url)}`);
+                    }
                   }
                 }
               } catch (e) {

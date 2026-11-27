@@ -11,6 +11,7 @@ import { fetchSafe, isStaticSafeUrl } from './url-safety.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const HTTP_TIMEOUT_MS = 60_000;
+const DRIVE_DOWNLOAD_TIMEOUT_MS = 180_000;
 const MEGA_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 
 // ====================================================================
@@ -134,16 +135,19 @@ export function __resetCloudCapCooldowns() {
  * Throws CloudCapError BEFORE the first byte is downloaded.
  */
 export function assertCloudBatchCaps(files, extraFiles = []) {
-  const all = [
-    ...(Array.isArray(files) ? files : []),
-    ...(Array.isArray(extraFiles) ? extraFiles : []),
-  ];
+  const mainFiles = Array.isArray(files) ? files : [];
+  const auxFiles = Array.isArray(extraFiles) ? extraFiles : [];
+  const all = [...mainFiles, ...auxFiles];
 
   if (all.length > CLOUD_CAP_LIMITS.MAX_FILES) {
-    throw cloudCapError(
+    const err = cloudCapError(
       'TOO_MANY_FILES',
       `cloud batch refused: ${all.length} files > ${CLOUD_CAP_LIMITS.MAX_FILES}`
     );
+    if (mainFiles.length <= CLOUD_CAP_LIMITS.MAX_FILES && auxFiles.length > 0) {
+      err.fontOverflow = true;
+    }
+    throw err;
   }
 
   let total = 0;
@@ -231,6 +235,28 @@ export function redactUrl(url) {
   return parsed.toString();
 }
 
+// Extract a pCloud publink code ONLY when the hostname is a genuine pCloud domain.
+export function extractPcloudPublinkCode(url) {
+  if (!url) return null;
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+  const host = parsed.hostname.toLowerCase();
+  const isPcloudDomain = host === 'pcloud.link' || host.endsWith('.pcloud.link')
+    || host === 'pcloud.com' || host.endsWith('.pcloud.com');
+  if (!isPcloudDomain) return null;
+  const code = parsed.searchParams.get('code') || '';
+  return /^[a-zA-Z0-9]+$/.test(code) ? code : null;
+}
+
+export function isPcloudPublinkUrl(url) {
+  return Boolean(extractPcloudPublinkCode(url));
+}
+
 // The provider of a url, decided by its HOSTNAME (m5) — never by a
 // substring of the whole url (a hostile link can carry "mega.nz" anywhere).
 export function cloudKindOfUrl(url) {
@@ -246,6 +272,7 @@ export function cloudKindOfUrl(url) {
   if (isHost('mega.nz') || isHost('mega.co.nz')) return 'mega';
   if (isHost('mediafire.com')) return 'mediafire';
   if (isHost('drive.google.com')) return isDriveFolderUrl(url) ? 'drive' : null;
+  if (isPcloudPublinkUrl(url)) return 'pcloud';
   return null;
 }
 
@@ -262,12 +289,20 @@ export function cloudHostOf(url) {
 // url that merely mentions "mediafire.com" in its query is NOT a mediafire
 // url (it would be fetched server-side otherwise).
 export function isProviderHostUrl(url, kind) {
-  const host = cloudHostOf(url);
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase();
   if (!host) return false;
   const domains = {
     mediafire: ['mediafire.com'],
     mega: ['mega.nz', 'mega.co.nz'],
     drive: ['drive.google.com', 'docs.google.com'],
+    pcloud: ['pcloud.link', 'pcloud.com'],
   }[kind] || [];
   return domains.some(d => host === d || host.endsWith(`.${d}`));
 }
@@ -483,6 +518,25 @@ export function chooseArchiveForEpisode(arcFiles, targetEpisode) {
   return chosen;
 }
 
+// Prefer softsub .mkv over .mp4/.m4v (which are frequently hardsubbed in fansub folders).
+export function chooseVideoCandidate(videoFiles, targetEpisode) {
+  const all = Array.isArray(videoFiles) ? videoFiles : [];
+  if (all.length === 0) return null;
+  const pureMkv = all.filter(f => /\.mkv$/i.test(f.name || ''));
+  const preferredPool = pureMkv.length > 0 ? pureMkv : all;
+
+  if (targetEpisode) {
+    const mkvMatch = pureMkv.find(f => matchesEpisode(f.name, targetEpisode));
+    if (mkvMatch) return mkvMatch;
+    const anyMatch = all.find(f => matchesEpisode(f.name, targetEpisode));
+    if (anyMatch) return anyMatch;
+    if (all.some(f => extractEpisodesFromText(f.name).length > 0)) {
+      throw episodeAbsentError();
+    }
+  }
+  return preferredPool[preferredPool.length - 1];
+}
+
 // ====================================================================
 // Folder target selection (F2a)
 // ====================================================================
@@ -654,6 +708,7 @@ export async function listCloudFolderFiles(kind, folderUrl) {
     if (kind === 'drive') return await listDriveFolderWithSubtitles(folderUrl, { strict: true });
     if (kind === 'mega') return await listMegaFolderStrict(folderUrl);
     if (kind === 'mediafire') return await listMediafireFolderStrict(folderUrl);
+    if (kind === 'pcloud') return await listPcloudFolderStrict(folderUrl);
   } catch (e) {
     // X2: a LISTING refusal (a cap) is not a soft failure: the source goes
     // into the 6 h cooldown so a hostile folder is not re-fetched every
@@ -797,22 +852,30 @@ export function packToZip(srcDir, zipPath) {
   return zipPath;
 }
 
-export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisode = null, options = {}) {
+// Shared cloud folder release downloader for Mega, Google Drive, and pCloud.
+async function runCloudFolderRelease(config, folderUrl, destDir, targetEpisode = null, options = {}) {
+  const {
+    providerLabel,
+    releaseLabel,
+    tagPrefix,
+    loadFiles,
+    downloadItem,
+  } = config;
   const {
     rawTitle = '',
     listedFiles = null,
     batch = true,
     skipFonts = false,
-    downloadNode = downloadMegaNode,
+    fontsUrl = null,
   } = options || {};
 
   // The listing is injected by the caller (M1): the folder is listed ONCE
   // per post, not once for the ranking and once for the download.
-  const files = (Array.isArray(listedFiles) && listedFiles.length > 0) ? listedFiles : await listMegaFolder(folderUrl);
-  if (files.length === 0) return null;
+  const files = (Array.isArray(listedFiles) && listedFiles.length > 0) ? listedFiles : await loadFiles(folderUrl);
+  if (!files || files.length === 0) return null;
   fs.mkdirSync(destDir, { recursive: true });
 
-  console.log(`   📂 Mega folder: ${files.length} file(s) found`);
+  console.log(`   📂 ${providerLabel} folder: ${files.length} file(s) found`);
   const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
 
   const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
@@ -820,188 +883,204 @@ export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisod
   const fontFiles = skipFonts ? [] : clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
 
+  // Separate Drive fonts folder URL if provided (used when subtitles omit fonts)
+  if (!skipFonts && fontsUrl && isDriveFolderUrl(fontsUrl)) {
+    console.log(`   📂 Fetching fonts from separate Drive folder: ${redactUrl(fontsUrl)}`);
+    try {
+      const fItems = await listDriveFolder(fontsUrl);
+      const fontsFound = fItems.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
+      if (fontsFound.length > 0) {
+        fontFiles.push(...fontsFound);
+      }
+    } catch (e) {
+      console.warn('   ⚠️ Drive fonts listing failed: ' + logSafe(e && e.message));
+    }
+  }
+
   // 1. Direct subtitle files (.ass/.srt)
   let episodeAbsent = false;
   try {
-  if (subFiles.length > 0) {
-    // F2a: a folder that holds several episodes is a BATCH — the whole batch
-    // is downloaded, never narrowed to the episode the post asks for (the
-    // same rule as the Drive folder). m8/m9: an EXPLICIT episode range is the
-    // only other narrowing rule; a single-episode TITLE narrows ONLY when the
-    // caller explicitly passes `batch: false` (a single-episode post).
-    const targetSubs = selectFolderTargets(subFiles, {
-      targetEpisode,
-      extractedEps: extractExplicitEpisodeRange(rawTitle),
-      batch,
-    });
-    console.log(`   🎯 [Mega Release] ${targetSubs.length}/${subFiles.length} subtitle file(s) selected from the folder.`);
+    if (subFiles.length > 0) {
+      // M4/F2a: only an EXPLICIT episode range narrows a multi-episode folder;
+      // single-episode titles narrow only when batch === false.
+      const targetSubs = selectFolderTargets(subFiles, {
+        targetEpisode,
+        extractedEps: extractExplicitEpisodeRange(rawTitle || ''),
+        batch,
+      });
+      console.log(`   🎯 [${releaseLabel}] ${targetSubs.length}/${subFiles.length} subtitle file(s) selected from the folder.`);
 
-    const isBatch = targetSubs.length > 1;
-    const hasFonts = fontFiles.length > 0;
-    // The fonts of the release (packToZip puts them under Fonts/). Counted
-    // towards the cap alongside the selected subtitles.
-    const fontCount = fontFiles.length;
+      const isBatch = targetSubs.length > 1;
+      const hasFonts = fontFiles.length > 0;
+      const fontCount = fontFiles.length;
 
-    // If multiple subtitles or fonts are present, bundle into zip archive
-    if (isBatch || hasFonts) {
-      console.log(`   📦 [Mega Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontCount} font(s)). Downloading and packing to .zip...`);
-      // The cap is checked BEFORE the first download (M6).
-      //
-      // A single-episode title narrowed out of a series-wide folder is NOT a
-      // batch: refusing it with the generic TOO_MANY_FILES would put the
-      // source into a 6 h cooldown and hide that another source may still
-      // carry the requested episode. Give it its own code so the caller can
-      // skip THIS source only. The message carries counts + limit alone
-      // (no URL, no raw title — the caller wraps it in logSafe).
-      const narrowed = batch !== true && Boolean(targetEpisode) && targetSubs.length < subFiles.length;
-      const seriesFolderCounts = `${targetSubs.length} sub(s) + ${fontCount} font(s) > ${CLOUD_CAP_LIMITS.MAX_FILES}`;
-      if (narrowed && targetSubs.length + fontCount > CLOUD_CAP_LIMITS.MAX_FILES) {
-        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
-      }
-      // Fonts alone can blow the budget even with a single selected sub.
-      if (targetSubs.length === 1 && fontCount >= CLOUD_CAP_LIMITS.MAX_FILES) {
-        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
-      }
-      assertCloudBatchCaps(targetSubs, fontFiles);
-
-      const unpackDir = path.join(destDir, nextTempTag('mega_unpack'));
-      fs.mkdirSync(unpackDir, { recursive: true });
-      const usedSubNames = new Set();
-      const usedFontNames = new Set();
-
-      try {
-        // P1: the destination names are computed FIRST (sequentially, so the
-        // unique names can never race), then the downloads run with a
-        // BOUNDED parallelism (the same helper the Drive path uses).
-        const subTargets = targetSubs.map(sub => ({
-          node: sub.node,
-          name: sub.name,
-          dest: path.join(unpackDir, uniqueFileName(safeRemoteBaseName(sub.name, nextTempTag('mega_sub')), usedSubNames)),
-        }));
-        for (const t of subTargets) {
-          if (!isInsideDir(t.dest, unpackDir)) throw new Error('unsafe cloud file name: ' + t.name);
+      if (isBatch || hasFonts) {
+        console.log(`   📦 [${releaseLabel}] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontCount} font(s)). Downloading and packing to .zip...`);
+        const narrowed = batch !== true && Boolean(targetEpisode) && targetSubs.length < subFiles.length;
+        const seriesFolderCounts = `${targetSubs.length} sub(s) + ${fontCount} font(s) > ${CLOUD_CAP_LIMITS.MAX_FILES}`;
+        if (narrowed && targetSubs.length + fontCount > CLOUD_CAP_LIMITS.MAX_FILES) {
+          throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
         }
-        await mapWithConcurrency(subTargets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
-          console.log(`   📥 Downloading Mega sub: ` + logSafe(t.name));
-          await downloadNode(t.node, t.dest, unpackDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-        });
-
-        if (hasFonts) {
-          const fontsDir = path.join(unpackDir, 'Fonts');
-          fs.mkdirSync(fontsDir, { recursive: true });
-          const fontTargets = fontFiles.map(font => ({
-            node: font.node,
-            name: font.name,
-            dest: path.join(fontsDir, uniqueFileName(safeRemoteBaseName(font.name, nextTempTag('font')), usedFontNames)),
-          }));
-          for (const t of fontTargets) {
-            if (!isInsideDir(t.dest, fontsDir)) throw new Error('unsafe cloud file name: ' + t.name);
-          }
-          await mapWithConcurrency(fontTargets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
-            await downloadNode(t.node, t.dest, fontsDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-          });
+        if (targetSubs.length === 1 && fontCount >= CLOUD_CAP_LIMITS.MAX_FILES) {
+          throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
         }
+        assertCloudBatchCaps(targetSubs, fontFiles);
 
-        const repackedZip = path.join(destDir, `${nextTempTag('mega_bundle')}.zip`);
-        // X11: a failed pack leaves no partial zip behind.
+        const unpackDir = path.join(destDir, nextTempTag(`${tagPrefix}_unpack`));
+        fs.mkdirSync(unpackDir, { recursive: true });
+        const usedSubNames = new Set();
+        const usedFontNames = new Set();
+
         try {
-          packToZip(unpackDir, repackedZip);
-        } catch (e) {
-          try { fs.rmSync(repackedZip, { force: true }); } catch { }
-          throw e;
-        }
+          const subTargets = targetSubs.map(sub => ({
+            item: sub,
+            name: sub.name,
+            dest: path.join(unpackDir, uniqueFileName(safeRemoteBaseName(sub.name, nextTempTag(`${tagPrefix}_sub`)), usedSubNames)),
+          }));
+          for (const t of subTargets) {
+            if (!isInsideDir(t.dest, unpackDir)) throw new Error('unsafe cloud file name: ' + t.name);
+          }
+          await mapWithConcurrency(subTargets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
+            console.log(`   📥 Downloading ${providerLabel} sub: ${logSafe(t.name)}`);
+            await downloadItem(t.item, t.dest, unpackDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+          });
 
+          if (hasFonts) {
+            const fontsDir = path.join(unpackDir, 'Fonts');
+            fs.mkdirSync(fontsDir, { recursive: true });
+            const fontTargets = fontFiles.map(font => ({
+              item: font,
+              name: font.name,
+              dest: path.join(fontsDir, uniqueFileName(safeRemoteBaseName(font.name, nextTempTag(`${tagPrefix}_font`)), usedFontNames)),
+            }));
+            for (const t of fontTargets) {
+              if (!isInsideDir(t.dest, fontsDir)) throw new Error('unsafe cloud file name: ' + t.name);
+            }
+            await mapWithConcurrency(fontTargets, CLOUD_CAP_LIMITS.CONCURRENCY, async (t) => {
+              await downloadItem(t.item, t.dest, fontsDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+            });
+          }
+
+          // Check actual byte total on disk after downloads (essential for providers without listing sizes)
+          const totalBytes = unpackDirBytes(unpackDir);
+          if (totalBytes > CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES) {
+            throw cloudCapError(
+              'BATCH_TOO_LARGE',
+              `cloud batch refused: ${Math.round(totalBytes / 1024 / 1024)} MiB > ${Math.round(CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES / 1024 / 1024)} MiB`
+            );
+          }
+
+          const repackedZip = path.join(destDir, `${nextTempTag(`${tagPrefix}_bundle`)}.zip`);
+          try {
+            packToZip(unpackDir, repackedZip);
+          } catch (e) {
+            try { fs.rmSync(repackedZip, { force: true }); } catch { }
+            throw e;
+          }
+
+          return {
+            filePath: repackedZip,
+            isArchive: true,
+            hasFonts,
+            type: 'archive',
+            subNames: targetSubs.map(s => s.name),
+          };
+        } finally {
+          try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch { }
+        }
+      }
+
+      // Single subtitle without fonts: download directly
+      const singleSub = targetSubs[0];
+      if (targetEpisode && extractEpisodesFromText(singleSub.name).length > 0 && !matchesEpisode(singleSub.name, targetEpisode)) {
+        throw episodeAbsentError();
+      }
+      console.log(`   📥 Downloading single ${providerLabel} subtitle: ${logSafe(singleSub.name)}`);
+      assertCloudBatchCaps([singleSub]);
+      const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(singleSub.name, nextTempTag(`${tagPrefix}_sub`))));
+      if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + singleSub.name);
+      let ok = false;
+      try {
+        ok = await downloadItem(singleSub, destPath, destDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
+      } catch (e) {
+        try { fs.rmSync(destPath, { force: true }); } catch { }
+        throw e;
+      }
+      if (ok) {
         return {
-          filePath: repackedZip,
-          isArchive: true,
-          hasFonts,
-          type: 'archive',
-          subNames: targetSubs.map(s => s.name)
+          filePath: destPath,
+          isArchive: false,
+          hasFonts: false,
+          type: 'subtitle',
+          subNames: [singleSub.name],
         };
-      } finally {
-        // The unpack directory NEVER survives the call (M7) — not on success
-        // and not on a failure in the middle of the loop.
-        try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch { }
       }
     }
 
-    // Single subtitle without fonts: download directly as naked subtitle
-    const singleSub = targetSubs[0];
-    // A parseable name carrying a DIFFERENT episode is never a substitute
-    // for the requested one (EPISODE_ABSENT → defer, retry next cycle).
-    if (targetEpisode && extractEpisodesFromText(singleSub.name).length > 0 && !matchesEpisode(singleSub.name, targetEpisode)) {
-      throw episodeAbsentError();
+    // 2. Archive files (.zip/.rar/.7z)
+    if (arcFiles.length > 0) {
+      const chosen = chooseArchiveForEpisode(arcFiles, targetEpisode);
+      console.log(`   📦 ${providerLabel}: found archive: ${logSafe(chosen.name)}`);
+      const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(chosen.name, nextTempTag(`${tagPrefix}_arc`))));
+      if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
+      const ok = await downloadItem(chosen, destPath, destDir, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
+      if (ok) {
+        return {
+          filePath: destPath,
+          isArchive: true,
+          hasFonts: null,
+          type: 'archive',
+          subNames: [chosen.name],
+        };
+      }
     }
-    console.log(`   📥 Downloading single Mega subtitle: ` + logSafe(singleSub.name));
-    // The per-file cap of a single download (C7b/C10).
-    assertCloudBatchCaps([singleSub]);
-    const destPath = path.join(destDir, safeRemoteBaseName(singleSub.name, nextTempTag('mega_sub')));
-    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + singleSub.name);
-    try {
-      await downloadNode(singleSub.node, destPath, destDir, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-    } catch (e) {
-      try { fs.rmSync(destPath, { force: true }); } catch { }
-      throw e;
-    }
-    return {
-      filePath: destPath,
-      isArchive: false,
-      hasFonts: false,
-      type: 'subtitle',
-      subNames: [singleSub.name]
-    };
-  }
-
-  // 2. Archive files (.zip/.rar/.7z)
-  if (arcFiles.length > 0) {
-    const chosen = chooseArchiveForEpisode(arcFiles, targetEpisode);
-    console.log(`   📦 Mega: found archive: ` + logSafe(chosen.name));
-    const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, nextTempTag('mega_arc')));
-    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
-    // X4: an archive is NOT a subtitle — it is bounded by the 4 GiB ceiling.
-    await downloadNode(chosen.node, destPath, destDir, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
-    return {
-      filePath: destPath,
-      isArchive: true,
-      hasFonts: null,
-      type: 'archive',
-      subNames: [chosen.name]
-    };
-  }
   } catch (e) {
     if (e.code !== 'EPISODE_ABSENT') throw e;
-    // The requested episode has no subtitle/archive in the folder yet — fall
-    // through to the softsub MKV branch: the episode may exist as a video with
-    // muxed Arabic subs + fonts. If no matching MKV exists either, that branch
-    // re-throws EPISODE_ABSENT (defer + retry, never a different episode).
     episodeAbsent = true;
   }
 
-  // 3. Softsub MKV files
+  // 3. Softsub MKV/video files (.mkv preferred over .mp4/.m4v)
   if (mkvFiles.length > 0) {
-    let chosen = mkvFiles[mkvFiles.length - 1];
-    if (targetEpisode) {
-      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) chosen = match;
-      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
+    const chosen = chooseVideoCandidate(mkvFiles, targetEpisode);
+    if (chosen) {
+      console.log(`   🎬 ${providerLabel}: found MKV: ${logSafe(chosen.name)}`);
+      const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(chosen.name, nextTempTag(`${tagPrefix}_mkv`))));
+      if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
+      const ok = await downloadItem(chosen, destPath, destDir, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
+      if (ok) {
+        return {
+          filePath: destPath,
+          isArchive: false,
+          hasFonts: false,
+          type: 'mkv',
+          subNames: [chosen.name],
+        };
+      }
     }
-    console.log(`   🎬 Mega: found MKV: ` + logSafe(chosen.name));
-    const destPath = path.join(destDir, safeRemoteBaseName(chosen.name, nextTempTag('mega_mkv')));
-    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
-    // X4: a video is bounded by the 4 GiB ceiling (not by the 64 MiB
-    // subtitle cap).
-    await downloadNode(chosen.node, destPath, destDir, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
-    return {
-      filePath: destPath,
-      isArchive: false,
-      hasFonts: false,
-      type: 'mkv',
-      subNames: [chosen.name]
-    };
   }
 
   if (episodeAbsent) throw episodeAbsentError();
   return null;
+}
+
+export async function downloadMegaFolderRelease(folderUrl, destDir, targetEpisode = null, options = {}) {
+  const { downloadNode = downloadMegaNode, ...rest } = options || {};
+  return await runCloudFolderRelease(
+    {
+      providerLabel: 'Mega',
+      releaseLabel: 'Mega Release',
+      tagPrefix: 'mega',
+      loadFiles: listMegaFolder,
+      downloadItem: async (item, destPath, itemDir, dlOpts) => {
+        await downloadNode(item.node, destPath, itemDir, dlOpts);
+        return true;
+      },
+    },
+    folderUrl,
+    destDir,
+    targetEpisode,
+    rest
+  );
 }
 
 export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, extractedEps = [], listedFiles = null, batch = true) {
@@ -1055,19 +1134,14 @@ export async function findBestFileInMegaFolder(folderUrl, targetEpisode = null, 
   // 2. Softsub MKV files
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
   if (mkvFiles.length > 0) {
-    if (targetEpisode) {
-      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) {
-        console.log(`   🎬 Mega: MKV matched EP ${targetEpisode}: ${logSafe(match.name)} (${(match.size / 1024 / 1024).toFixed(0)} MB)`);
-        return { node: match.node, name: match.name, type: 'mkv', size: match.size };
-      }
+    const chosen = chooseVideoCandidate(mkvFiles, targetEpisode);
+    if (chosen) {
+      const detail = targetEpisode && matchesEpisode(chosen.name, targetEpisode)
+        ? `MKV matched EP ${targetEpisode}: ${logSafe(chosen.name)} (${(chosen.size / 1024 / 1024).toFixed(0)} MB)`
+        : `using latest MKV: ${logSafe(chosen.name)}`;
+      console.log(`   🎬 Mega: ${detail}`);
+      return { node: chosen.node, name: chosen.name, type: 'mkv', size: chosen.size };
     }
-    if (targetEpisode && mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) {
-      throw episodeAbsentError();
-    }
-    const latest = mkvFiles[mkvFiles.length - 1];
-    console.log(`   🎬 Mega: using latest MKV: ${logSafe(latest.name)}`);
-    return { node: latest.node, name: latest.name, type: 'mkv', size: latest.size };
   }
 
   if (episodeAbsent) throw episodeAbsentError();
@@ -1225,20 +1299,17 @@ export async function findBestFileInMediafire(mfUrl, targetEpisode = null, extra
   // 2. MKV files
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
   if (mkvFiles.length > 0) {
-    let chosen = mkvFiles[mkvFiles.length - 1];
-    if (targetEpisode) {
-      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) chosen = match;
-      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
+    const chosen = chooseVideoCandidate(mkvFiles, targetEpisode);
+    if (chosen) {
+      console.log(`   🎬 Mediafire: found MKV ` + logSafe(chosen.name));
+      const resolved = await resolveMediafireDirectDownload(chosen.directUrl);
+      return {
+        name: chosen.name,
+        directUrl: resolved || chosen.directUrl,
+        type: 'mkv',
+        size: chosen.size
+      };
     }
-    console.log(`   🎬 Mediafire: found MKV ` + logSafe(chosen.name));
-    const resolved = await resolveMediafireDirectDownload(chosen.directUrl);
-    return {
-      name: chosen.name,
-      directUrl: resolved || chosen.directUrl,
-      type: 'mkv',
-      size: chosen.size
-    };
   }
 
   if (episodeAbsent) throw episodeAbsentError();
@@ -1272,12 +1343,15 @@ export async function downloadGoogleDriveFileToDisk(fileId, destPath, fileName =
     ...(cookie ? { 'Cookie': cookie } : {})
   };
   const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : null;
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+    ? options.timeoutMs
+    : DRIVE_DOWNLOAD_TIMEOUT_MS;
 
   try {
     // SSRF audit: `url` is produced by getDriveDirectUrl(fileId), whose host is
     // the FIXED drive.google.com; `fileId` is interpolated only into the `id=`
     // query value, so it cannot rewrite the request host. Documented safe.
-    let res = await fetchWithTimeout(url, { headers }, 60_000);
+    let res = await fetchWithTimeout(url, { headers }, timeoutMs);
     if (!res.ok) {
       console.warn(`   ⚠️ Google Drive HTTP ${res.status} for file: ${logSafe(fileName || fileId)}`);
       return false;
@@ -1315,7 +1389,7 @@ export async function downloadGoogleDriveFileToDisk(fileId, destPath, fileName =
           cookieHeader: cookie,
           initialValidator: isStaticSafeUrl,
           headers,
-          timeoutMs: 60_000,
+          timeoutMs,
         });
         res = confirmed?.response;
         if (!res) {
@@ -1534,19 +1608,16 @@ export async function findBestFileInDrive(driveUrl, targetEpisode = null, extrac
   // 2. MKV files
   const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
   if (mkvFiles.length > 0) {
-    let chosen = mkvFiles[mkvFiles.length - 1];
-    if (targetEpisode) {
-      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) chosen = match;
-      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
+    const chosen = chooseVideoCandidate(mkvFiles, targetEpisode);
+    if (chosen) {
+      console.log(`   🎬 Drive: MKV ${logSafe(chosen.name)}`);
+      return {
+        id: chosen.id,
+        name: chosen.name,
+        directUrl: getDriveDirectUrl(chosen.id),
+        type: 'mkv'
+      };
     }
-    console.log(`   🎬 Drive: MKV ${logSafe(chosen.name)}`);
-    return {
-      id: chosen.id,
-      name: chosen.name,
-      directUrl: getDriveDirectUrl(chosen.id),
-      type: 'mkv'
-    };
   }
 
   if (episodeAbsent) throw episodeAbsentError();
@@ -1572,216 +1643,26 @@ export function unpackDirBytes(dir) {
 }
 
 export async function downloadDriveFolderRelease(folderUrl, destDir, targetEpisode = null, fontsUrl = null, rawTitle = '', options = {}) {
-  const {
-    // The listing is injected by the caller (M1): the folder is listed ONCE
-    // per post, not once for the ranking and once for the download.
-    listedFiles = null,
-    // The download sink is injectable so the batch can be tested offline.
-    downloadFile = downloadGoogleDriveFileToDisk,
-    // Single-episode titles narrow a multi-episode folder (P1 wiring).
-    batch = true,
-    skipFonts = false,
-  } = options || {};
-
-  const files = (Array.isArray(listedFiles) && listedFiles.length > 0) ? listedFiles : await listDriveFolderWithSubtitles(folderUrl);
-  if (!files || files.length === 0) return null;
-  fs.mkdirSync(destDir, { recursive: true });
-
-  console.log(`   📂 Google Drive folder: ${files.length} file(s) found`);
-  const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
-
-  const subFiles = clean.filter(f => /\.(ass|srt)$/i.test(f.name));
-  const arcFiles = clean.filter(f => /\.(zip|7z|rar)$/i.test(f.name));
-  let fontFiles = skipFonts ? [] : clean.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
-  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name)); // video containers the extractor supports
-
-  // If a separate fonts folder URL is provided
-  if (!skipFonts && fontsUrl && isDriveFolderUrl(fontsUrl)) {
-    console.log(`   📂 Fetching fonts from separate Drive folder: ${redactUrl(fontsUrl)}`);
-    try {
-      const fItems = await listDriveFolder(fontsUrl);
-      const fontsFound = fItems.filter(f => /\.(ttf|otf|woff2?|ttc)$/i.test(f.name));
-      if (fontsFound.length > 0) {
-        fontFiles.push(...fontsFound);
-      }
-    } catch (e) {
-      console.warn('   ⚠️ Drive fonts listing failed: ' + logSafe(e && e.message));
+  const { downloadFile = downloadGoogleDriveFileToDisk, ...rest } = options || {};
+  return await runCloudFolderRelease(
+    {
+      providerLabel: 'Google Drive',
+      releaseLabel: 'Drive Release',
+      tagPrefix: 'drive',
+      loadFiles: listDriveFolderWithSubtitles,
+      downloadItem: async (item, destPath, _itemDir, dlOpts) => {
+        return await downloadFile(item.id, destPath, item.name, dlOpts);
+      },
+    },
+    folderUrl,
+    destDir,
+    targetEpisode,
+    {
+      ...rest,
+      fontsUrl: fontsUrl ?? rest.fontsUrl ?? null,
+      rawTitle: rawTitle || rest.rawTitle || '',
     }
-  }
-
-  // 1. Direct subtitle files (.ass/.srt)
-  let episodeAbsent = false;
-  try {
-  if (subFiles.length > 0) {
-    // Check if rawTitle specifies a batch range or specific episodes
-    // M4: only an EXPLICIT episode range narrows the folder (a single
-    // episode number in the title never narrows a multi-episode folder).
-    const extractedEps = extractExplicitEpisodeRange(rawTitle || '');
-    // F2a: a folder with several episodes is a BATCH — the whole batch is
-    // downloaded, never narrowed to the episode the post asks for.
-    const targetSubs = selectFolderTargets(subFiles, { targetEpisode, extractedEps, batch });
-    console.log(`   🎯 [Drive Release] ${targetSubs.length}/${subFiles.length} subtitle file(s) selected from the folder.`);
-
-    const isBatch = targetSubs.length > 1;
-    const hasFonts = fontFiles.length > 0;
-    const fontCount = fontFiles.length;
-
-    if (isBatch || hasFonts) {
-      console.log(`   📦 [Drive Release] Batch/Fonts detected (${targetSubs.length} sub(s), ${fontCount} font(s)). Downloading and packing to .zip...`);
-      // The cap is checked BEFORE the first download (M6): the file count
-      // (subtitles AND fonts) and the total size are refused up-front.
-      // A narrowed single-episode folder must reach the caller's no-font fallback.
-      const narrowed = batch !== true && Boolean(targetEpisode) && targetSubs.length < subFiles.length;
-      const seriesFolderCounts = `${targetSubs.length} sub(s) + ${fontCount} font(s) > ${CLOUD_CAP_LIMITS.MAX_FILES}`;
-      if (narrowed && targetSubs.length + fontCount > CLOUD_CAP_LIMITS.MAX_FILES) {
-        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
-      }
-      // Fonts alone can exhaust the cap even with one selected subtitle.
-      if (targetSubs.length === 1 && fontCount >= CLOUD_CAP_LIMITS.MAX_FILES) {
-        throw cloudCapError('SERIES_FOLDER_BATCH', seriesFolderCounts);
-      }
-      assertCloudBatchCaps(targetSubs, fontFiles);
-
-      const unpackDir = path.join(destDir, nextTempTag('drive_unpack'));
-      fs.mkdirSync(unpackDir, { recursive: true });
-      const usedSubNames = new Set();
-      const usedFontNames = new Set();
-
-      try {
-        // Bounded parallelism (M6): at most CONCURRENCY downloads at a time.
-        await mapWithConcurrency(targetSubs, CLOUD_CAP_LIMITS.CONCURRENCY, async (sub) => {
-          console.log(`   📥 Downloading Drive sub: ${logSafe(sub.name)}`);
-          const subDest = path.join(unpackDir, uniqueFileName(safeRemoteBaseName(sub.name, nextTempTag('drive_sub')), usedSubNames));
-          if (!isInsideDir(subDest, unpackDir)) throw new Error('unsafe cloud file name: ' + sub.name);
-          await downloadFile(sub.id, subDest, sub.name, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-        });
-
-        if (hasFonts) {
-          const fontsDir = path.join(unpackDir, 'Fonts');
-          fs.mkdirSync(fontsDir, { recursive: true });
-          await mapWithConcurrency(fontFiles, CLOUD_CAP_LIMITS.CONCURRENCY, async (font) => {
-            const fontDest = path.join(fontsDir, uniqueFileName(safeRemoteBaseName(font.name, nextTempTag('drive_font')), usedFontNames));
-            if (!isInsideDir(fontDest, fontsDir)) throw new Error('unsafe cloud file name: ' + font.name);
-            await downloadFile(font.id, fontDest, font.name, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-          });
-        }
-
-        // C7c: the Drive listing carries no sizes, so the total is checked
-        // AFTER the download (a stat of the downloaded files): a batch that
-        // is too big is refused and the unpack directory is removed.
-        const totalBytes = unpackDirBytes(unpackDir);
-        if (totalBytes > CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES) {
-          throw cloudCapError(
-            'BATCH_TOO_LARGE',
-            `cloud batch refused: ${Math.round(totalBytes / 1024 / 1024)} MiB > ${Math.round(CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES / 1024 / 1024)} MiB`
-          );
-        }
-
-        const repackedZip = path.join(destDir, `${nextTempTag('drive_bundle')}.zip`);
-        // X11: a failed pack leaves no partial zip behind.
-        try {
-          packToZip(unpackDir, repackedZip);
-        } catch (e) {
-          try { fs.rmSync(repackedZip, { force: true }); } catch { }
-          throw e;
-        }
-
-        return {
-          filePath: repackedZip,
-          isArchive: true,
-          hasFonts,
-          type: 'archive',
-          subNames: targetSubs.map(s => s.name)
-        };
-      } finally {
-        // The unpack directory NEVER survives the call (M7) — not on success
-        // and not on a failure in the middle of the loop.
-        try { fs.rmSync(unpackDir, { recursive: true, force: true }); } catch { }
-      }
-    }
-
-    // Single subtitle without fonts
-    const singleSub = targetSubs[0];
-    // A parseable name carrying a DIFFERENT episode is never a substitute
-    // for the requested one (EPISODE_ABSENT → defer, retry next cycle).
-    if (targetEpisode && extractEpisodesFromText(singleSub.name).length > 0 && !matchesEpisode(singleSub.name, targetEpisode)) {
-      throw episodeAbsentError();
-    }
-    console.log(`   📥 Downloading single Drive subtitle: ${logSafe(singleSub.name)}`);
-    // The per-file cap of a single download (C7b/C10).
-    assertCloudBatchCaps([singleSub]);
-    const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(singleSub.name, nextTempTag('drive_sub'))));
-    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + singleSub.name);
-    try {
-      const ok = await downloadFile(singleSub.id, destPath, singleSub.name, { maxBytes: CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES });
-      if (ok) {
-        return {
-          filePath: destPath,
-          isArchive: false,
-          hasFonts: false,
-          type: 'subtitle',
-          subNames: [singleSub.name]
-        };
-      }
-    } catch (e) {
-      // The partial file NEVER survives a failed single download (M7).
-      try { fs.rmSync(destPath, { force: true }); } catch { }
-      throw e;
-    }
-  }
-
-  // 2. Archive files (.zip/.rar/.7z)
-  if (arcFiles.length > 0) {
-    const chosen = chooseArchiveForEpisode(arcFiles, targetEpisode);
-    console.log(`   📦 Drive: found archive: ${logSafe(chosen.name)}`);
-    const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(chosen.name, nextTempTag('drive_arc'))));
-    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
-    const ok = await downloadFile(chosen.id, destPath, chosen.name, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
-    if (ok) {
-      return {
-        filePath: destPath,
-        isArchive: true,
-        hasFonts: null,
-        type: 'archive',
-        subNames: [chosen.name]
-      };
-    }
-  }
-  } catch (e) {
-    if (e.code !== 'EPISODE_ABSENT') throw e;
-    // The requested episode has no subtitle/archive here — fall through to
-    // the softsub MKV branch (muxed Arabic subs + fonts). If that branch has
-    // no matching episode either it re-throws EPISODE_ABSENT (defer, never
-    // substitute a different episode).
-    episodeAbsent = true;
-  }
-
-  // 3. Softsub MKV files
-  if (mkvFiles.length > 0) {
-    let chosen = mkvFiles[mkvFiles.length - 1];
-    if (targetEpisode) {
-      const match = mkvFiles.find(f => matchesEpisode(f.name, targetEpisode));
-      if (match) chosen = match;
-      else if (mkvFiles.some(f => extractEpisodesFromText(f.name).length > 0)) throw episodeAbsentError();
-    }
-    console.log(`   🎬 Drive: found MKV: ` + logSafe(chosen.name));
-    const destPath = path.join(destDir, uniqueFileName(safeRemoteBaseName(chosen.name, nextTempTag('drive_mkv'))));
-    if (!isInsideDir(destPath, destDir)) throw new Error('unsafe cloud file name: ' + chosen.name);
-    // X4: a video is bounded by the 4 GiB ceiling, not the 64 MiB sub cap.
-    const ok = await downloadFile(chosen.id, destPath, chosen.name, { maxBytes: CLOUD_CAP_LIMITS.CLOUD_FILE_MAX_BYTES });
-    if (ok) {
-      return {
-        filePath: destPath,
-        isArchive: false,
-        hasFonts: false,
-        type: 'mkv',
-        subNames: [chosen.name]
-      };
-    }
-  }
-
-  if (episodeAbsent) throw episodeAbsentError();
-  return null;
+  );
 }
 
 // Extract font family names declared in ASS/SSA subtitle Style lines
@@ -1822,22 +1703,65 @@ export function findMatchingFontFiles(assFontNames, availableFontFiles) {
   return matched;
 }
 
-// Try to bundle matching fonts for a single ASS subtitle file when available
-export async function tryBundleMatchingFonts(subFilePath, fontFiles, destDir, downloadFontFn) {
-  if (!subFilePath || !fs.existsSync(subFilePath) || !/\.(ass|ssa)$/i.test(subFilePath)) {
+function decodeAssZipEntry(entry) {
+  if (!entry || entry.isDirectory) return '';
+  if (entry.header && Number.isFinite(entry.header.size) && entry.header.size > CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES) {
+    return '';
+  }
+  const buf = entry.getData();
+  if (!Buffer.isBuffer(buf) || buf.length > CLOUD_CAP_LIMITS.SUB_MAX_FILE_BYTES) return '';
+  if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE) {
+    return buf.subarray(2).toString('utf16le');
+  }
+  return buf.toString('utf8');
+}
+
+// Try to bundle matching fonts for a single ASS subtitle or a subtitle .zip bundle when available
+export async function tryBundleMatchingFonts(subFilePath, fontFiles, destDir, downloadFontFn, options = {}) {
+  const isAss = Boolean(subFilePath) && /\.(ass|ssa)$/i.test(subFilePath);
+  const isZip = Boolean(subFilePath) && /\.zip$/i.test(subFilePath);
+  if (!subFilePath || !fs.existsSync(subFilePath) || (!isAss && !isZip)) {
     return subFilePath;
   }
   if (!Array.isArray(fontFiles) || fontFiles.length === 0 || typeof downloadFontFn !== 'function') {
     return subFilePath;
   }
   try {
-    const assText = fs.readFileSync(subFilePath, 'utf8');
-    const neededFonts = extractAssFontNames(assText);
+    const existingFontNames = new Set();
+    let neededFonts = [];
+    let existingZip = null;
+    if (isAss) {
+      neededFonts = extractAssFontNames(fs.readFileSync(subFilePath, 'utf8'));
+    } else {
+      existingZip = new AdmZip(subFilePath);
+      const neededSet = new Set();
+      for (const entry of existingZip.getEntries()) {
+        if (!entry || entry.isDirectory) continue;
+        const baseName = path.basename(entry.entryName || '');
+        if (/\.(ttf|otf|woff2?|ttc)$/i.test(baseName)) {
+          existingFontNames.add(baseName.toLowerCase());
+          continue;
+        }
+        if (/\.(ass|ssa)$/i.test(baseName)) {
+          for (const fn of extractAssFontNames(decodeAssZipEntry(entry))) {
+            neededSet.add(fn);
+          }
+        }
+      }
+      neededFonts = [...neededSet];
+    }
     if (neededFonts.length === 0) return subFilePath;
 
-    const matched = findMatchingFontFiles(neededFonts, fontFiles);
+    const rawMatched = findMatchingFontFiles(neededFonts, fontFiles);
+    const matched = isZip
+      ? rawMatched.filter(f => f && f.name && !existingFontNames.has(path.basename(f.name).toLowerCase()))
+      : rawMatched;
     if (matched.length === 0) return subFilePath;
-    if (1 + matched.length > CLOUD_CAP_LIMITS.MAX_FILES) return subFilePath;
+
+    const maxFonts = isZip
+      ? (Number.isFinite(options?.maxMatchedFonts) ? options.maxMatchedFonts : 40)
+      : CLOUD_CAP_LIMITS.MAX_FILES - 1;
+    if (matched.length > maxFonts) return subFilePath;
 
     const unpackDir = path.join(destDir, nextTempTag('bundle_unpack'));
     fs.mkdirSync(unpackDir, { recursive: true });
@@ -1845,11 +1769,7 @@ export async function tryBundleMatchingFonts(subFilePath, fontFiles, destDir, do
     fs.mkdirSync(fontsDir, { recursive: true });
 
     try {
-      const subBase = path.basename(subFilePath);
-      const subDest = path.join(unpackDir, subBase);
-      fs.copyFileSync(subFilePath, subDest);
-
-      const usedNames = new Set();
+      const usedNames = new Set(existingFontNames);
       const fontTargets = matched.map(f => ({
         font: f,
         name: f.name,
@@ -1864,18 +1784,36 @@ export async function tryBundleMatchingFonts(subFilePath, fontFiles, destDir, do
         await downloadFontFn(t.font, t.dest, fontsDir);
       });
 
-      let totalBytes = fs.statSync(subDest).size;
+      let totalBytes = fs.statSync(subFilePath).size;
+      let anyFontDownloaded = false;
       for (const t of fontTargets) {
         if (fs.existsSync(t.dest)) {
+          anyFontDownloaded = true;
           totalBytes += fs.statSync(t.dest).size;
         }
       }
-      if (totalBytes > CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES) {
+      if (!anyFontDownloaded || totalBytes > CLOUD_CAP_LIMITS.BATCH_MAX_TOTAL_BYTES) {
         return subFilePath;
       }
 
       const repackedZip = path.join(destDir, `${nextTempTag('matched_bundle')}.zip`);
-      packToZip(unpackDir, repackedZip);
+      try {
+        if (isZip) {
+          for (const t of fontTargets) {
+            if (fs.existsSync(t.dest)) {
+              existingZip.addLocalFile(t.dest, 'Fonts');
+            }
+          }
+          existingZip.writeZip(repackedZip);
+        } else {
+          const subDest = path.join(unpackDir, path.basename(subFilePath));
+          fs.copyFileSync(subFilePath, subDest);
+          packToZip(unpackDir, repackedZip);
+        }
+      } catch (zipErr) {
+        try { fs.rmSync(repackedZip, { force: true }); } catch { }
+        throw zipErr;
+      }
       if (fs.existsSync(repackedZip) && fs.statSync(repackedZip).size > 100) {
         try { fs.rmSync(subFilePath, { force: true }); } catch { }
         return repackedZip;
@@ -1888,4 +1826,246 @@ export async function tryBundleMatchingFonts(subFilePath, fontFiles, destDir, do
   }
   return subFilePath;
 }
+
+// ====================================================================
+// pCloud Public Link Handler (u.pcloud.link / e.pcloud.link / my.pcloud.com)
+// ====================================================================
+
+const PCLOUD_API_HOSTS = {
+  us: 'api.pcloud.com',
+  eu: 'eapi.pcloud.com',
+};
+
+function getPcloudApiHostOrder(folderUrl) {
+  const host = cloudHostOf(folderUrl) || '';
+  if (host === 'e.pcloud.link' || host.endsWith('.e.pcloud.link') || host === 'eapi.pcloud.com') {
+    return [PCLOUD_API_HOSTS.eu, PCLOUD_API_HOSTS.us];
+  }
+  return [PCLOUD_API_HOSTS.us, PCLOUD_API_HOSTS.eu];
+}
+
+function isAllowedPcloudCdnHost(hostname) {
+  if (!hostname || typeof hostname !== 'string') return false;
+  const host = hostname.trim().toLowerCase();
+  if (!/^[a-z0-9.-]+$/.test(host)) return false;
+  return host === 'pcloud.com' || host.endsWith('.pcloud.com')
+    || host === 'pcloud.link' || host.endsWith('.pcloud.link');
+}
+
+function collectPcloudEntries(node, code, apiHost, out) {
+  if (!node || out.length >= CLOUD_LISTING_MAX_ENTRIES) return;
+  if (node.isfolder) {
+    for (const child of node.contents || []) {
+      if (out.length >= CLOUD_LISTING_MAX_ENTRIES) break;
+      collectPcloudEntries(child, code, apiHost, out);
+    }
+    return;
+  }
+  if (!node.name) return;
+  out.push({
+    name: node.name,
+    size: Number(node.size) || 0,
+    fileid: node.fileid,
+    code,
+    apiHost,
+    isSingleFile: false,
+  });
+}
+
+export async function listPcloudFolderStrict(folderUrl, options = {}) {
+  if (!isProviderHostUrl(folderUrl, 'pcloud')) {
+    throw new Error('pCloud listing refused: unsafe host');
+  }
+  const code = extractPcloudPublinkCode(folderUrl);
+  if (!code) return [];
+  const fetchFn = typeof options.fetchImpl === 'function' ? options.fetchImpl : null;
+  let lastErr = null;
+  for (const apiHost of getPcloudApiHostOrder(folderUrl)) {
+    const apiUrl = `https://${apiHost}/showpublink?code=${encodeURIComponent(code)}`;
+    try {
+      let res;
+      if (fetchFn) {
+        res = await fetchFn(apiUrl, { headers: { 'User-Agent': UA } });
+      } else {
+        const safe = await fetchSafe(apiUrl, {
+          sourceUrl: apiUrl,
+          initialValidator: isStaticSafeUrl,
+          headers: { 'User-Agent': UA },
+          timeoutMs: HTTP_TIMEOUT_MS,
+        });
+        res = safe?.response;
+      }
+      if (!res || !res.ok) {
+        lastErr = new Error(`pCloud HTTP ${res ? res.status : 'blocked'}`);
+        continue;
+      }
+      const text = await readResponseTextCapped(res, CLOUD_LISTING_MAX_BYTES);
+      const data = JSON.parse(text);
+      if (data && data.result === 0 && data.metadata) {
+        if (!data.metadata.isfolder) {
+          if (!data.metadata.name) return [];
+          return [{
+            name: data.metadata.name,
+            size: Number(data.metadata.size) || 0,
+            fileid: data.metadata.fileid,
+            code,
+            apiHost,
+            isSingleFile: true,
+          }];
+        }
+        const files = [];
+        collectPcloudEntries(data.metadata, code, apiHost, files);
+        return files;
+      }
+      lastErr = new Error(`pCloud API error ${(data && data.result) ?? 'unknown'}`);
+      if (![7001, 7002, 7014].includes(data?.result)) break;
+    } catch (e) {
+      if (isCloudCapError(e)) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('pCloud listing failed');
+}
+
+export async function listPcloudFolder(folderUrl, options = {}) {
+  try {
+    return await listPcloudFolderStrict(folderUrl, options);
+  } catch (e) {
+    console.warn(`   ⚠️ pCloud folder listing failed: ${logSafe(e && e.message)}`);
+    return [];
+  }
+}
+
+export async function downloadPcloudEntryToDisk(entry, destPath, options = {}) {
+  const code = entry && entry.code;
+  const apiHost = entry?.apiHost === PCLOUD_API_HOSTS.eu ? PCLOUD_API_HOSTS.eu : PCLOUD_API_HOSTS.us;
+  if (!code || !/^[a-zA-Z0-9]+$/.test(String(code))) return false;
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : null;
+  const fetchFn = typeof options.fetchImpl === 'function' ? options.fetchImpl : null;
+  const requestUrl = async (url, timeoutMs = HTTP_TIMEOUT_MS) => {
+    if (fetchFn) return await fetchFn(url, { headers: { 'User-Agent': UA } });
+    const safe = await fetchSafe(url, {
+      sourceUrl: url,
+      initialValidator: isStaticSafeUrl,
+      headers: { 'User-Agent': UA },
+      timeoutMs,
+    });
+    return safe?.response || null;
+  };
+  try {
+    const fileParam = !entry.isSingleFile && entry.fileid != null
+      ? `&fileid=${encodeURIComponent(String(entry.fileid))}`
+      : '';
+    const dlApiUrl = `https://${apiHost}/getpublinkdownload?code=${encodeURIComponent(String(code))}${fileParam}`;
+    const metaRes = await requestUrl(dlApiUrl, HTTP_TIMEOUT_MS);
+    if (!metaRes || !metaRes.ok) {
+      console.warn(`   ⚠️ pCloud download metadata HTTP ${metaRes ? metaRes.status : 'blocked'} for: ${logSafe(entry.name || code)}`);
+      return false;
+    }
+    const metaText = await readResponseTextCapped(metaRes, CLOUD_LISTING_MAX_BYTES);
+    const meta = JSON.parse(metaText);
+    const relPath = typeof meta?.path === 'string' ? meta.path : '';
+    const hosts = Array.isArray(meta?.hosts) ? meta.hosts.filter(isAllowedPcloudCdnHost) : [];
+    if (meta?.result !== 0 || !relPath.startsWith('/') || relPath.startsWith('//') || hosts.length === 0) {
+      console.warn(`   ⚠️ pCloud invalid download response for: ${logSafe(entry.name || code)}`);
+      return false;
+    }
+
+    for (const cdnHost of hosts) {
+      const cdnUrl = `https://${cdnHost}${relPath}`;
+      const fileRes = await requestUrl(cdnUrl, DRIVE_DOWNLOAD_TIMEOUT_MS);
+      if (!fileRes || !fileRes.ok || !fileRes.body) continue;
+      const bodyStream = typeof fileRes.body.getReader === 'function'
+        ? Readable.fromWeb(fileRes.body)
+        : fileRes.body;
+      await writeStreamToFileWithCap(bodyStream, destPath, maxBytes);
+      return true;
+    }
+    console.warn(`   ⚠️ pCloud CDN download failed for: ${logSafe(entry.name || code)}`);
+    return false;
+  } catch (e) {
+    if (isCloudCapError(e)) throw e;
+    console.warn(`   ⚠️ pCloud download failed for "${logSafe(entry?.name || code)}": ${logSafe(e && e.message)}`);
+    return false;
+  }
+}
+
+export async function findBestFileInPcloud(folderUrl, targetEpisode = null, extractedEps = [], listedFiles = null, batch = true) {
+  const files = listedFiles || await listPcloudFolder(folderUrl);
+  if (!files || files.length === 0) return null;
+
+  console.log(`   📂 pCloud folder: ${files.length} file(s) found`);
+  const clean = files.filter(f => !/hardsub|hard[\s_-]*sub/i.test(f.name));
+
+  const subFiles = clean.filter(f => /\.(ass|srt|zip|7z|rar)$/i.test(f.name));
+  let episodeAbsent = false;
+  try {
+    if (subFiles.length > 0) {
+      const batchSel = selectFolderSubtitleBatch(subFiles, { targetEpisode, extractedEps, batch: batch === true });
+      if (batchSel.length > 1) {
+        console.log(`   📦 pCloud: subtitle batch of ${batchSel.length} file(s) — one package.`);
+        return {
+          type: 'subtitles',
+          files: batchSel.map(f => ({
+            fileid: f.fileid,
+            code: f.code,
+            apiHost: f.apiHost,
+            isSingleFile: f.isSingleFile,
+            name: f.name,
+            size: f.size,
+          })),
+          subNames: batchSel.map(f => f.name),
+        };
+      }
+      if (targetEpisode) {
+        const match = subFiles.find(f => matchesEpisode(f.name, targetEpisode));
+        if (match) {
+          console.log(`   ✅ pCloud: subtitle matched EP ${targetEpisode}: ${logSafe(match.name)}`);
+          return { ...match, type: 'subtitle' };
+        }
+      }
+      const latest = subFiles[subFiles.length - 1];
+      if (targetEpisode && extractEpisodesFromText(latest.name).length > 0 && !matchesEpisode(latest.name, targetEpisode)) {
+        throw episodeAbsentError();
+      }
+      console.log(`   ✅ pCloud: subtitle ${logSafe(latest.name)}`);
+      return { ...latest, type: 'subtitle' };
+    }
+  } catch (e) {
+    if (e.code !== 'EPISODE_ABSENT') throw e;
+    episodeAbsent = true;
+  }
+
+  const mkvFiles = clean.filter(f => /\.(mkv|mp4|m4v)$/i.test(f.name));
+  if (mkvFiles.length > 0) {
+    const chosen = chooseVideoCandidate(mkvFiles, targetEpisode);
+    if (chosen) {
+      console.log(`   🎬 pCloud: MKV ${logSafe(chosen.name)}`);
+      return { ...chosen, type: 'mkv' };
+    }
+  }
+
+  if (episodeAbsent) throw episodeAbsentError();
+  return null;
+}
+
+export async function downloadPcloudFolderRelease(folderUrl, destDir, targetEpisode = null, options = {}) {
+  const { downloadEntry = downloadPcloudEntryToDisk, fetchImpl = null, ...rest } = options || {};
+  return await runCloudFolderRelease(
+    {
+      providerLabel: 'pCloud',
+      releaseLabel: 'pCloud Release',
+      tagPrefix: 'pcloud',
+      loadFiles: (url) => listPcloudFolder(url, fetchImpl ? { fetchImpl } : {}),
+      downloadItem: async (item, destPath, _itemDir, dlOpts) => {
+        return await downloadEntry(item, destPath, fetchImpl ? { ...dlOpts, fetchImpl } : dlOpts);
+      },
+    },
+    folderUrl,
+    destDir,
+    targetEpisode,
+    rest
+  );
+}
+
 

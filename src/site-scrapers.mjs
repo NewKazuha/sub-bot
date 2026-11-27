@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import fs from 'node:fs';
 import path from 'node:path';
-import { matchesEpisode, logSafe } from './cloud-folders.mjs';
+import { matchesEpisode, logSafe, isPcloudPublinkUrl } from './cloud-folders.mjs';
 import { getCachedCanonical } from './title-identity.mjs';
 import { fetchRenderedHtml, isRocksDdlHost, isRocksHost, postJsonViaBrowser } from './browser-fetch.mjs';
 import {
@@ -2125,7 +2125,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     for (const l of allLinks) {
       const isRoot = /(?:workers\.dev|ddl\.[^/]+)\/0:\/?$/i.test(l.href);
       if (isRoot || !l.el) continue;
-      if (!isAnyHostOf(l.href, ['drive.google.com', 'mega.nz', 'mediafire.com', 'top4top.io'])) continue;
+      if (!isAnyHostOf(l.href, ['drive.google.com', 'mega.nz', 'mediafire.com', 'top4top.io']) && !isPcloudPublinkUrl(l.href)) continue;
       const head = $(l.el).closest('h1, h2, h3, h4, h5, h6');
       const scope = head.length ? head : $(l.el).closest('p, div');
       let nearLabel = '';
@@ -2159,7 +2159,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
           (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) ||
            isHostOf(l.href, 'top4top.io') || isHostOf(l.href, 'mediafire.com') ||
            isHostOf(l.href, 'urls.mugi-subs.com') || isHostOf(l.href, 'tinyurl.com') ||
-           isAnyHostOf(l.href, ['drive.google.com', 'mega.nz']))) {
+           isAnyHostOf(l.href, ['drive.google.com', 'mega.nz']) || isPcloudPublinkUrl(l.href))) {
         directSubLink = l.href;
         break;
       }
@@ -2174,7 +2174,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
           (actionButtonRegex.test(l.text) || subHeadingRegex.test(l.text) ||
            isHostOf(l.href, 'top4top.io') || isHostOf(l.href, 'mediafire.com') ||
            isHostOf(l.href, 'urls.mugi-subs.com') || isHostOf(l.href, 'tinyurl.com') ||
-           isAnyHostOf(l.href, ['drive.google.com', 'mega.nz']))) {
+           isAnyHostOf(l.href, ['drive.google.com', 'mega.nz']) || isPcloudPublinkUrl(l.href))) {
         directSubLink = l.href;
         break;
       }
@@ -2197,6 +2197,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   let mediafire = null;
   let mega = null;
   let drive = null;
+  let pcloud = null;
   let fontsLink = null;
   let proton = null;
   let pixeldrain = null;
@@ -2226,6 +2227,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
     if (isHostOf(l.href, 'mediafire.com') && isSoft && !mediafire) mediafire = l.href;
     if (isAnyHostOf(l.href, ['mega.nz', 'mega.co.nz']) && isSoft && !mega) mega = l.href;
     if (isAnyHostOf(l.href, ['drive.google.com', 'docs.google.com']) && isSoft && !drive) drive = l.href;
+    if (isPcloudPublinkUrl(l.href) && isSoft && !pcloud) pcloud = l.href;
     if (isHostOf(l.href, 'proton.me') && isSoft && !proton) proton = l.href;
     if (isHostOf(l.href, 'pixeldrain.com') && isSoft && !pixeldrain) pixeldrain = l.href;
     if ((hrefLower.includes('.torrent') || hrefLower.includes('nyaa.si')) && !torrent) torrent = l.href;
@@ -2268,12 +2270,13 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
   if (isHostOf(directSubLink, 'mediafire.com') && !mediafire) mediafire = directSubLink;
   if (isAnyHostOf(directSubLink, ['drive.google.com', 'docs.google.com'])) drive = directSubLink;
   if (isAnyHostOf(directSubLink, ['mega.nz', 'mega.co.nz']) && !mega) mega = directSubLink;
+  if (isPcloudPublinkUrl(directSubLink) && !pcloud) pcloud = directSubLink;
   if (isHostOf(directSubLink, 'proton.me') && !proton) proton = directSubLink;
   if (isHostOf(directSubLink, 'pixeldrain.com') && !pixeldrain) pixeldrain = directSubLink;
   if ((resolvedLower.includes('.torrent') || resolvedLower.includes('nyaa.si')) && !torrent) torrent = directSubLink;
   if (isHostOf(directSubLink, 'buzzheavier.com') && !buzzheavier) buzzheavier = directSubLink;
 
-  const bestDownloadUrl = directSubLink || (top4top || mediafire || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || buzzheavier || null);
+  const bestDownloadUrl = directSubLink || (top4top || mediafire || pcloud || hevcLink || h264Link || mega || drive || proton || pixeldrain || torrent || buzzheavier || null);
 
   const result = {
     title,
@@ -2286,6 +2289,7 @@ export async function scrapePostPage(pageUrl, siteConfig = null, targetEp = null
       mediafire,
       mega,
       drive,
+      pcloud,
       proton,
       pixeldrain,
       torrent,
