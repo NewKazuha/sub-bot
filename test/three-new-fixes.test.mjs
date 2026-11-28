@@ -519,4 +519,10 @@ test('getSafeTelegramFileName preserves Tougen Anki arc title and never leaves t
 
   const exactHyphenCut = getSafeTelegramFileName(`[Crunchyroll] ${'A'.repeat(48)}-hen - 09`, '.ass');
   assert.equal(exactHyphenCut, `[Crunchyroll] ${'A'.repeat(48)} - 09.ass`);
+
+  const ranma = getSafeTelegramFileName('[Netflix] Ranma 1/2 3rd Season - 09', '.ass');
+  assert.equal(ranma, '[Netflix] Ranma ½ 3rd Season - 09.ass');
+
+  const notFraction = getSafeTelegramFileName('[Team] Show 1/24 Edition 01/2 - 03', '.ass');
+  assert.equal(notFraction, '[Team] Show 1 24 Edition 01 2 - 03.ass');
 });

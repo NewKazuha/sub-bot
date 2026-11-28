@@ -2158,6 +2158,8 @@ export function getSafeTelegramFileName(name, ext = '.ass') {
     // M2: the C0 control characters (NUL, ESC, …) can never reach a
     // published document name.
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    // Preserve literal 1/2 fraction (e.g. "Ranma 1/2") as "½" instead of turning "/" into "1 2"
+    .replace(/(^|[^\d/])1\/2(?=$|[^\d/])/g, '$1½')
     .replace(/[\\/:*?"<>|,]+/g, ' ')
     .replace(/[\p{Extended_Pictographic}\u2600-\u26FF\u2700-\u27BF\u25A0-\u25FF\u{1F1E6}-\u{1F1FF}✦✧★☆✪✵✹✸✷✶◆◇■□▲▼▶◀●○•※⚜〽][\uFE00-\uFE0F\u200D\u{1F3FB}-\u{1F3FF}]*/gu, '')
     .replace(/\s+/g, ' ')
